@@ -10,6 +10,7 @@ config.json
 signals.db
 signals.db-journal
 signals.db-wal
+backups/
 data/symbols_status.json
 data/signals_history.csv
 data/positions_summary.json
