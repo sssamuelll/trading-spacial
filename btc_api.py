@@ -824,17 +824,19 @@ def execute_scan_for_symbol(sym: str, cfg: dict) -> dict:
 
         if is_signal:
             _scanner_state["signals_total"] += 1
-            log.info(f"SENAL {sym} — score {rep.get('score')}/10  "
+            log.info(f"SENAL {sym} — score {rep.get('score')}/9  "
                      f"precio ${rep.get('price')}")
             append_signal_log(rep, scan_id)
             append_signal_csv(rep, scan_id)
         elif is_setup:
-            log.info(f"SETUP {sym} — score {rep.get('score')}/10 (sin gatillo)")
+            log.info(f"SETUP {sym} — score {rep.get('score')}/9 (sin gatillo)")
             append_signal_log(rep, scan_id)
             append_signal_csv(rep, scan_id)
 
         if should_notify_signal(rep, cfg):
             push_telegram_direct(rep, cfg)
+            if cfg.get("webhook_url", "").strip():
+                push_webhook(rep, scan_id, cfg)
         else:
             log.info(f"{sym}: {estado[:55]}")
 
