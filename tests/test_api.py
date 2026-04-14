@@ -1533,6 +1533,74 @@ class TestSignalPerformance:
         assert data["ok"] is True
         assert data["total_completed"] == 0
 
+    def test_check_pending_uses_current_prices(self):
+        """check_pending_signal_outcomes uses passed prices, no API calls."""
+        import btc_api
+        from unittest.mock import patch
+
+        con = btc_api.get_db()
+        # Insert a pending signal from 2 hours ago
+        ts_2h_ago = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        con.execute("""
+            INSERT INTO signal_outcomes
+            (scan_id, symbol, signal_ts, signal_price, score, status)
+            VALUES (99, 'BTCUSDT', ?, 60000.0, 5, 'pending')
+        """, (ts_2h_ago,))
+        con.commit()
+        con.close()
+
+        # Pass current price — should fill price_1h without calling get_klines for milestones
+        with patch.object(btc_api, "get_klines") as mock_klines:
+            # get_klines only needed for runup/drawdown (1h candles)
+            import pandas as pd
+            mock_klines.return_value = pd.DataFrame({
+                "open": [59000.0], "high": [62000.0],
+                "low": [58000.0], "close": [61000.0],
+                "volume": [100.0], "taker_buy_base": [50.0],
+            })
+            btc_api.check_pending_signal_outcomes({"BTCUSDT": 61500.0})
+
+            # Should only call get_klines once (for runup/drawdown 1h),
+            # NOT 3 times for milestone prices
+            assert mock_klines.call_count <= 1
+            if mock_klines.call_count == 1:
+                args = mock_klines.call_args
+                assert args[0][1] == "1h"  # interval must be 1h, not 1m
+
+        # Verify price_1h was set from current_prices
+        con = btc_api.get_db()
+        row = con.execute("SELECT * FROM signal_outcomes WHERE scan_id = 99").fetchone()
+        con.close()
+        assert row["price_1h"] == 61500.0
+
+    def test_check_pending_groups_by_symbol(self):
+        """Multiple pending signals for same symbol share one klines call."""
+        import btc_api
+        from unittest.mock import patch
+
+        con = btc_api.get_db()
+        ts_3h_ago = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        for scan_id in (200, 201, 202):
+            con.execute("""
+                INSERT INTO signal_outcomes
+                (scan_id, symbol, signal_ts, signal_price, score, status)
+                VALUES (?, 'ETHUSDT', ?, 3000.0, 4, 'pending')
+            """, (scan_id, ts_3h_ago))
+        con.commit()
+        con.close()
+
+        with patch.object(btc_api, "get_klines") as mock_klines:
+            import pandas as pd
+            mock_klines.return_value = pd.DataFrame({
+                "open": [2900.0], "high": [3100.0],
+                "low": [2850.0], "close": [3050.0],
+                "volume": [500.0], "taker_buy_base": [250.0],
+            })
+            btc_api.check_pending_signal_outcomes({"ETHUSDT": 3050.0})
+
+            # Only ONE klines call for all 3 signals (same symbol)
+            assert mock_klines.call_count == 1
+
     def test_performance_with_data(self, client):
         import btc_api
         con = btc_api.get_db()

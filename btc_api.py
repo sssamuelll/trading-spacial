@@ -46,10 +46,13 @@ from btc_scanner import scan, get_top_symbols, get_klines
 #  TRACKING DE PERFORMANCE HISTÓRICO
 # ─────────────────────────────────────────────────────────────────────────────
 
-def check_pending_signal_outcomes():
+def check_pending_signal_outcomes(current_prices: dict[str, float]):
     """
     Recorre señales pendientes y actualiza su precio 1h, 4h y 24h después.
     También actualiza max_runup y max_drawdown si no han pasado 24h.
+
+    current_prices: {symbol: price} recolectado del ciclo de scan actual,
+    para evitar llamadas extra a la API de Binance.
     """
     con = get_db()
     rows = con.execute("SELECT * FROM signal_outcomes WHERE status = 'pending'").fetchall()
@@ -61,6 +64,9 @@ def check_pending_signal_outcomes():
     now = datetime.now(timezone.utc)
     updated_count = 0
 
+    # Cache de klines 1h por symbol para runup/drawdown (una llamada por symbol)
+    _klines_cache: dict[str, object] = {}
+
     for r in [dict(row) for row in rows]:
         try:
             sig_ts = datetime.fromisoformat(r["signal_ts"])
@@ -70,31 +76,33 @@ def check_pending_signal_outcomes():
             age_hours = (now - sig_ts).total_seconds() / 3600
             symbol    = r["symbol"]
             sig_price = r["signal_price"]
+            cur_price = current_prices.get(symbol)
 
             updates = {}
 
             # 1. Capturar precios en hitos (1h, 4h, 24h)
-            # Solo si no los tenemos ya y ha pasado el tiempo
-            if r["price_1h"] is None and age_hours >= 1.0:
-                df = get_klines(symbol, "1m", limit=1)
-                if not df.empty: updates["price_1h"] = float(df["close"].iloc[-1])
+            #    Usa el precio actual del ciclo de scan (sin llamada API)
+            if cur_price is not None:
+                if r["price_1h"] is None and age_hours >= 1.0:
+                    updates["price_1h"] = cur_price
 
-            if r["price_4h"] is None and age_hours >= 4.0:
-                df = get_klines(symbol, "1m", limit=1)
-                if not df.empty: updates["price_4h"] = float(df["close"].iloc[-1])
+                if r["price_4h"] is None and age_hours >= 4.0:
+                    updates["price_4h"] = cur_price
 
-            if r["price_24h"] is None and age_hours >= 24.0:
-                df = get_klines(symbol, "1m", limit=1)
-                if not df.empty: updates["price_24h"] = float(df["close"].iloc[-1])
-                updates["status"] = "completed"
+                if r["price_24h"] is None and age_hours >= 24.0:
+                    updates["price_24h"] = cur_price
+                    updates["status"] = "completed"
 
-            # 2. Max Runup / Drawdown (usar 1h OHLCV como proxy si es < 24h)
+            # 2. Max Runup / Drawdown con velas 1h (una llamada por symbol único)
             if age_hours <= 25.0:
-                # Obtener klines desde la señal hasta ahora
-                # limit estimado: age_hours * 60 (para 1m) o usar 1h si es mucho
-                limit = min(1500, int(age_hours * 60) + 5)
-                df = get_klines(symbol, "1m", limit=limit)
-                if not df.empty:
+                if symbol not in _klines_cache:
+                    try:
+                        _klines_cache[symbol] = get_klines(symbol, "1h", limit=25)
+                    except Exception:
+                        _klines_cache[symbol] = None
+
+                df = _klines_cache[symbol]
+                if df is not None and not df.empty:
                     high = df["high"].max()
                     low  = df["low"].min()
                     updates["max_runup_pct"]    = round((high - sig_price) / sig_price * 100, 2)
@@ -1198,10 +1206,13 @@ def scanner_loop():
         _scanner_state["symbols_active"] = symbols
         log.info(f"Ciclo iniciado — {len(symbols)} simbolos")
 
+        cycle_prices = {}
         for sym in symbols:
             if not _scanner_state["running"]:
                 break
-            execute_scan_for_symbol(sym, cfg)
+            result = execute_scan_for_symbol(sym, cfg)
+            if result and result.get("price"):
+                cycle_prices[sym] = result["price"]
 
         # Actualizar data/symbols_status.json al final de cada ciclo
         try:
@@ -1218,7 +1229,7 @@ def scanner_loop():
 
         # Seguimiento de performance de señales
         try:
-            check_pending_signal_outcomes()
+            check_pending_signal_outcomes(cycle_prices)
         except Exception as e:
             log.warning(f"check_pending_signal_outcomes error en ciclo: {e}")
 
