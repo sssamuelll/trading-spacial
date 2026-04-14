@@ -17,34 +17,38 @@ import sys
 PORT = 9000
 _DIR     = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(_DIR, "logs", "webhook.log")
+os.makedirs(os.path.join(_DIR, "logs"), exist_ok=True)
 
-def _load_webhook_config():
-    """Load telegram_chat_id and openclaw path from config.json."""
+def load_config():
+    """Load config.json if it exists."""
     cfg_path = os.path.join(_DIR, "config.json")
-    cfg = {}
     if os.path.exists(cfg_path):
         try:
-            with open(cfg_path) as f:
-                cfg = json.load(f)
-        except Exception:
-            pass
-    return cfg
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            if 'logger' in globals():
+                logger.error(f"Error loading config.json: {e}")
+    return {}
 
 def _get_telegram_target():
-    return _load_webhook_config().get("telegram_chat_id", "")
+    cfg = load_config()
+    # 380882623 is the legacy hardcoded target for Simon
+    return cfg.get("telegram_chat_id", "380882623")
 
 def _get_openclaw_cmd():
-    cfg = _load_webhook_config()
+    cfg = load_config()
     configured = cfg.get("openclaw_path", "")
     if configured and os.path.isfile(configured):
         return configured
+    
+    # Fallback to absolute path or just 'openclaw' if not on Windows
+    openclaw_cmd = r"C:\Users\simon\AppData\Roaming\npm\openclaw.cmd"
+    if os.path.exists(openclaw_cmd):
+        return openclaw_cmd
+        
     import shutil
-    found = shutil.which("openclaw")
-    if found:
-        return found
-    return "openclaw"
-
-os.makedirs(os.path.join(_DIR, "logs"), exist_ok=True)
+    return shutil.which("openclaw") or "openclaw"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,6 +71,21 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_error(404, "Endpoint not found")
             return
         
+        # Security: Validate secret if configured
+        cfg = load_config()
+        secret = cfg.get("webhook_secret", "").strip()
+        if secret:
+            received_secret = self.headers.get("X-Scanner-Secret", "").strip()
+            # fallback to X-Webhook-Secret if someone used the other name
+            if not received_secret:
+                received_secret = self.headers.get("X-Webhook-Secret", "").strip()
+            
+            import hmac
+            if not hmac.compare_digest(received_secret, secret):
+                logger.warning(f"Unauthorized webhook attempt from {self.address_string()}")
+                self.send_error(401, "Unauthorized: Invalid secret")
+                return
+
         content_length = int(self.headers.get('Content-Length', 0))
         if content_length == 0:
             self.send_error(400, "Empty body")
@@ -117,10 +136,12 @@ def send_via_openclaw(message):
     try:
         openclaw_cmd = _get_openclaw_cmd()
         telegram_target = _get_telegram_target()
+        
         if not telegram_target:
             logger.error("telegram_chat_id not configured in config.json")
             return False
-        cmd = [openclaw_cmd, "message", "send", "--channel", "telegram", "--target", telegram_target, "--message", message]
+            
+        cmd = [openclaw_cmd, "message", "send", "--channel", "telegram", "--target", str(telegram_target), "--message", message]
         logger.info(f"Executing: {' '.join(cmd)}")
         
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
