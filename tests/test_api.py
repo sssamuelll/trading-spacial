@@ -438,9 +438,11 @@ class TestAPIEndpoints:
         data = r.json()
         assert data.get("symbol") == "BTCUSDT"
 
-    def test_webhook_test_sin_config_400(self, client):
+    def test_webhook_test_sin_config(self, client):
         r = client.get("/webhook/test")
-        assert r.status_code == 400
+        assert r.status_code == 200
+        data = r.json()
+        assert data["ok"] is False
 
     def test_webhook_test_con_url(self, client, tmp_path, monkeypatch):
         import btc_api
