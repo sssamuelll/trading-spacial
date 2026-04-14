@@ -78,6 +78,7 @@ def load_config() -> dict:
             "min_score":       0,      # score mínimo para enviar (0 = sin filtro)
             "require_macro_ok": False, # exigir macro 4H alcista
             "notify_setup":    False,  # enviar también setups sin gatillo
+            "dedup_window_minutes": 30, # ventana de deduplicación (minutos)
         },
     }
     if os.path.exists(CONFIG_FILE):
@@ -134,6 +135,30 @@ def should_notify_signal(rep: dict, cfg: dict) -> bool:
         return True
 
     return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  DEDUPLICACIÓN DE SEÑALES
+# ─────────────────────────────────────────────────────────────────────────────
+
+_notified_signals: dict = {}  # symbol -> last_notified_iso
+
+
+def _is_duplicate_signal(symbol: str, cfg: dict) -> bool:
+    """Check if we already notified for this symbol within the dedup window."""
+    filters = cfg.get("signal_filters", {})
+    window_minutes = filters.get("dedup_window_minutes", 30)
+    last = _notified_signals.get(symbol)
+    if not last:
+        return False
+    last_dt = datetime.fromisoformat(last)
+    now = datetime.now(timezone.utc)
+    return (now - last_dt).total_seconds() < window_minutes * 60
+
+
+def _mark_notified(symbol: str):
+    """Mark a symbol as notified now."""
+    _notified_signals[symbol] = datetime.now(timezone.utc).isoformat()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -842,7 +867,11 @@ def scanner_loop():
                     append_signal_csv(rep, scan_id)
 
                 if should_notify_signal(rep, cfg):
-                    push_telegram_direct(rep, cfg)
+                    if not _is_duplicate_signal(sym, cfg):
+                        push_telegram_direct(rep, cfg)
+                        _mark_notified(sym)
+                    else:
+                        log.info(f"{sym}: senal duplicada, notificacion omitida")
                 else:
                     log.info(f"{sym}: {estado[:55]}")
 
@@ -993,7 +1022,11 @@ def force_scan(
                 append_signal_csv(rep, scan_id)
 
             if should_notify_signal(rep, cfg):
-                push_telegram_direct(rep, cfg)
+                if not _is_duplicate_signal(sym, cfg):
+                    push_telegram_direct(rep, cfg)
+                    _mark_notified(sym)
+                else:
+                    log.info(f"{sym}: senal duplicada, notificacion omitida (force_scan)")
 
             results.append({
                 "symbol":    sym,

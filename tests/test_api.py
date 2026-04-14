@@ -10,7 +10,7 @@ import pytest
 import sqlite3
 import tempfile
 from unittest.mock import patch, MagicMock
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -569,3 +569,85 @@ class TestLoadConfig:
         # notify_setup_only debe tener valor por defecto
         assert "notify_setup_only" in cfg
         assert cfg["notify_setup_only"] is False
+
+    def test_dedup_window_default(self, tmp_path, monkeypatch):
+        import btc_api
+        cfg_path = str(tmp_path / "config.json")
+        with open(cfg_path, "w") as f:
+            json.dump({}, f)
+        monkeypatch.setattr(btc_api, "CONFIG_FILE", cfg_path)
+        cfg = btc_api.load_config()
+        assert cfg["signal_filters"]["dedup_window_minutes"] == 30
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TESTS — Signal deduplication
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSignalDeduplication:
+    @pytest.fixture(autouse=True)
+    def clear_notified(self):
+        """Clear the in-memory dedup tracker before each test."""
+        import btc_api
+        btc_api._notified_signals.clear()
+        yield
+        btc_api._notified_signals.clear()
+
+    def test_first_signal_is_not_duplicate(self):
+        import btc_api
+        cfg = {"signal_filters": {"dedup_window_minutes": 30}}
+        assert btc_api._is_duplicate_signal("BTCUSDT", cfg) is False
+
+    def test_same_symbol_is_duplicate_within_window(self):
+        import btc_api
+        cfg = {"signal_filters": {"dedup_window_minutes": 30}}
+        btc_api._mark_notified("BTCUSDT")
+        assert btc_api._is_duplicate_signal("BTCUSDT", cfg) is True
+
+    def test_different_symbol_is_not_duplicate(self):
+        import btc_api
+        cfg = {"signal_filters": {"dedup_window_minutes": 30}}
+        btc_api._mark_notified("BTCUSDT")
+        assert btc_api._is_duplicate_signal("ETHUSDT", cfg) is False
+
+    def test_signal_outside_window_is_not_duplicate(self):
+        import btc_api
+        cfg = {"signal_filters": {"dedup_window_minutes": 30}}
+        # Simulate a notification from 31 minutes ago
+        old_ts = (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat()
+        btc_api._notified_signals["BTCUSDT"] = old_ts
+        assert btc_api._is_duplicate_signal("BTCUSDT", cfg) is False
+
+    def test_signal_inside_window_is_duplicate(self):
+        import btc_api
+        cfg = {"signal_filters": {"dedup_window_minutes": 30}}
+        # Simulate a notification from 10 minutes ago
+        recent_ts = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        btc_api._notified_signals["BTCUSDT"] = recent_ts
+        assert btc_api._is_duplicate_signal("BTCUSDT", cfg) is True
+
+    def test_custom_dedup_window(self):
+        import btc_api
+        cfg = {"signal_filters": {"dedup_window_minutes": 5}}
+        # 6 minutes ago should be outside a 5-minute window
+        old_ts = (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat()
+        btc_api._notified_signals["BTCUSDT"] = old_ts
+        assert btc_api._is_duplicate_signal("BTCUSDT", cfg) is False
+
+    def test_mark_notified_updates_timestamp(self):
+        import btc_api
+        cfg = {"signal_filters": {"dedup_window_minutes": 30}}
+        btc_api._mark_notified("BTCUSDT")
+        ts1 = btc_api._notified_signals["BTCUSDT"]
+        assert ts1 is not None
+        # Mark again — timestamp should be present
+        btc_api._mark_notified("BTCUSDT")
+        ts2 = btc_api._notified_signals["BTCUSDT"]
+        assert ts2 >= ts1
+
+    def test_default_window_from_config(self):
+        """When dedup_window_minutes is not set, default to 30."""
+        import btc_api
+        cfg = {"signal_filters": {}}
+        btc_api._mark_notified("BTCUSDT")
+        assert btc_api._is_duplicate_signal("BTCUSDT", cfg) is True
