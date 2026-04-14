@@ -198,6 +198,7 @@ def start_service(svc: dict):
         stdout=log_fh,
         stderr=log_fh,
     )
+    log_fh.close()  # subprocess inherits the fd; Python handle no longer needed
     svc["process"] = proc
 
     # 5. Guardar PID
