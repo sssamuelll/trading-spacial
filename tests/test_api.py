@@ -569,3 +569,158 @@ class TestLoadConfig:
         # notify_setup_only debe tener valor por defecto
         assert "notify_setup_only" in cfg
         assert cfg["notify_setup_only"] is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TESTS — execute_scan_for_symbol
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestExecuteScanForSymbol:
+    """Tests for the shared scan cycle function."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path, monkeypatch):
+        import btc_api
+        db_path = str(tmp_path / "test_scan.db")
+        cfg_path = str(tmp_path / "config.json")
+        with open(cfg_path, "w") as f:
+            json.dump({"signal_filters": {"min_score": 4}}, f)
+        monkeypatch.setattr(btc_api, "DB_FILE", db_path)
+        monkeypatch.setattr(btc_api, "CONFIG_FILE", cfg_path)
+        # Prevent file I/O for logs/csv in tests
+        monkeypatch.setattr(btc_api, "append_signal_log", lambda rep, sid: None)
+        monkeypatch.setattr(btc_api, "append_signal_csv", lambda rep, sid: None)
+        monkeypatch.setattr(btc_api, "check_position_stops", lambda sym, price: None)
+        btc_api.init_db()
+
+    def test_returns_dict_with_symbol(self, monkeypatch):
+        """execute_scan_for_symbol returns a dict with the symbol."""
+        import btc_api
+        fake_report = {
+            "symbol": "BTCUSDT",
+            "timestamp": "2026-01-01T00:00:00",
+            "estado": "Sin zona LRC",
+            "señal_activa": False,
+            "gatillo_activo": False,
+            "price": 65000.0,
+            "score": 2,
+            "score_label": "MINIMA",
+            "macro_4h": {"price_above": True},
+            "lrc_1h": {"pct": 45.0},
+            "sizing_1h": {},
+            "confirmations": {},
+        }
+        monkeypatch.setattr(btc_api, "scan", lambda sym: fake_report)
+        monkeypatch.setattr(btc_api, "push_telegram_direct", lambda r, c: None)
+
+        cfg = btc_api.load_config()
+        result = btc_api.execute_scan_for_symbol("BTCUSDT", cfg)
+        assert result["symbol"] == "BTCUSDT"
+        assert "error" not in result
+
+    def test_saves_scan_to_db(self, monkeypatch):
+        """Scan results are persisted to the database."""
+        import btc_api
+        fake_report = {
+            "symbol": "ETHUSDT", "timestamp": "2026-01-01T00:00:00",
+            "estado": "Sin zona", "señal_activa": False, "gatillo_activo": False,
+            "price": 3500.0, "score": 1, "score_label": "MINIMA",
+            "macro_4h": {}, "lrc_1h": {}, "sizing_1h": {}, "confirmations": {},
+        }
+        monkeypatch.setattr(btc_api, "scan", lambda sym: fake_report)
+        monkeypatch.setattr(btc_api, "push_telegram_direct", lambda r, c: None)
+
+        cfg = btc_api.load_config()
+        btc_api.execute_scan_for_symbol("ETHUSDT", cfg)
+        scans = btc_api.get_scans()
+        assert len(scans) >= 1
+        assert scans[0]["symbol"] == "ETHUSDT"
+
+    def test_updates_scanner_state(self, monkeypatch):
+        """Scanner state is updated after scan."""
+        import btc_api
+        fake_report = {
+            "symbol": "BTCUSDT", "timestamp": "2026-01-01T12:00:00",
+            "estado": "Test", "señal_activa": False, "gatillo_activo": False,
+            "price": 65000.0, "score": 0, "score_label": "MINIMA",
+            "macro_4h": {}, "lrc_1h": {}, "sizing_1h": {}, "confirmations": {},
+        }
+        monkeypatch.setattr(btc_api, "scan", lambda sym: fake_report)
+        monkeypatch.setattr(btc_api, "push_telegram_direct", lambda r, c: None)
+        initial_count = btc_api._scanner_state["scans_total"]
+
+        cfg = btc_api.load_config()
+        btc_api.execute_scan_for_symbol("BTCUSDT", cfg)
+        assert btc_api._scanner_state["scans_total"] > initial_count
+        assert btc_api._scanner_state["last_symbol"] == "BTCUSDT"
+
+    def test_notifies_on_premium_signal(self, monkeypatch):
+        """Notification sent when signal passes filters."""
+        import btc_api
+        notified = []
+        fake_report = {
+            "symbol": "BTCUSDT", "timestamp": "2026-01-01T00:00:00",
+            "estado": "SEÑAL CONFIRMADA", "señal_activa": True, "gatillo_activo": True,
+            "price": 65000.0, "score": 6, "score_label": "PREMIUM",
+            "macro_4h": {"price_above": True}, "lrc_1h": {"pct": 15.0},
+            "sizing_1h": {"sl_precio": 63000, "tp_precio": 70000},
+            "confirmations": {},
+        }
+        monkeypatch.setattr(btc_api, "scan", lambda sym: fake_report)
+        monkeypatch.setattr(btc_api, "push_telegram_direct",
+                            lambda r, c: notified.append(r["symbol"]))
+
+        cfg = btc_api.load_config()
+        cfg["signal_filters"]["min_score"] = 4
+        btc_api.execute_scan_for_symbol("BTCUSDT", cfg)
+        assert "BTCUSDT" in notified
+
+    def test_no_notification_below_threshold(self, monkeypatch):
+        """No notification when score is below min_score."""
+        import btc_api
+        notified = []
+        fake_report = {
+            "symbol": "BTCUSDT", "timestamp": "2026-01-01T00:00:00",
+            "estado": "Setup valido", "señal_activa": True, "gatillo_activo": True,
+            "price": 65000.0, "score": 2, "score_label": "MINIMA",
+            "macro_4h": {}, "lrc_1h": {"pct": 15.0}, "sizing_1h": {},
+            "confirmations": {},
+        }
+        monkeypatch.setattr(btc_api, "scan", lambda sym: fake_report)
+        monkeypatch.setattr(btc_api, "push_telegram_direct",
+                            lambda r, c: notified.append(True))
+
+        cfg = btc_api.load_config()
+        cfg["signal_filters"]["min_score"] = 4
+        btc_api.execute_scan_for_symbol("BTCUSDT", cfg)
+        assert len(notified) == 0
+
+    def test_handles_scan_exception(self, monkeypatch):
+        """Exception in scan() returns error dict, doesn't crash."""
+        import btc_api
+
+        def raise_error(sym):
+            raise ValueError("API down")
+
+        monkeypatch.setattr(btc_api, "scan", raise_error)
+
+        cfg = btc_api.load_config()
+        result = btc_api.execute_scan_for_symbol("BTCUSDT", cfg)
+        assert "error" in result
+
+    def test_increments_signal_count(self, monkeypatch):
+        """signals_total incremented for confirmed signals."""
+        import btc_api
+        fake_report = {
+            "symbol": "BTCUSDT", "timestamp": "2026-01-01T00:00:00",
+            "estado": "SEÑAL CONFIRMADA", "señal_activa": True, "gatillo_activo": True,
+            "price": 65000.0, "score": 6, "score_label": "PREMIUM",
+            "macro_4h": {}, "lrc_1h": {}, "sizing_1h": {}, "confirmations": {},
+        }
+        monkeypatch.setattr(btc_api, "scan", lambda sym: fake_report)
+        monkeypatch.setattr(btc_api, "push_telegram_direct", lambda r, c: None)
+
+        initial = btc_api._scanner_state["signals_total"]
+        cfg = btc_api.load_config()
+        btc_api.execute_scan_for_symbol("BTCUSDT", cfg)
+        assert btc_api._scanner_state["signals_total"] == initial + 1
