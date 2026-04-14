@@ -1062,7 +1062,10 @@ def latest_signal(
     if not row:
         msg = f"Sin señales para {symbol}." if symbol else "Sin señales registradas."
         return {"message": msg, "señal": None}
-    payload = json.loads(row["payload"]) if row.get("payload") else {}
+    try:
+        payload = json.loads(row["payload"]) if row.get("payload") else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
     return {
         "id":            row["id"],
         "ts":            row["ts"],
@@ -1090,7 +1093,10 @@ def latest_message(
     row = get_latest_signal(symbol)
     if not row:
         return {"message": "Sin señales registradas aun."}
-    payload = json.loads(row["payload"]) if row.get("payload") else {}
+    try:
+        payload = json.loads(row["payload"]) if row.get("payload") else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
     return {
         "scan_id": row["id"],
         "symbol":  row["symbol"],
@@ -1107,7 +1113,10 @@ def signal_by_id(scan_id: int):
     if not row:
         raise HTTPException(status_code=404, detail=f"Escaneo #{scan_id} no encontrado")
     row     = dict(row)
-    payload = json.loads(row["payload"]) if row.get("payload") else {}
+    try:
+        payload = json.loads(row["payload"]) if row.get("payload") else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
     return {**row, "full_report": payload,
             "telegram_message": build_telegram_message(payload)}
 
