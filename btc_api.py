@@ -1278,6 +1278,52 @@ def test_webhook():
     return {"ok": overall_ok, **results}
 
 
+@app.get("/health", summary="Health check for monitoring and Docker")
+def health_check():
+    """Returns system health status. HTTP 200 = healthy, 503 = degraded."""
+    checks = {}
+
+    # Database connectivity
+    try:
+        con = get_db()
+        con.execute("SELECT 1")
+        con.close()
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"error: {e}"
+
+    # Scanner thread status
+    checks["scanner"] = "ok" if _scanner_state.get("running") else "stopped"
+
+    # Last scan freshness
+    last_ts = _scanner_state.get("last_scan_ts")
+    if last_ts:
+        try:
+            last_dt = datetime.fromisoformat(last_ts)
+            age_sec = (datetime.now(timezone.utc) - last_dt).total_seconds()
+            cfg = load_config()
+            interval = cfg.get("scan_interval_sec", 300)
+            checks["scan_freshness"] = "ok" if age_sec < interval * 3 else f"stale ({int(age_sec)}s ago)"
+        except Exception:
+            checks["scan_freshness"] = "unknown"
+    else:
+        checks["scan_freshness"] = "no_scans_yet"
+
+    # Stats
+    checks["scans_total"] = _scanner_state.get("scans_total", 0)
+    checks["signals_total"] = _scanner_state.get("signals_total", 0)
+    checks["errors"] = _scanner_state.get("errors", 0)
+
+    healthy = checks["database"] == "ok" and checks["scanner"] == "ok"
+    status_code = 200 if healthy else 503
+
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        content={"healthy": healthy, "checks": checks},
+        status_code=status_code
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────────────────────
