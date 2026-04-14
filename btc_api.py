@@ -1105,7 +1105,10 @@ def signal_by_id(scan_id: int):
     if not row:
         raise HTTPException(status_code=404, detail=f"Escaneo #{scan_id} no encontrado")
     row     = dict(row)
-    payload = json.loads(row["payload"]) if row.get("payload") else {}
+    try:
+        payload = json.loads(row["payload"]) if row.get("payload") else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
     return {**row, "full_report": payload,
             "telegram_message": build_telegram_message(payload)}
 
