@@ -26,6 +26,8 @@ import sqlite3
 import json
 import os
 import time
+import shutil
+import glob
 import requests as req_lib
 from datetime import datetime, timezone, timedelta
 import logging
@@ -466,6 +468,30 @@ def get_active_symbols(n: int = 20) -> List[str]:
 #  BASE DE DATOS  (SQLite)
 # ─────────────────────────────────────────────────────────────────────────────
 
+_BACKUP_DIR = os.path.join(SCRIPT_DIR, "backups")
+_BACKUP_INTERVAL_SCANS = 288  # ~24h at 5min intervals
+_BACKUP_MAX_FILES = 7
+
+
+def backup_db():
+    """Create a timestamped backup of signals.db. Keeps last 7 backups."""
+    if not os.path.exists(DB_FILE):
+        return
+    os.makedirs(_BACKUP_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(_BACKUP_DIR, f"signals_{timestamp}.db")
+    try:
+        shutil.copy2(DB_FILE, backup_path)
+        log.info(f"DB backup: {backup_path}")
+        # Cleanup old backups
+        backups = sorted(glob.glob(os.path.join(_BACKUP_DIR, "signals_*.db")))
+        for old in backups[:-_BACKUP_MAX_FILES]:
+            os.remove(old)
+            log.info(f"DB backup removed: {old}")
+    except Exception as e:
+        log.warning(f"DB backup failed: {e}")
+
+
 def get_db():
     con = sqlite3.connect(DB_FILE)
     con.row_factory = sqlite3.Row
@@ -474,6 +500,7 @@ def get_db():
 
 def init_db():
     con = get_db()
+    con.execute("PRAGMA journal_mode=WAL")
     con.execute("""
         CREATE TABLE IF NOT EXISTS scans (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -864,6 +891,10 @@ def scanner_loop():
             update_positions_json()
         except Exception as e:
             log.warning(f"update_positions_json error en ciclo: {e}")
+
+        # Periodic DB backup (~every 24h)
+        if _scanner_state["scans_total"] % _BACKUP_INTERVAL_SCANS == 0 and _scanner_state["scans_total"] > 0:
+            backup_db()
 
         elapsed    = time.time() - cycle_start
         sleep_time = max(5, interval - elapsed)
