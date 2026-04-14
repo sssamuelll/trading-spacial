@@ -231,7 +231,7 @@ def append_signal_log(rep: dict, scan_id: int):
             f"[{ts} UTC]  {tipo}  {sym}  (scan_id={scan_id})",
             sep,
             f"  Precio : ${price:>12,.4f}",
-            f"  LRC 1H : {lrc}%   Score: {score}/10  {slabel}",
+            f"  LRC 1H : {lrc}%   Score: {score}/9  {slabel}",
             f"  Macro  : {macro_s}",
         ]
         if is_sig:
@@ -566,20 +566,24 @@ def save_scan(rep: dict) -> int:
 def get_scans(limit=50, only_signals=False, only_setups=False,
               since_hours: Optional[float] = None,
               symbol: Optional[str] = None) -> list:
-    con   = get_db()
-    conds = []
+    con    = get_db()
+    conds  = []
+    params = []
     if symbol:
-        conds.append(f"symbol = '{symbol.upper()}'")
+        conds.append("symbol = ?")
+        params.append(symbol.upper())
     if only_signals:
         conds.append("señal = 1")
     elif only_setups:
         conds.append("(señal = 1 OR setup = 1)")
     if since_hours:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=since_hours)).isoformat()
-        conds.append(f"ts >= '{cutoff}'")
+        conds.append("ts >= ?")
+        params.append(cutoff)
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
+    params.append(limit)
     rows  = con.execute(
-        f"SELECT * FROM scans {where} ORDER BY id DESC LIMIT ?", (limit,)
+        f"SELECT * FROM scans {where} ORDER BY id DESC LIMIT ?", params
     ).fetchall()
     con.close()
     return [dict(r) for r in rows]
@@ -661,7 +665,7 @@ def build_telegram_message(rep: dict) -> str:
         "",
         f"*Precio:* `${price:,.2f}`",
         f"*LRC 1H:* `{lrc.get('pct')}%`  _(zona <= 25% = LONG)_",
-        f"*Score:* `{score}/10`  _{slabel}_",
+        f"*Score:* `{score}/9`  _{slabel}_",
         f"*Macro 4H:* `{'Alcista' if macro.get('price_above') else 'Adversa'}`  _(Precio vs SMA100)_",
         "",
     ]
@@ -1043,7 +1047,10 @@ def latest_signal(
     if not row:
         msg = f"Sin señales para {symbol}." if symbol else "Sin señales registradas."
         return {"message": msg, "señal": None}
-    payload = json.loads(row["payload"]) if row.get("payload") else {}
+    try:
+        payload = json.loads(row["payload"]) if row.get("payload") else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
     return {
         "id":            row["id"],
         "ts":            row["ts"],
@@ -1071,7 +1078,10 @@ def latest_message(
     row = get_latest_signal(symbol)
     if not row:
         return {"message": "Sin señales registradas aun."}
-    payload = json.loads(row["payload"]) if row.get("payload") else {}
+    try:
+        payload = json.loads(row["payload"]) if row.get("payload") else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
     return {
         "scan_id": row["id"],
         "symbol":  row["symbol"],
@@ -1088,7 +1098,10 @@ def signal_by_id(scan_id: int):
     if not row:
         raise HTTPException(status_code=404, detail=f"Escaneo #{scan_id} no encontrado")
     row     = dict(row)
-    payload = json.loads(row["payload"]) if row.get("payload") else {}
+    try:
+        payload = json.loads(row["payload"]) if row.get("payload") else {}
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
     return {**row, "full_report": payload,
             "telegram_message": build_telegram_message(payload)}
 
