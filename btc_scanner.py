@@ -67,6 +67,10 @@ RSI_PERIOD     = 14
 BB_PERIOD      = 20
 BB_STDEV       = 2.0
 VOL_PERIOD     = 20
+ATR_PERIOD     = 14
+ATR_SL_MULT    = 1.5    # SL = entry - 1.5x ATR
+ATR_TP_MULT    = 3.0    # TP = entry + 3.0x ATR (mantiene ratio 2:1)
+ATR_BE_MULT    = 1.5    # Mover SL a breakeven cuando profit >= 1.5x ATR
 
 # ── Parámetros de la estrategia Spot 1H ────────────────────────────────────
 LRC_LONG_MAX   = 25.0     # LRC% ≤ 25  →  zona de entrada
@@ -367,6 +371,19 @@ def calc_bb(close: pd.Series, period=20, k=2.0):
 
 def calc_sma(close: pd.Series, period: int):
     return close.rolling(period).mean()
+
+
+def calc_atr(df: pd.DataFrame, period=14) -> pd.Series:
+    """Average True Range — mide la volatilidad real del mercado."""
+    high = df["high"]
+    low = df["low"]
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
 
 
 def detect_bull_engulfing(df: pd.DataFrame):

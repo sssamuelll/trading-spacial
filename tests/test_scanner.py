@@ -838,3 +838,43 @@ class TestFmt:
         rep["blocks_auto"] = ["E1: BullEngulfing activo"]
         result = scanner.fmt(rep)
         assert "BullEngulfing" in result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TESTS — calc_atr
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCalcATR:
+    def _make_df(self, n=30):
+        np.random.seed(42)
+        close = 100 + np.cumsum(np.random.randn(n) * 0.5)
+        high = close + np.abs(np.random.randn(n) * 0.3)
+        low = close - np.abs(np.random.randn(n) * 0.3)
+        return pd.DataFrame({"high": high, "low": low, "close": close})
+
+    def test_retorna_series(self):
+        from btc_scanner import calc_atr
+        df = self._make_df()
+        atr = calc_atr(df, period=14)
+        assert isinstance(atr, pd.Series)
+        assert len(atr) == len(df)
+
+    def test_valores_positivos(self):
+        from btc_scanner import calc_atr
+        df = self._make_df()
+        atr = calc_atr(df, period=14)
+        valid = atr.dropna()
+        assert (valid > 0).all()
+
+    def test_primeros_nan(self):
+        from btc_scanner import calc_atr
+        df = self._make_df()
+        atr = calc_atr(df, period=14)
+        assert pd.isna(atr.iloc[0])
+
+    def test_periodo_custom(self):
+        from btc_scanner import calc_atr
+        df = self._make_df(50)
+        atr7 = calc_atr(df, period=7)
+        atr21 = calc_atr(df, period=21)
+        assert atr7.dropna().iloc[0] != atr21.dropna().iloc[0]
