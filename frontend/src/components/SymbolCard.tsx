@@ -54,11 +54,29 @@ const SymbolCard: React.FC<SymbolCardProps> = ({ symbol, onClick }) => {
   if (isSenal) cardClass += ' symbol-card--signal';
   else if (isSetup) cardClass += ' symbol-card--setup';
 
+  const isShort = isSenal && symbol.direction === 'SHORT';
+
   let badgeClass = 'card-badge';
   let badgeText = '—';
+  let badgeStyle: React.CSSProperties = {};
   if (isSenal) {
-    badgeClass += ' card-badge--signal';
-    badgeText = 'SEÑAL';
+    if (isShort) {
+      badgeClass += ' card-badge--short';
+      badgeText = 'SHORT';
+      badgeStyle = {
+        background: 'rgba(239,68,68,0.15)',
+        color: '#ef4444',
+        border: '1px solid rgba(239,68,68,0.3)',
+      };
+    } else {
+      badgeClass += ' card-badge--signal';
+      badgeText = 'LONG';
+      badgeStyle = {
+        background: 'rgba(34,197,94,0.15)',
+        color: '#22c55e',
+        border: '1px solid rgba(34,197,94,0.3)',
+      };
+    }
   } else if (isSetup) {
     badgeClass += ' card-badge--setup';
     badgeText = 'SETUP';
@@ -78,9 +96,10 @@ const SymbolCard: React.FC<SymbolCardProps> = ({ symbol, onClick }) => {
         </div>
         <div className="card-header-right">
           <span className="card-chart-icon">↗</span>
-          <span className={badgeClass}>
+          <span className={badgeClass} style={badgeStyle}>
             {badgeText}
-            {isSenal && <span className="badge-dot badge-dot--green" />}
+            {isSenal && !isShort && <span className="badge-dot badge-dot--green" />}
+            {isSenal && isShort && <span className="badge-dot badge-dot--red" />}
             {isSetup && <span className="badge-dot badge-dot--amber" />}
           </span>
         </div>

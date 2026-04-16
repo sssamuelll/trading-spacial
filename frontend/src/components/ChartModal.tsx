@@ -300,6 +300,14 @@ const ChartModal: React.FC<ChartModalProps> = ({ symbol, onClose }) => {
               {lrc != null ? `${lrc.toFixed(1)}%` : '—'}
             </span>
           </div>
+          {symbol.direction && (
+            <div className="chart-chip">
+              <span className="chart-chip-label">Dir</span>
+              <span className="chart-chip-val" style={{ color: symbol.direction === 'SHORT' ? '#ef4444' : '#22c55e' }}>
+                {symbol.direction}
+              </span>
+            </div>
+          )}
           <div className="chart-chip">
             <span className="chart-chip-label">Score</span>
             <span className="chart-chip-val" style={{ color: scoreColor }}>
