@@ -461,8 +461,8 @@ def db_create_position(data: dict) -> dict:
     cur = con.execute("""
         INSERT INTO positions
             (scan_id, symbol, direction, status, entry_price, entry_ts,
-             sl_price, tp_price, size_usd, qty, atr_entry, notes)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+             sl_price, tp_price, size_usd, qty, atr_entry, be_mult, notes)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         data.get("scan_id"),
         data["symbol"].upper(),
@@ -475,6 +475,7 @@ def db_create_position(data: dict) -> dict:
         data.get("size_usd"),
         qty,
         data.get("atr_entry"),
+        data.get("be_mult"),
         data.get("notes", ""),
     ))
     pos_id = cur.lastrowid
@@ -520,7 +521,7 @@ def db_close_position(pos_id: int, exit_price: float, exit_reason: str) -> Optio
 
 
 def db_update_position(pos_id: int, data: dict) -> Optional[dict]:
-    allowed = {"sl_price", "tp_price", "size_usd", "qty", "notes", "entry_price", "atr_entry"}
+    allowed = {"sl_price", "tp_price", "size_usd", "qty", "notes", "entry_price", "atr_entry", "be_mult"}
     updates = {k: v for k, v in data.items() if k in allowed}
     if not updates:
         return None
@@ -548,10 +549,11 @@ def check_position_stops(symbol: str, price: float):
         reason = None
         exit_price = None
 
-        # Trailing ratchet: move SL to breakeven when profit >= 1.5x ATR
+        # Trailing ratchet: move SL to breakeven when profit >= be_mult × ATR
         atr_entry = pos.get("atr_entry")
+        _be_mult = pos.get("be_mult") or 1.5  # per-symbol from config, fallback 1.5
         if atr_entry and pos["direction"] == "LONG" and pos["sl_price"]:
-            be_threshold = pos["entry_price"] + round(atr_entry * 1.5, 2)
+            be_threshold = pos["entry_price"] + round(atr_entry * _be_mult, 2)
             if price >= be_threshold and pos["sl_price"] < pos["entry_price"]:
                 new_sl = pos["entry_price"]
                 con_trail = get_db()
@@ -564,7 +566,7 @@ def check_position_stops(symbol: str, price: float):
                 pos["sl_price"] = new_sl
                 log.info(f"Trailing: #{pos['id']} {symbol} SL moved to breakeven ${new_sl:.2f}")
         elif atr_entry and pos["direction"] == "SHORT" and pos["sl_price"]:
-            be_threshold = pos["entry_price"] - round(atr_entry * 1.5, 2)
+            be_threshold = pos["entry_price"] - round(atr_entry * _be_mult, 2)
             if price <= be_threshold and pos["sl_price"] > pos["entry_price"]:
                 new_sl = pos["entry_price"]
                 con_trail = get_db()
@@ -819,6 +821,7 @@ def init_db():
             pnl_usd     REAL,
             pnl_pct     REAL,
             atr_entry   REAL,
+            be_mult     REAL,
             notes       TEXT
         )
     """)
@@ -849,7 +852,7 @@ def init_db():
     con.close()
     log.info(f"DB inicializada: {DB_FILE}")
 
-    # Migrate: add atr_entry column if missing
+    # Migrate: add atr_entry and be_mult columns if missing
     try:
         con_mig = get_db()
         cols = [r[1] for r in con_mig.execute("PRAGMA table_info(positions)").fetchall()]
@@ -857,6 +860,10 @@ def init_db():
             con_mig.execute("ALTER TABLE positions ADD COLUMN atr_entry REAL")
             con_mig.commit()
             log.info("DB migration: added atr_entry column to positions")
+        if "be_mult" not in cols:
+            con_mig.execute("ALTER TABLE positions ADD COLUMN be_mult REAL")
+            con_mig.commit()
+            log.info("DB migration: added be_mult column to positions")
         con_mig.close()
     except Exception as e:
         log.warning(f"DB migration check: {e}")

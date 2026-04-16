@@ -1226,6 +1226,30 @@ class TestPositionsCRUD:
         assert len(updated) == 1
         assert updated[0]["sl_price"] == 60000.0  # unchanged
 
+    def test_trailing_ratchet_uses_custom_be_mult(self):
+        """be_mult from position overrides the default 1.5."""
+        import btc_api
+        pos = btc_api.db_create_position({
+            "symbol": "DOGEUSDT",
+            "entry_price": 0.10,
+            "sl_price": 0.09,
+            "tp_price": 0.14,
+            "direction": "LONG",
+            "atr_entry": 0.005,
+            "be_mult": 2.0,  # custom: breakeven at entry + 2.0 * 0.005 = 0.11
+        })
+        # Price at 0.108 — above 1.5x ATR (0.1075) but below 2.0x ATR (0.11)
+        btc_api.check_position_stops("DOGEUSDT", 0.108)
+        updated = btc_api.db_get_positions(status="open")
+        assert len(updated) == 1
+        assert updated[0]["sl_price"] == 0.09  # NOT at breakeven yet (be_mult=2.0)
+
+        # Price at 0.111 — above 2.0x ATR threshold
+        btc_api.check_position_stops("DOGEUSDT", 0.111)
+        updated = btc_api.db_get_positions(status="open")
+        assert len(updated) == 1
+        assert updated[0]["sl_price"] == 0.10  # NOW at breakeven
+
     def test_position_without_atr_skips_trailing(self):
         """Legacy positions without atr_entry skip trailing logic."""
         import btc_api

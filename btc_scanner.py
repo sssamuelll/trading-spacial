@@ -933,6 +933,7 @@ def scan(symbol: str = None):
         return rep
     _sl_m = _so.get("atr_sl_mult", ATR_SL_MULT) if isinstance(_so, dict) else ATR_SL_MULT
     _tp_m = _so.get("atr_tp_mult", ATR_TP_MULT) if isinstance(_so, dict) else ATR_TP_MULT
+    _be_m = _so.get("atr_be_mult", ATR_BE_MULT) if isinstance(_so, dict) else ATR_BE_MULT
 
     sl_dist    = atr_val * _sl_m
     tp_dist    = atr_val * _tp_m
@@ -1009,6 +1010,7 @@ def scan(symbol: str = None):
             "atr_1h":      round(atr_val, 2),
             "atr_sl_mult": _sl_m,
             "atr_tp_mult": _tp_m,
+            "atr_be_mult": _be_m,
             "sl_mode":     "atr",
             "sl_pct":      f"{sl_pct_val}%",
             "tp_pct":      f"{tp_pct_val}%",
