@@ -842,12 +842,17 @@ def scan(symbol: str = None):
     if bull_div:
         blocks_short.append("E6S: Divergencia alcista RSI (1H) — agotamiento bajista")
 
-    # ── Determinar direccion activa (filtrado por régimen de mercado) ────────
+    # ── Determinar direccion activa ─────────────────────────────────────────
+    # LONG-only: backtest demostro que SHORT no es rentable (2023-2025).
+    # En BEAR, la estrategia NO opera (protege capital en cash).
+    # El regime detector se usa para decidir si operar o pausar.
     direction = None
-    if in_long_zone and regime == "LONG":
+    if in_long_zone and regime in ("LONG", "NEUTRAL"):
         direction = "LONG"
-    elif in_short_zone and regime == "SHORT":
-        direction = "SHORT"
+    # SHORT deshabilitado por resultados de backtest — infraestructura lista
+    # pero no se activa. Si se quiere habilitar en el futuro:
+    # elif in_short_zone and regime == "SHORT":
+    #     direction = "SHORT"
 
     # ── Score de Confirmaciones 1H ────────────────────────────────────────────
     score = 0

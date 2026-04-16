@@ -273,10 +273,10 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
                     if price_score < 30:
                         regime = "SHORT"
 
+        # LONG-only: SHORT deshabilitado por resultados de backtest
+        # En BEAR regime, no opera (protege capital)
         if lrc_pct <= LRC_LONG_MAX and regime == "LONG":
             trade_dir = "LONG"
-        elif lrc_pct >= LRC_SHORT_MIN and regime == "SHORT":
-            trade_dir = "SHORT"
         else:
             continue
 
