@@ -11,16 +11,16 @@
 
 | Metric | Value |
 |--------|-------|
-| Total Trades | 358 |
-| Win Rate | 18.4% |
-| Profit Factor | 1.19 |
-| Net P&L | $+5,325.25 |
-| Total Return | +53.2% |
-| Max Drawdown | -15.2% |
-| Sharpe Ratio | 1.14 |
-| Sortino Ratio | 8.72 |
-| Final Equity | $15,325.25 |
-| Trades/Month | 9.1 |
+| Total Trades | 396 |
+| Win Rate | 17.4% |
+| Profit Factor | 1.11 |
+| Net P&L | $+3,403.06 |
+| Total Return | +34.0% |
+| Max Drawdown | -17.1% |
+| Sharpe Ratio | 0.98 |
+| Sortino Ratio | 6.8 |
+| Final Equity | $13,403.06 |
+| Trades/Month | 10.1 |
 
 ---
 
@@ -42,23 +42,23 @@
 
 | Metric | Value |
 |--------|-------|
-| Wins | 66 |
-| Losses | 292 |
+| Wins | 69 |
+| Losses | 327 |
 | Best Trade | +11.44% |
 | Worst Trade | -2.47% |
-| Median Trade | -0.36% |
-| Gross Profit | $33,806.35 |
-| Gross Loss | $28,481.10 |
+| Median Trade | -0.39% |
+| Gross Profit | $33,586.90 |
+| Gross Loss | $30,183.84 |
 
 ### Duration
 
 | Metric | Value |
 |--------|-------|
-| Avg Trade Duration | 11.9 hours |
-| Avg Win Duration | 23.5 hours |
+| Avg Trade Duration | 11.8 hours |
+| Avg Win Duration | 23.3 hours |
 | Avg Loss Duration | 9.3 hours |
 | Max Consecutive Wins | 2 |
-| Max Consecutive Losses | 14 |
+| Max Consecutive Losses | 19 |
 
 ---
 
@@ -68,9 +68,9 @@ Does higher score = better performance?
 
 | Tier | Trades | Win Rate | Avg P&L % | Total P&L $ |
 |------|--------|----------|-----------|-------------|
-| 0-1 (minimal) | 72 | 25.0% | +0.35% | $+2,059.77 |
-| 2-3 (standard) | 163 | 17.2% | +0.09% | $+1,483.28 |
-| 4+ (premium) | 123 | 16.3% | +0.17% | $+1,782.20 |
+| 0-1 (minimal) | 79 | 24.1% | +0.39% | $+1,953.11 |
+| 2-3 (standard) | 185 | 15.7% | +0.02% | $-479.20 |
+| 4+ (premium) | 132 | 15.9% | +0.17% | $+1,929.15 |
 
 ---
 
@@ -78,9 +78,9 @@ Does higher score = better performance?
 
 | Regime | Trades | Win Rate | Avg P&L % | Total P&L $ |
 |--------|--------|----------|-----------|-------------|
-| Bull | 131 | 19.1% | +0.28% | $+3,975.32 |
-| Bear | 7 | 0.0% | -0.44% | $-756.33 |
-| Sideways | 220 | 18.6% | +0.12% | $+2,106.26 |
+| Bull | 131 | 19.1% | +0.28% | $+3,751.02 |
+| Bear | 31 | 9.7% | -0.19% | $-1,496.44 |
+| Sideways | 234 | 17.5% | +0.11% | $+1,148.48 |
 
 ---
 
@@ -88,11 +88,11 @@ Does higher score = better performance?
 
 | Metric | Our Strategy | Freqtrade Top 10% | Jesse Published |
 |--------|-------------|-------------------|-----------------|
-| Win Rate | 18.4% | 55-65% | 45-55% |
-| Profit Factor | 1.19 | 1.5-2.5 | 1.3-2.0 |
-| Sharpe Ratio | 1.14 | 1.0-2.0 | 0.8-1.5 |
-| Max Drawdown | -15.2% | -10% to -25% | -15% to -30% |
-| Trades/Month | 9.1 | 15-40 | 10-30 |
+| Win Rate | 17.4% | 55-65% | 45-55% |
+| Profit Factor | 1.11 | 1.5-2.5 | 1.3-2.0 |
+| Sharpe Ratio | 0.98 | 1.0-2.0 | 0.8-1.5 |
+| Max Drawdown | -17.1% | -10% to -25% | -15% to -30% |
+| Trades/Month | 10.1 | 15-40 | 10-30 |
 | R:R Ratio | 2:1 (fixed) | 1.5:1-3:1 | 2:1-4:1 |
 
 ---
@@ -113,7 +113,7 @@ Based on backtest data:
 
 1. **Long-only limitation:** The strategy generates zero revenue during bear markets — it correctly avoids bad entries but misses short opportunities
 2. **Fixed SL/TP:** 2.0%/4.0% does not adapt to volatility — too tight in high-vol periods (premature SL hits), too loose in low-vol (slow TP fills)
-3. **Low trade frequency:** ~9.1 trades/month means capital sits idle most of the time
+3. **Low trade frequency:** ~10.1 trades/month means capital sits idle most of the time
 4. **No trailing stop:** Winners are capped at +4.0% even when the trend continues strongly
 5. **Static thresholds:** RSI < 40, LRC <= 25% — not adapted to different volatility regimes
 
@@ -142,14 +142,10 @@ Based on backtest data:
 
 | Entry | Exit | Entry $ | Exit $ | P&L % | Score | Reason |
 |-------|------|---------|--------|-------|-------|--------|
-| 2026-01-08 03:00 | 2026-01-08 06:00 | $90,813 | $90,229 | -0.64% | 3 | SL |
-| 2026-01-12 10:00 | 2026-01-13 14:00 | $90,433 | $92,742 | +2.55% | 4 | TP |
-| 2026-01-15 14:00 | 2026-01-15 15:00 | $96,063 | $95,519 | -0.57% | 2 | SL |
-| 2026-01-15 21:00 | 2026-01-16 15:00 | $95,584 | $94,904 | -0.71% | 1 | SL |
-| 2026-01-17 01:00 | 2026-01-18 01:00 | $95,400 | $94,979 | -0.44% | 1 | SL |
-| 2026-01-19 07:00 | 2026-01-19 23:00 | $92,842 | $92,350 | -0.53% | 6 | SL |
-| 2026-03-05 17:00 | 2026-03-06 12:00 | $70,704 | $69,907 | -1.13% | 5 | SL |
+| 2026-03-06 00:00 | 2026-03-06 04:00 | $70,988 | $70,325 | -0.93% | 1 | SL |
+| 2026-03-06 10:00 | 2026-03-06 12:00 | $70,528 | $70,019 | -0.72% | 1 | SL |
 | 2026-03-06 18:00 | 2026-03-07 07:00 | $68,181 | $67,535 | -0.95% | 3 | SL |
+| 2026-03-08 20:00 | 2026-03-09 03:00 | $67,239 | $67,239 | +0.00% | 3 | SL |
 | 2026-03-11 11:00 | 2026-03-11 13:00 | $69,173 | $71,016 | +2.66% | 2 | TP |
 | 2026-03-11 23:00 | 2026-03-12 02:00 | $70,192 | $69,512 | -0.97% | 2 | SL |
 | 2026-03-12 08:00 | 2026-03-12 13:00 | $69,917 | $69,917 | +0.00% | 3 | SL |
@@ -157,8 +153,12 @@ Based on backtest data:
 | 2026-03-17 22:00 | 2026-03-18 00:00 | $74,307 | $73,711 | -0.80% | 2 | SL |
 | 2026-03-18 06:00 | 2026-03-18 11:00 | $73,954 | $73,506 | -0.61% | 2 | SL |
 | 2026-03-18 18:00 | 2026-03-19 07:00 | $71,097 | $70,489 | -0.86% | 4 | SL |
+| 2026-03-29 07:00 | 2026-03-29 11:00 | $66,671 | $66,913 | -0.36% | 2 | SL |
+| 2026-03-29 17:00 | 2026-03-29 20:00 | $66,386 | $66,661 | -0.41% | 3 | SL |
+| 2026-03-31 01:00 | 2026-03-31 16:00 | $67,939 | $67,939 | +0.00% | 5 | SL |
+| 2026-03-31 23:00 | 2026-04-01 06:00 | $68,284 | $68,935 | -0.95% | 4 | SL |
+| 2026-04-01 16:00 | 2026-04-02 02:00 | $68,816 | $66,754 | +3.00% | 1 | TP |
+| 2026-04-04 15:00 | 2026-04-04 19:00 | $67,384 | $67,536 | -0.23% | 5 | SL |
 | 2026-04-07 12:00 | 2026-04-07 14:00 | $68,392 | $67,970 | -0.62% | 2 | SL |
 | 2026-04-09 04:00 | 2026-04-09 13:00 | $70,782 | $70,782 | +0.00% | 2 | SL |
-| 2026-04-12 03:00 | 2026-04-12 12:00 | $71,593 | $71,122 | -0.66% | 5 | SL |
-| 2026-04-12 18:00 | 2026-04-12 22:00 | $71,138 | $70,889 | -0.35% | 4 | SL |
-| 2026-04-13 04:00 | 2026-04-13 13:00 | $70,890 | $70,890 | +0.00% | 5 | SL |
+| 2026-04-13 01:00 | 2026-04-13 05:00 | $71,198 | $70,841 | -0.50% | 3 | SL |
