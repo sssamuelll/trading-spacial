@@ -916,8 +916,26 @@ def scan(symbol: str = None):
     capital    = 1000.0
     risk_usd   = capital * 0.01
 
-    sl_dist    = atr_val * ATR_SL_MULT
-    tp_dist    = atr_val * ATR_TP_MULT
+    # Per-symbol ATR overrides from config
+    _cfg_path = os.path.join(SCRIPT_DIR, "config.json")
+    _sym_overrides = {}
+    if os.path.exists(_cfg_path):
+        try:
+            with open(_cfg_path) as _f:
+                _sym_overrides = json.load(_f).get("symbol_overrides", {})
+        except Exception:
+            pass
+    _so = _sym_overrides.get(symbol, {})
+    if _so is False:
+        # Symbol disabled — no signal
+        rep.update({"estado": f"⛔ {symbol} deshabilitado en config", "señal_activa": False,
+                    "direction": None, "price": round(price, 2)})
+        return rep
+    _sl_m = _so.get("atr_sl_mult", ATR_SL_MULT) if isinstance(_so, dict) else ATR_SL_MULT
+    _tp_m = _so.get("atr_tp_mult", ATR_TP_MULT) if isinstance(_so, dict) else ATR_TP_MULT
+
+    sl_dist    = atr_val * _sl_m
+    tp_dist    = atr_val * _tp_m
 
     if direction == "SHORT":
         sl_price   = round(price + sl_dist, 2)   # SL arriba para SHORT
@@ -989,6 +1007,8 @@ def scan(symbol: str = None):
             "capital_usd": capital,
             "riesgo_usd":  round(risk_usd, 2),
             "atr_1h":      round(atr_val, 2),
+            "atr_sl_mult": _sl_m,
+            "atr_tp_mult": _tp_m,
             "sl_mode":     "atr",
             "sl_pct":      f"{sl_pct_val}%",
             "tp_pct":      f"{tp_pct_val}%",
