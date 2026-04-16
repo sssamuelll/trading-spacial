@@ -74,6 +74,7 @@ ATR_BE_MULT    = 1.5    # Mover SL a breakeven cuando profit >= 1.5x ATR
 
 # ── Parámetros de la estrategia Spot 1H ────────────────────────────────────
 LRC_LONG_MAX   = 25.0     # LRC% ≤ 25  →  zona de entrada
+LRC_SHORT_MIN  = 75.0     # LRC% >= 75  →  zona de entrada SHORT
 SL_PCT         = 2.0      # Stop Loss  2.0%
 TP_PCT         = 4.0      # Take Profit 4.0%
 COOLDOWN_H     = 6        # Horas mínimas entre trades
@@ -459,6 +460,20 @@ def detect_bull_engulfing(df: pd.DataFrame):
             and c["close"] >= p["open"])    # cierra ≥ open anterior
 
 
+def detect_bear_engulfing(df: pd.DataFrame):
+    """
+    BearEngulfing: vela anterior alcista completamente engullida por vela bajista.
+    Si está activo → NO entrar SHORT (exclusion para shorts).
+    """
+    if len(df) < 2:
+        return False
+    p, c = df.iloc[-2], df.iloc[-1]
+    return bool(p["close"] > p["open"]          # anterior alcista
+               and c["close"] < c["open"]      # actual bajista
+               and c["open"]  >= p["close"]    # abre >= cierre anterior
+               and c["close"] <= p["open"])    # cierra <= open anterior
+
+
 def calc_cvd_delta(df: pd.DataFrame, n=3):
     """Proxy CVD: volumen taker buy − sell últimas n barras."""
     buy  = df["taker_buy_base"].tail(n)
@@ -553,6 +568,36 @@ def check_trigger_5m(df5: pd.DataFrame):
     return trigger_active, details
 
 
+def check_trigger_5m_short(df5: pd.DataFrame):
+    """
+    Evalúa si la última vela de 5M activa el gatillo de entrada SHORT.
+
+    Gatillo SHORT ACTIVO cuando:
+      1. Vela 5M cierra bajista (close < open)
+      2. RSI 5M está cayendo (RSI actual < RSI vela anterior)
+    """
+    if len(df5) < 3:
+        return False, {}
+
+    rsi5        = calc_rsi(df5["close"], RSI_PERIOD)
+    cur         = df5.iloc[-1]
+
+    bearish_candle  = bool(cur["close"] < cur["open"])
+    rsi_falling     = bool(rsi5.iloc[-1] < rsi5.iloc[-2])
+
+    trigger_active = bearish_candle and rsi_falling
+
+    details = {
+        "vela_5m_bajista":    bearish_candle,
+        "rsi_5m_cayendo":     rsi_falling,
+        "rsi_5m_actual":      round(rsi5.iloc[-1], 2),
+        "rsi_5m_anterior":    round(rsi5.iloc[-2], 2),
+        "close_5m":           round(cur["close"], 2),
+        "open_5m":            round(cur["open"], 2),
+    }
+    return trigger_active, details
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  SCANNER PRINCIPAL
 # ─────────────────────────────────────────────────────────────────────────────
@@ -566,8 +611,18 @@ def scan(symbol: str = None):
     df5  = get_klines(symbol, "5m",  limit=210)   # gatillo
     df1h = get_klines(symbol, "1h",  limit=210)   # señal principal
     df4h = get_klines(symbol, "4h",  limit=150)   # contexto macro
+    df1d = get_klines(symbol, "1d",  limit=250)   # régimen de mercado (SMA200)
 
     price = df1h["close"].iloc[-1]   # precio de cierre de la última vela 1H
+
+    # ── Régimen de mercado (Death Cross = bear confirmado) ───────────────────
+    sma50_d  = calc_sma(df1d["close"], 50).iloc[-1] if len(df1d) >= 50 else None
+    sma200_d = calc_sma(df1d["close"], 200).iloc[-1] if len(df1d) >= 200 else None
+    if (sma50_d and sma200_d and not pd.isna(sma50_d) and not pd.isna(sma200_d)
+            and sma50_d < sma200_d and price < sma200_d):
+        regime = "SHORT"  # death cross + precio debajo = bear confirmado
+    else:
+        regime = "LONG"   # default: mercado alcista o neutral
 
     # ── Indicadores 1H (señal) ────────────────────────────────────────────────
     lrc_pct, lrc_up, lrc_dn, lrc_mid = calc_lrc(df1h["close"], LRC_PERIOD, LRC_STDEV)
@@ -600,10 +655,15 @@ def scan(symbol: str = None):
     price_above_4h = bool(price > sma100_4h)
 
     # ── Condición Primaria (1H) ───────────────────────────────────────────────
-    in_long_zone = lrc_pct is not None and lrc_pct <= LRC_LONG_MAX
+    in_long_zone  = lrc_pct is not None and lrc_pct <= LRC_LONG_MAX
+    in_short_zone = lrc_pct is not None and lrc_pct >= LRC_SHORT_MIN
 
     # ── Contexto macro 4H ─────────────────────────────────────────────────────
-    macro_ok = price_above_4h   # precio por encima de SMA100 en 4H
+    macro_long  = price_above_4h    # precio por encima de SMA100 en 4H
+    macro_short = not price_above_4h  # precio por debajo de SMA100 en 4H
+
+    # Bear engulfing (exclusion para SHORT)
+    bear_eng = detect_bear_engulfing(df1h)
 
     # ── Condiciones de Exclusión (Spot V6) ────────────────────────────────────
     excl = {
@@ -637,13 +697,26 @@ def scan(symbol: str = None):
         },
     }
 
-    blocks = []
+    blocks_long = []
     if bull_eng:
-        blocks.append("E1: BullEngulfing activo — posible micro-techo, esperar próxima vela")
+        blocks_long.append("E1: BullEngulfing activo — posible micro-techo")
     if bear_div:
-        blocks.append("E6: Divergencia bajista RSI (1H) — señal de agotamiento alcista")
+        blocks_long.append("E6: Divergencia bajista RSI (1H) — agotamiento alcista")
 
-    # ── Score de Confirmaciones 1H (Spot V6) ──────────────────────────────────
+    blocks_short = []
+    if bear_eng:
+        blocks_short.append("E1S: BearEngulfing activo — posible micro-suelo")
+    if bull_div:
+        blocks_short.append("E6S: Divergencia alcista RSI (1H) — agotamiento bajista")
+
+    # ── Determinar direccion activa (filtrado por régimen de mercado) ────────
+    direction = None
+    if in_long_zone and regime == "LONG":
+        direction = "LONG"
+    elif in_short_zone and regime == "SHORT":
+        direction = "SHORT"
+
+    # ── Score de Confirmaciones 1H ────────────────────────────────────────────
     score = 0
     conf  = {}
 
@@ -656,86 +729,103 @@ def scan(symbol: str = None):
             entry.update(extra)
         conf[key] = entry
 
-    # C1: RSI 1H < 40
-    add("C1_RSI_Sobreventa",      2, cur_rsi1h < 40,
-        {"rsi_1h": cur_rsi1h})
+    if direction == "SHORT":
+        # Score SHORT (invertido)
+        add("C1_RSI_Sobrecompra",     2, cur_rsi1h > 60,
+            {"rsi_1h": cur_rsi1h})
+        add("C2_Divergencia_Bajista", 2, bear_div)
+        dist_res = abs(price - lrc_up) / price * 100 if lrc_up else 999
+        add("C3_Resistencia_Cercana", 1, dist_res <= 1.5,
+            {"dist_resistencia_pct": round(dist_res, 2)})
+        add("C4_BB_Superior",         1, price >= bb_up1h.iloc[-1],
+            {"bb_upper_1h": round(bb_up1h.iloc[-1], 2)})
+        add("C5_Volumen",             1, bool(vol_1h >= vol_avg1h),
+            {"vol_ratio": round(vol_1h / vol_avg1h, 2)})
+        add("C6_CVD_Delta_Negativo",  1, cvd_1h < 0,
+            {"cvd_delta": round(cvd_1h, 4)})
+        add("C7_SMA10_menor_SMA20",   1, sma10_1h < sma20_1h,
+            {"sma10": round(sma10_1h, 2), "sma20": round(sma20_1h, 2)})
+    else:
+        # Score LONG (original)
+        add("C1_RSI_Sobreventa",      2, cur_rsi1h < 40,
+            {"rsi_1h": cur_rsi1h})
+        add("C2_Divergencia_Alcista", 2, bull_div)
+        dist_sup = abs(price - lrc_dn) / price * 100 if lrc_dn else 999
+        add("C3_Soporte_Cercano",     1, dist_sup <= 1.5,
+            {"dist_soporte_pct": round(dist_sup, 2)})
+        add("C4_BB_Inferior",         1, price <= bb_dn1h.iloc[-1],
+            {"bb_lower_1h": round(bb_dn1h.iloc[-1], 2)})
+        add("C5_Volumen",             1, bool(vol_1h >= vol_avg1h),
+            {"vol_ratio": round(vol_1h / vol_avg1h, 2)})
+        add("C6_CVD_Delta_Positivo",  1, cvd_1h > 0,
+            {"cvd_delta": round(cvd_1h, 4)})
+        add("C7_SMA10_mayor_SMA20",   1, sma10_1h > sma20_1h,
+            {"sma10": round(sma10_1h, 2), "sma20": round(sma20_1h, 2)})
 
-    # C2: Divergencia alcista RSI (1H)
-    add("C2_Divergencia_Alcista", 2, bull_div)
-
-    # C3: Cerca de soporte (LRC lower como proxy de soporte estructural)
-    dist_sup = abs(price - lrc_dn) / price * 100 if lrc_dn else 999
-    add("C3_Soporte_Cercano",     1, dist_sup <= 1.5,
-        {"dist_soporte_pct": round(dist_sup, 2)})
-
-    # C4: Toque de Banda de Bollinger inferior (1H)
-    add("C4_BB_Inferior",         1, price <= bb_dn1h.iloc[-1],
-        {"bb_lower_1h": round(bb_dn1h.iloc[-1], 2)})
-
-    # C5: Volumen por encima del promedio (1H)
-    add("C5_Volumen",             1, bool(vol_1h >= vol_avg1h),
-        {"vol_ratio": round(vol_1h / vol_avg1h, 2)})
-
-    # C6: CVD Delta positivo (compradores netos en últimas 3 barras 1H)
-    add("C6_CVD_Delta_Positivo",  1, cvd_1h > 0,
-        {"cvd_delta": round(cvd_1h, 4)})
-
-    # C7: SMA10 > SMA20 (tendencia local alcista en 1H)
-    add("C7_SMA10_mayor_SMA20",   1, sma10_1h > sma20_1h,
-        {"sma10": round(sma10_1h, 2), "sma20": round(sma20_1h, 2)})
-
-    # C8: DXY (manual)
-    conf["C8_DXY_Bajando"] = {
+    conf["C8_DXY"] = {
         "pass": "MANUAL", "pts": "?", "max_pts": 1,
-        "nota": "DXY bajando o lateral → verificar TradingView (DXY < SMA20)",
+        "nota": "DXY verificar TradingView (DXY < SMA20 para LONG, > SMA20 para SHORT)",
     }
 
     # ── Gatillo 5M ────────────────────────────────────────────────────────────
-    trigger_active, trigger_details = check_trigger_5m(df5)
+    if direction == "SHORT":
+        trigger_active, trigger_details = check_trigger_5m_short(df5)
+    else:
+        trigger_active, trigger_details = check_trigger_5m(df5)
 
-    # ── Sizing informativo (1H Spot) ──────────────────────────────────────────
+    # ── Sizing informativo ────────────────────────────────────────────────────
     atr_val    = float(calc_atr(df1h, ATR_PERIOD).iloc[-1])
     capital    = 1000.0
     risk_usd   = capital * 0.01
 
-    # ATR-based SL/TP (adaptativo a volatilidad)
     sl_dist    = atr_val * ATR_SL_MULT
     tp_dist    = atr_val * ATR_TP_MULT
-    sl_price   = round(price - sl_dist, 2)
-    tp_price   = round(price + tp_dist, 2)
+
+    if direction == "SHORT":
+        sl_price   = round(price + sl_dist, 2)   # SL arriba para SHORT
+        tp_price   = round(price - tp_dist, 2)   # TP abajo para SHORT
+    else:
+        sl_price   = round(price - sl_dist, 2)   # SL abajo para LONG
+        tp_price   = round(price + tp_dist, 2)   # TP arriba para LONG
+
     sl_pct_val = round(sl_dist / price * 100, 2)
     tp_pct_val = round(tp_dist / price * 100, 2)
 
     qty_btc    = risk_usd / sl_dist
     val_pos    = qty_btc * price
-    # Spot: valor posicion no puede superar 98% del capital
     if val_pos > capital * 0.98:
         qty_btc = (capital * 0.98) / price
         val_pos  = qty_btc * price
 
     # ── Veredicto ─────────────────────────────────────────────────────────────
-    if not in_long_zone:
-        estado = "⏳ SIN SETUP — LRC% fuera de zona (> 25%)"
+    blocks = blocks_long if direction == "LONG" else blocks_short if direction == "SHORT" else []
+    macro_ok = macro_long if direction == "LONG" else macro_short if direction == "SHORT" else False
+
+    if direction is None:
+        estado = "⏳ SIN SETUP — LRC% fuera de zona (25%-75%)"
         señal  = False
     elif blocks:
-        estado = f"🚫 BLOQUEADA — {len(blocks)} condición(es) de exclusión automática"
+        estado = f"🚫 BLOQUEADA {direction} — {len(blocks)} exclusión(es) automática"
         señal  = False
     elif not macro_ok:
-        estado = "⚠️  SETUP TÉCNICO — Macro 4H adversa (precio < SMA100 4H)"
+        macro_desc = "precio < SMA100 4H" if direction == "LONG" else "precio > SMA100 4H"
+        estado = f"⚠️  SETUP {direction} — Macro 4H adversa ({macro_desc})"
         señal  = False
     elif not trigger_active:
-        estado = "🕐 SETUP VÁLIDO — Esperando gatillo 5M"
+        estado = f"🕐 SETUP {direction} VÁLIDO — Esperando gatillo 5M"
         señal  = False
     else:
-        # Señal completa
         sl = score_label(score)
-        estado = f"✅ SEÑAL + GATILLO CONFIRMADOS — Calidad: {sl}"
+        estado = f"✅ SEÑAL {direction} + GATILLO CONFIRMADOS — Calidad: {sl}"
         señal  = True
 
     # ── Consolidar ────────────────────────────────────────────────────────────
     rep.update({
         "estado":         estado,
         "señal_activa":   señal,
+        "direction":      direction,
+        "regime":         regime,
+        "sma200_daily":   round(sma200_d, 2) if sma200_d and not pd.isna(sma200_d) else None,
         "price":          round(price, 2),
         "lrc_1h": {
             "pct":   lrc_pct,
@@ -814,9 +904,10 @@ def fmt(rep):
         SEP,
         f"  💰 PRECIO (cierre 1H) : ${rep['price']:,.2f}",
         f"  📡 ESTADO             : {rep['estado']}",
+        f"  📐 DIRECCION          : {rep.get('direction') or 'N/A'}",
         DIV,
         "  ── SETUP 1H  (señal principal) ──────────────────────────",
-        f"  LRC 1H : {rep['lrc_1h']['pct']}%   {'✅ ZONA LONG (≤ 25%)' if rep['lrc_1h']['pct'] and rep['lrc_1h']['pct'] <= 25 else '⏳ Fuera de zona'}",
+        f"  LRC 1H : {rep['lrc_1h']['pct']}%   {'✅ ZONA LONG (≤ 25%)' if rep['lrc_1h']['pct'] and rep['lrc_1h']['pct'] <= 25 else '🔴 ZONA SHORT (≥ 75%)' if rep['lrc_1h']['pct'] and rep['lrc_1h']['pct'] >= 75 else '⏳ Fuera de zona'}",
         f"  Upper  : ${rep['lrc_1h']['upper']}   |   Mid : ${rep['lrc_1h']['mid']}   |   Lower : ${rep['lrc_1h']['lower']}",
         f"  RSI 1H : {rep['rsi_1h']}  {'✅ Sobreventa' if rep['rsi_1h'] < 40 else ''}",
         DIV,

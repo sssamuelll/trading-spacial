@@ -574,7 +574,7 @@ class TestScan:
     @patch("btc_scanner.get_klines")
     def test_scan_retorna_dict_con_claves(self, mock_klines):
         df1h, df4h, df5m = self._make_scan_mock()
-        mock_klines.side_effect = [df5m, df1h, df4h]  # 5m, 1h, 4h
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h]  # 5m, 1h, 4h, 1d
 
         rep = scanner.scan()
 
@@ -589,7 +589,7 @@ class TestScan:
     @patch("btc_scanner.get_klines")
     def test_scan_precio_es_float(self, mock_klines):
         df1h, df4h, df5m = self._make_scan_mock()
-        mock_klines.side_effect = [df5m, df1h, df4h]
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h]
 
         rep = scanner.scan("ETHUSDT")
         assert isinstance(rep["price"], float)
@@ -598,7 +598,7 @@ class TestScan:
     @patch("btc_scanner.get_klines")
     def test_scan_señal_activa_es_bool(self, mock_klines):
         df1h, df4h, df5m = self._make_scan_mock()
-        mock_klines.side_effect = [df5m, df1h, df4h]
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h]
 
         rep = scanner.scan()
         assert isinstance(rep["señal_activa"], bool)
@@ -612,7 +612,7 @@ class TestScan:
         df1h = make_ohlcv(n=n, base_price=85000, trend=100, noise=10)
         df4h = make_ohlcv(n=150, base_price=85000, noise=50)
         df5m = make_ohlcv(n=210, base_price=85000, noise=50)
-        mock_klines.side_effect = [df5m, df1h, df4h]
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h]
 
         rep = scanner.scan()
         # No garantizamos el valor exacto de lrc_pct ya que depende del canal,
@@ -624,7 +624,7 @@ class TestScan:
     def test_scan_sizing_coherente(self, mock_klines):
         """Verifica que el sizing no supere el 98% del capital."""
         df1h, df4h, df5m = self._make_scan_mock()
-        mock_klines.side_effect = [df5m, df1h, df4h]
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h]
 
         rep = scanner.scan()
         sz = rep["sizing_1h"]
@@ -636,7 +636,7 @@ class TestScan:
     def test_scan_sl_tp_coherentes(self, mock_klines):
         """SL debe ser menor al precio, TP mayor."""
         df1h, df4h, df5m = self._make_scan_mock()
-        mock_klines.side_effect = [df5m, df1h, df4h]
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h]
 
         rep = scanner.scan()
         price = rep["price"]
@@ -648,7 +648,7 @@ class TestScan:
     def test_scan_json_serializable(self, mock_klines):
         """El reporte debe ser completamente serializable a JSON."""
         df1h, df4h, df5m = self._make_scan_mock()
-        mock_klines.side_effect = [df5m, df1h, df4h]
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h]
 
         rep = scanner.scan()
         # Esto no debe lanzar excepción
@@ -659,7 +659,7 @@ class TestScan:
     def test_scan_score_en_rango(self, mock_klines):
         """El score debe estar entre 0 y 10."""
         df1h, df4h, df5m = self._make_scan_mock()
-        mock_klines.side_effect = [df5m, df1h, df4h]
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h]
 
         rep = scanner.scan()
         assert 0 <= rep["score"] <= 10
@@ -667,7 +667,7 @@ class TestScan:
     @patch("btc_scanner.get_klines")
     def test_scan_sizing_uses_atr(self, mock_klines):
         df1h, df4h, df5m = self._make_scan_mock()
-        mock_klines.side_effect = [df5m, df1h, df4h]
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h]
 
         rep = scanner.scan("BTCUSDT")
         sz = rep["sizing_1h"]
@@ -946,3 +946,93 @@ class TestCalcATR:
         atr7 = calc_atr(df, period=7)
         atr21 = calc_atr(df, period=21)
         assert atr7.dropna().iloc[0] != atr21.dropna().iloc[0]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TESTS — detect_bear_engulfing
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDetectBearEngulfing:
+    def test_detecta_bear_engulfing(self):
+        from btc_scanner import detect_bear_engulfing
+        df = pd.DataFrame({
+            "open":  [100, 105],
+            "high":  [106, 106],
+            "low":   [99,  98],
+            "close": [105, 99],   # prev bullish, current bearish engulfs
+        })
+        assert detect_bear_engulfing(df) is True
+
+    def test_no_engulfing_ambas_bajistas(self):
+        from btc_scanner import detect_bear_engulfing
+        df = pd.DataFrame({
+            "open":  [105, 104],
+            "high":  [106, 105],
+            "low":   [99,  98],
+            "close": [100, 99],
+        })
+        assert detect_bear_engulfing(df) is False
+
+    def test_datos_insuficientes(self):
+        from btc_scanner import detect_bear_engulfing
+        df = pd.DataFrame({"open": [100], "high": [101], "low": [99], "close": [100]})
+        assert detect_bear_engulfing(df) is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TESTS — check_trigger_5m_short
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCheckTrigger5MShort:
+    def _make_df5_short(self, bearish_last=True, rsi_falling=True, n=30):
+        """Construye un DataFrame 5M con control de la última vela para SHORT."""
+        base = 85000.0
+        rng = np.random.default_rng(0)
+        closes = base + rng.normal(0, 100, n)
+        opens  = closes + rng.normal(0, 50, n)
+        volume = np.full(n, 500.0)
+        tbb    = volume * 0.5
+
+        df = pd.DataFrame({
+            "open":  opens,
+            "close": closes,
+            "high":  closes + 150,
+            "low":   closes - 150,
+            "volume": volume,
+            "taker_buy_base":  tbb,
+            "taker_buy_quote": tbb * closes,
+        })
+
+        # Forzar condición de la última vela
+        if bearish_last:
+            df.iloc[-1, df.columns.get_loc("close")] = df.iloc[-1]["open"] - 200
+        else:
+            df.iloc[-1, df.columns.get_loc("close")] = df.iloc[-1]["open"] + 200
+
+        # Forzar RSI cayendo: barras anteriores con precio alto, última con precio bajo
+        if rsi_falling:
+            df.iloc[-5:-1, df.columns.get_loc("close")] += 500
+        return df
+
+    def test_trigger_short_activo(self):
+        from btc_scanner import check_trigger_5m_short
+        df5 = self._make_df5_short(bearish_last=True, rsi_falling=True)
+        active, details = check_trigger_5m_short(df5)
+        assert details["vela_5m_bajista"] is True
+        assert active is True
+
+    def test_trigger_short_inactivo_vela_alcista(self):
+        from btc_scanner import check_trigger_5m_short
+        df5 = self._make_df5_short(bearish_last=False, rsi_falling=True)
+        active, _ = check_trigger_5m_short(df5)
+        assert active is False
+
+    def test_datos_insuficientes_short(self):
+        from btc_scanner import check_trigger_5m_short
+        df5 = pd.DataFrame({
+            "open": [100.0], "high": [101.0], "low": [99.0], "close": [100.0],
+            "volume": [10], "taker_buy_base": [5],
+        })
+        active, details = check_trigger_5m_short(df5)
+        assert active is False
+        assert details == {}

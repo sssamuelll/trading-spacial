@@ -405,7 +405,8 @@ def append_signal_log(rep: dict, scan_id: int):
         _ensure_dirs()
         is_sig = rep.get("señal_activa", False)
         is_stp = "SETUP VÁLIDO" in rep.get("estado", "")
-        tipo   = "SENAL LONG" if is_sig else "SETUP VALIDO"
+        direction = rep.get("direction", "LONG")
+        tipo   = f"SENAL {direction}" if is_sig else "SETUP VALIDO"
         sym    = rep.get("symbol", "?")
         ts     = rep.get("timestamp", "")[:19].replace("T", " ")
         price  = rep.get("price", 0)
@@ -988,8 +989,10 @@ def build_telegram_message(rep: dict) -> str:
     ts     = rep.get("timestamp", "")
 
     if rep.get("señal_activa"):
-        header = f"SENAL LONG {symbol} SPOT"
-        emoji  = "OK"
+        direction = rep.get("direction", "LONG")
+        market = "SPOT" if direction == "LONG" else "FUTURES"
+        header = f"SENAL {direction} {symbol} {market}"
+        emoji  = "OK" if direction == "LONG" else "STOP_SIGN"
     elif "SETUP VÁLIDO" in estado:
         header = f"SETUP VALIDO {symbol} - Sin gatillo aun"
         emoji  = "CONFIG"
@@ -1123,7 +1126,7 @@ def push_webhook(rep: dict, scan_id: int, cfg: dict):
         "symbol":          rep.get("symbol", "BTCUSDT"),
         "señal_activa":    rep.get("señal_activa", False),
         "estado":          rep.get("estado", ""),
-        "direction":       "LONG",
+        "direction":       rep.get("direction", "LONG"),
         "price":           rep.get("price"),
         "lrc_pct":         rep.get("lrc_1h", {}).get("pct"),
         "score":           rep.get("score", 0),

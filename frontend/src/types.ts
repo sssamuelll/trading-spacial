@@ -26,6 +26,7 @@ export interface SymbolStatus {
   gatillo: boolean;
   ts: string | null;
   sizing_1h?: Sizing1h;
+  direction?: 'LONG' | 'SHORT' | null;
 }
 
 export interface SymbolsResponse {
@@ -63,6 +64,7 @@ export interface Signal {
   score_label: string;
   macro_ok: boolean;
   gatillo: boolean;
+  direction?: 'LONG' | 'SHORT' | null;
 }
 
 export interface SignalsResponse {

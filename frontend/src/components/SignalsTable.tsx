@@ -64,6 +64,7 @@ const SignalsTable: React.FC<SignalsTableProps> = ({ signals, loading, onOpenPos
                 <th className="col-num">#</th>
                 <th className="col-time">Hora</th>
                 <th className="col-pair">Par</th>
+                <th className="col-dir">Dir</th>
                 <th className="col-price">Precio</th>
                 <th className="col-lrc">LRC%</th>
                 <th className="col-score">Score</th>
@@ -86,6 +87,11 @@ const SignalsTable: React.FC<SignalsTableProps> = ({ signals, loading, onOpenPos
                   </td>
                   <td className="col-pair">
                     <span className="pair-text">{sig.symbol}</span>
+                  </td>
+                  <td className="col-dir">
+                    <span className={`dir-pill ${sig.direction === 'SHORT' ? 'dir-pill--short' : 'dir-pill--long'}`}>
+                      {sig.direction === 'SHORT' ? 'S' : 'L'}
+                    </span>
                   </td>
                   <td className="col-price">
                     <span className="price-text">
