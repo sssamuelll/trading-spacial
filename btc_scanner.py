@@ -189,8 +189,25 @@ def _load_proxy() -> dict:
     return {}
 
 
+_last_api_call = 0.0
+_API_MIN_INTERVAL = 0.1  # 100ms between API calls (max 10/sec, well under limits)
+_api_lock = threading.Lock()
+
+
+def _rate_limit():
+    """Enforce minimum interval between API calls to avoid rate-limit bans."""
+    global _last_api_call
+    with _api_lock:
+        now = time.time()
+        elapsed = now - _last_api_call
+        if elapsed < _API_MIN_INTERVAL:
+            time.sleep(_API_MIN_INTERVAL - elapsed)
+        _last_api_call = time.time()
+
+
 def _get(url: str, params: dict = None) -> dict:
-    """HTTP GET con soporte de proxy y timeout."""
+    """HTTP GET con soporte de proxy, timeout y rate limiting."""
+    _rate_limit()
     proxies = _load_proxy()
     r = requests.get(url, params=params, proxies=proxies or None,
                      timeout=12, headers={"User-Agent": "btc-scanner/1.0"})
@@ -687,6 +704,7 @@ def detect_regime() -> dict:
     # ── 2. Sentiment: Fear & Greed Index (30% weight) ────────────────────────
     fng_score = 50  # default neutral
     try:
+        _rate_limit()
         r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
         if r.ok:
             data = r.json()
@@ -706,6 +724,7 @@ def detect_regime() -> dict:
     # ── 3. Market: Funding Rate (30% weight) ─────────────────────────────────
     funding_score = 50  # default neutral
     try:
+        _rate_limit()
         r = requests.get(
             "https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1",
             timeout=10

@@ -56,8 +56,11 @@ FEE_PCT = 0.001  # 0.1% per trade (Binance spot)
 #  DATA DOWNLOAD
 # ─────────────────────────────────────────────────────────────────────────────
 
+_dl_last_call = 0.0
+
 def download_klines(symbol: str, interval: str, start_ts: int, end_ts: int) -> pd.DataFrame:
-    """Download historical klines from Binance with pagination."""
+    """Download historical klines from Binance with pagination and rate limiting."""
+    global _dl_last_call
     all_data = []
     current_start = start_ts
     limit = 1000
@@ -86,7 +89,11 @@ def download_klines(symbol: str, interval: str, start_ts: int, end_ts: int) -> p
         if len(data) < limit:
             break
 
-        time.sleep(0.2)  # rate limit courtesy
+        # Rate limit: max 5 requests/sec to Binance
+        elapsed = time.time() - _dl_last_call
+        if elapsed < 0.2:
+            time.sleep(0.2 - elapsed)
+        _dl_last_call = time.time()
 
     if not all_data:
         return pd.DataFrame()
