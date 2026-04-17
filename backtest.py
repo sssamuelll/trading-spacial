@@ -46,7 +46,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(SCRIPT_DIR, "data", "backtest")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-START_DATE = datetime(2023, 1, 1, tzinfo=timezone.utc)
+DEFAULT_START = datetime(2021, 1, 1, tzinfo=timezone.utc)  # earliest data to cache
 INITIAL_CAPITAL = 10000.0
 RISK_PER_TRADE = 0.01  # 1% of capital per trade
 FEE_PCT = 0.001  # 0.1% per trade (Binance spot)
@@ -111,29 +111,43 @@ def download_klines(symbol: str, interval: str, start_ts: int, end_ts: int) -> p
     return df
 
 
-def get_cached_data(symbol: str, interval: str) -> pd.DataFrame:
-    """Download data or load from cache."""
+def get_cached_data(symbol: str, interval: str, start_date: datetime = None) -> pd.DataFrame:
+    """Download data or load from cache. Extends cache in both directions as needed."""
     cache_file = os.path.join(DATA_DIR, f"{symbol}_{interval}.csv")
-    start_ms = int(START_DATE.timestamp() * 1000)
+    want_start = start_date or DEFAULT_START
+    start_ms = int(want_start.timestamp() * 1000)
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
     if os.path.exists(cache_file):
         df = pd.read_csv(cache_file, index_col="ts", parse_dates=True)
+        changed = False
+
+        # Extend backwards if cache starts later than requested
+        first_ts = int(df.index[0].timestamp() * 1000)
+        if first_ts > start_ms + 86400_000:
+            log.info(f"Extending cache backwards for {symbol} {interval} to {want_start.date()}...")
+            old_df = download_klines(symbol, interval, start_ms, first_ts - 1)
+            if not old_df.empty:
+                df = pd.concat([old_df, df])
+                changed = True
+
+        # Extend forward if cache is older than 24h
         last_ts = int(df.index[-1].timestamp() * 1000)
-        # If cache is less than 24h old, use it
-        if (end_ms - last_ts) < 86400_000:
-            log.info(f"Cache hit: {cache_file} ({len(df)} candles)")
-            return df
-        # Otherwise, download only the missing part
-        log.info(f"Updating cache from {df.index[-1]}...")
-        new_df = download_klines(symbol, interval, last_ts + 1, end_ms)
-        if not new_df.empty:
-            df = pd.concat([df, new_df])
-            df = df[~df.index.duplicated(keep='first')]
+        if (end_ms - last_ts) > 86400_000:
+            log.info(f"Updating cache forward for {symbol} {interval}...")
+            new_df = download_klines(symbol, interval, last_ts + 1, end_ms)
+            if not new_df.empty:
+                df = pd.concat([df, new_df])
+                changed = True
+
+        if changed:
+            df = df[~df.index.duplicated(keep='first')].sort_index()
             df.to_csv(cache_file)
+
+        log.info(f"Cache: {cache_file} ({len(df)} candles, {df.index[0].date()} → {df.index[-1].date()})")
         return df
 
-    log.info(f"Downloading {symbol} {interval} from {START_DATE.date()}...")
+    log.info(f"Downloading {symbol} {interval} from {want_start.date()}...")
     df = download_klines(symbol, interval, start_ms, end_ms)
     if not df.empty:
         df.to_csv(cache_file)
@@ -149,7 +163,8 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
                       symbol: str, sl_mode: str = "atr",
                       atr_sl_mult: float = None, atr_tp_mult: float = None,
                       atr_be_mult: float = None,
-                      df1d: pd.DataFrame = None) -> list[dict]:
+                      df1d: pd.DataFrame = None,
+                      sim_start: datetime = None, sim_end: datetime = None) -> list[dict]:
     """Run bar-by-bar simulation of the Spot V6 strategy."""
     trades = []
     position = None  # {entry_price, entry_time, score, sl, tp, size_mult}
@@ -164,11 +179,18 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
 
     # Need at least LRC_PERIOD bars of warmup
     warmup = max(LRC_PERIOD, 100) + 10
+    _sim_start_ts = pd.Timestamp(sim_start).tz_localize(None) if sim_start else None
+    _sim_end_ts = pd.Timestamp(sim_end).tz_localize(None) if sim_end else None
     log.info(f"Simulating {symbol} — {len(df1h)} 1H bars (warmup: {warmup})")
 
     for i in range(warmup, len(df1h)):
         bar = df1h.iloc[i]
         bar_time = df1h.index[i]
+        bar_time_naive = bar_time.tz_localize(None) if bar_time.tzinfo else bar_time
+
+        # Skip bars outside simulation window (but still check open positions)
+        if _sim_end_ts and bar_time_naive > _sim_end_ts and position is None:
+            continue
 
         # ── Check open position for SL/TP ─────────────────────────────────
         if position is not None:
@@ -237,6 +259,10 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
 
         # ── Skip if already in a position ─────────────────────────────────
         if position is not None:
+            continue
+
+        # ── Skip if before simulation start (warmup period) ──────────────
+        if _sim_start_ts and bar_time_naive < _sim_start_ts:
             continue
 
         # ── Cooldown check ────────────────────────────────────────────────
@@ -759,18 +785,29 @@ def main():
     parser.add_argument("--symbol", default="BTCUSDT", help="Trading pair (default: BTCUSDT)")
     parser.add_argument("--sl-mode", default="atr", choices=["atr", "fixed"],
                         help="SL/TP mode: 'atr' (dynamic) or 'fixed' (2%%/4%%)")
+    parser.add_argument("--start", default="2023-01-01",
+                        help="Start date YYYY-MM-DD (default: 2023-01-01)")
+    parser.add_argument("--end", default=None,
+                        help="End date YYYY-MM-DD (default: today)")
     parser.add_argument("--download-only", action="store_true", help="Only download data")
     args = parser.parse_args()
 
     symbol = args.symbol.upper()
+    sim_start = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    sim_end = (datetime.strptime(args.end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+               if args.end else datetime.now(timezone.utc))
 
-    # Download data
-    log.info(f"=== Backtest: {symbol} | {START_DATE.date()} — present ===")
-    df1h = get_cached_data(symbol, "1h")
-    df4h = get_cached_data(symbol, "4h")
-    df5m = get_cached_data(symbol, "5m")
-    df1d = get_cached_data(symbol, "1d")
+    # Need data from before sim_start for indicator warmup (SMA200 daily = 200 days)
+    data_start = datetime(sim_start.year - 1, 1, 1, tzinfo=timezone.utc)
 
+    # Download data (cache extends automatically to cover requested range)
+    log.info(f"=== Backtest: {symbol} | {args.start} — {args.end or 'present'} ===")
+    df1h = get_cached_data(symbol, "1h", start_date=data_start)
+    df4h = get_cached_data(symbol, "4h", start_date=data_start)
+    df5m = get_cached_data(symbol, "5m", start_date=data_start)
+    df1d = get_cached_data(symbol, "1d", start_date=data_start)
+
+    # Filter to simulation period (keep extra for warmup — simulate_strategy handles it)
     log.info(f"Data loaded: 1H={len(df1h)}, 4H={len(df4h)}, 5M={len(df5m)}, 1D={len(df1d)} candles")
 
     if args.download_only:
@@ -782,7 +819,8 @@ def main():
         return
 
     # Run simulation
-    trades, equity_curve = simulate_strategy(df1h, df4h, df5m, symbol, sl_mode=args.sl_mode, df1d=df1d)
+    trades, equity_curve = simulate_strategy(df1h, df4h, df5m, symbol, sl_mode=args.sl_mode,
+                                               df1d=df1d, sim_start=sim_start, sim_end=sim_end)
     log.info(f"Simulation complete: {len(trades)} trades generated")
 
     if not trades:
