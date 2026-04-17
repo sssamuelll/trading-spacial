@@ -8,6 +8,7 @@ config.json
 
 # ── Datos de backtesting (descargados de Binance) ────────────
 data/backtest/
+data/regime_cache.json
 
 # ── Base de datos y datos en tiempo real ──────────────────────
 signals.db

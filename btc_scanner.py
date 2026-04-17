@@ -602,8 +602,35 @@ def check_trigger_5m_short(df5: pd.DataFrame):
 #  REGIME DETECTOR — Multi-signal, runs once per day, cached
 # ─────────────────────────────────────────────────────────────────────────────
 
-_regime_cache = {"regime": "BULL", "score": 100, "details": {}, "ts": None}
+_REGIME_CACHE_FILE = os.path.join(SCRIPT_DIR, "data", "regime_cache.json")
 _REGIME_TTL_SEC = 86400  # 24 hours
+
+
+def _load_regime_cache() -> dict:
+    """Load regime cache from disk. Returns default if missing/corrupt."""
+    default = {"regime": "BULL", "score": 100, "details": {}, "ts": None}
+    try:
+        if os.path.exists(_REGIME_CACHE_FILE):
+            with open(_REGIME_CACHE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if "regime" in data and "ts" in data:
+                return data
+    except Exception:
+        pass
+    return default
+
+
+def _save_regime_cache(data: dict):
+    """Persist regime cache to disk."""
+    try:
+        os.makedirs(os.path.dirname(_REGIME_CACHE_FILE), exist_ok=True)
+        with open(_REGIME_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log.warning(f"Failed to save regime cache: {e}")
+
+
+_regime_cache = _load_regime_cache()
 
 
 def detect_regime() -> dict:
@@ -717,9 +744,10 @@ def detect_regime() -> dict:
         "ts": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Update cache
+    # Update cache (RAM + disk)
     global _regime_cache
     _regime_cache = result
+    _save_regime_cache(result)
     log.info(f"Regime Detection: {regime} (score={composite}) "
              f"[price={price_score} fng={fng_score} funding={funding_score}]")
 
