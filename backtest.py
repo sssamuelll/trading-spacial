@@ -244,8 +244,7 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
                       df1d: pd.DataFrame = None,
                       sim_start: datetime = None, sim_end: datetime = None,
                       df_fng: pd.DataFrame = None,
-                      df_funding: pd.DataFrame = None,
-                      backtest_config: dict = None) -> list[dict]:
+                      df_funding: pd.DataFrame = None) -> list[dict]:
     """Run bar-by-bar simulation of the Spot V6 strategy."""
     trades = []
     position = None  # {entry_price, entry_time, score, sl, tp, size_mult}
@@ -257,11 +256,6 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
     _sl_m = atr_sl_mult if atr_sl_mult is not None else ATR_SL_MULT
     _tp_m = atr_tp_mult if atr_tp_mult is not None else ATR_TP_MULT
     _be_m = atr_be_mult if atr_be_mult is not None else ATR_BE_MULT
-
-    from strategies.trend_following_sim import create_tf_state, assess_tf_bar
-    from strategies.router import route as route_strategy
-    tf_state = create_tf_state()
-    _bt_cfg = backtest_config or {}
 
     # Need at least LRC_PERIOD bars of warmup
     warmup = max(LRC_PERIOD, 100) + 10
@@ -278,30 +272,7 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
         if _sim_end_ts and bar_time_naive > _sim_end_ts and position is None:
             continue
 
-        # ── Trend-following position management ───────────────────────────
-        if tf_state["position"] is not None and position is not None and position.get("strategy") == "trend_following":
-            window_1h_tf = df1h.iloc[max(0, i - 209):i + 1]
-            if len(window_1h_tf) >= 60:
-                price_tf = float(window_1h_tf["close"].iloc[-1])
-                adx_s_tf = calc_adx(window_1h_tf, 14)
-                adx_tf = float(adx_s_tf.iloc[-1]) if not pd.isna(adx_s_tf.iloc[-1]) else 0
-
-                tf_result = assess_tf_bar(
-                    window_1h=window_1h_tf, df4h=df4h, df5m=df5m,
-                    bar_time=bar_time, price=price_tf, symbol=symbol,
-                    regime="LONG", cur_adx=adx_tf,
-                    config=_bt_cfg, tf_state=tf_state,
-                )
-                if tf_result == "exit":
-                    trade = tf_state["last_trade"]
-                    trades.append(trade)
-                    capital += trade["pnl_usd"]
-                    position = None
-                    last_exit_time = bar_time
-            equity_curve.append({"time": bar_time, "equity": capital})
-            continue
-
-        # ── Check open position for SL/TP (mean-reversion) ───────────────
+        # ── Check open position for SL/TP ─────────────────────────────────
         if position is not None:
             pos_dir = position.get("direction", "LONG")
             be_thresh = position.get("be_threshold")
@@ -357,7 +328,6 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
                     "score": position["score"],
                     "size_mult": position["size_mult"],
                     "duration_hours": (bar_time - position["entry_time"]).total_seconds() / 3600,
-                    "strategy": position.get("strategy", "mean_reversion"),
                 }
                 trades.append(trade)
                 capital += pnl_usd
@@ -441,30 +411,7 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
         else:
             regime = "LONG"  # NEUTRAL = conservative LONG
 
-        # ── ADX Strategy Routing ──────────────────────────────────────
-        adx_series_bt = calc_adx(window_1h, 14)
-        _cur_adx_bt = float(adx_series_bt.iloc[-1]) if not pd.isna(adx_series_bt.iloc[-1]) else 0
-        _bt_strategy = route_strategy(_cur_adx_bt, symbol, _bt_cfg)
-
-        if _bt_strategy == "trend_following":
-            tf_result = assess_tf_bar(
-                window_1h=window_1h, df4h=df4h, df5m=df5m,
-                bar_time=bar_time, price=price, symbol=symbol,
-                regime=regime, cur_adx=_cur_adx_bt,
-                config=_bt_cfg, tf_state=tf_state,
-            )
-            if tf_result == "enter":
-                position = tf_state["position"]
-            elif tf_result == "exit":
-                trade = tf_state["last_trade"]
-                trades.append(trade)
-                capital += trade["pnl_usd"]
-                position = None
-                last_exit_time = bar_time
-            equity_curve.append({"time": bar_time, "equity": capital})
-            continue
-
-        # Direction based on regime + LRC zone (mean-reversion path)
+        # Direction based on regime + LRC zone
         if lrc_pct <= LRC_LONG_MAX and regime == "LONG":
             trade_dir = "LONG"
         elif lrc_pct >= LRC_SHORT_MIN and regime == "SHORT":
@@ -579,20 +526,15 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
             "tp": tp_price,
             "size_mult": size_mult,
             "be_threshold": be_threshold,
-            "strategy": "mean_reversion",
         }
 
-    # Close any open position at last bar price (MR or TF)
+    # Close any open position at last bar price
     if position is not None:
         last_bar = df1h.iloc[-1]
         exit_price = float(last_bar["close"])
-        pos_dir = position.get("direction", "LONG")
-        if pos_dir == "SHORT":
-            pnl_pct = (position["entry_price"] - exit_price) / position["entry_price"] * 100
-        else:
-            pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] * 100
+        pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] * 100
         risk_amount = capital * RISK_PER_TRADE * position["size_mult"]
-        sl_pct_actual = abs(position["entry_price"] - position["sl_orig"]) / position["entry_price"] * 100
+        sl_pct_actual = (position["entry_price"] - position["sl_orig"]) / position["entry_price"] * 100
         pnl_usd = risk_amount * (pnl_pct / sl_pct_actual) if sl_pct_actual > 0 else 0
         trades.append({
             "entry_time": position["entry_time"],
@@ -600,42 +542,11 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
             "entry_price": position["entry_price"],
             "exit_price": exit_price,
             "exit_reason": "OPEN",
-            "direction": pos_dir,
             "pnl_pct": round(pnl_pct, 4),
             "pnl_usd": round(pnl_usd, 2),
             "score": position["score"],
             "size_mult": position["size_mult"],
             "duration_hours": (df1h.index[-1] - position["entry_time"]).total_seconds() / 3600,
-            "strategy": position.get("strategy", "mean_reversion"),
-        })
-        capital += pnl_usd
-
-    # Also close any TF position still open
-    if tf_state["position"] is not None and position is None:
-        last_bar = df1h.iloc[-1]
-        exit_price = float(last_bar["close"])
-        pos = tf_state["position"]
-        pos_dir = pos.get("direction", "LONG")
-        if pos_dir == "SHORT":
-            pnl_pct = (pos["entry_price"] - exit_price) / pos["entry_price"] * 100
-        else:
-            pnl_pct = (exit_price - pos["entry_price"]) / pos["entry_price"] * 100
-        sl_pct_actual = abs(pos["entry_price"] - pos["sl_orig"]) / pos["entry_price"] * 100
-        risk_amount = capital * RISK_PER_TRADE * pos["size_mult"]
-        pnl_usd = risk_amount * (pnl_pct / sl_pct_actual) if sl_pct_actual > 0 else 0
-        trades.append({
-            "entry_time": pos["entry_time"],
-            "exit_time": df1h.index[-1],
-            "entry_price": pos["entry_price"],
-            "exit_price": exit_price,
-            "exit_reason": "OPEN",
-            "direction": pos_dir,
-            "pnl_pct": round(pnl_pct, 4),
-            "pnl_usd": round(pnl_usd, 2),
-            "score": pos["score"],
-            "size_mult": pos["size_mult"],
-            "duration_hours": (df1h.index[-1] - pos["entry_time"]).total_seconds() / 3600,
-            "strategy": "trend_following",
         })
         capital += pnl_usd
 
@@ -892,39 +803,10 @@ Does higher score = better performance?
     for tier_name, tier_data in m.get("score_tiers", {}).items():
         report += f"| {tier_name} | {tier_data['trades']} | {tier_data['win_rate']}% | {tier_data['avg_pnl_pct']:+.2f}% | ${tier_data['total_pnl_usd']:+,.2f} |\n"
 
-    # ── Per-Strategy Breakdown ────────────────────────────────────────────
-    closed_trades = [t for t in trades if t.get("exit_reason") != "OPEN"]
-    strategy_names = sorted(set(t.get("strategy", "mean_reversion") for t in closed_trades)) or ["mean_reversion"]
-    report += """
----
-
-## 5. Per-Strategy Breakdown
-
-| Strategy | Trades | Win Rate | P&L | Avg Trade |
-|----------|--------|----------|-----|-----------|
-"""
-    total_strat_trades = 0
-    total_strat_pnl = 0.0
-    total_strat_wins = 0
-    for strat in strategy_names:
-        st = [t for t in closed_trades if t.get("strategy", "mean_reversion") == strat]
-        n_trades = len(st)
-        wins = sum(1 for t in st if t.get("pnl_usd", 0) > 0)
-        wr = round(wins / n_trades * 100, 1) if n_trades > 0 else 0.0
-        pnl = sum(t.get("pnl_usd", 0) for t in st)
-        avg_pnl = round(pnl / n_trades, 2) if n_trades > 0 else 0.0
-        report += f"| {strat} | {n_trades} | {wr}% | ${pnl:+,.2f} | ${avg_pnl:+,.2f} |\n"
-        total_strat_trades += n_trades
-        total_strat_pnl += pnl
-        total_strat_wins += wins
-    total_wr = round(total_strat_wins / total_strat_trades * 100, 1) if total_strat_trades > 0 else 0.0
-    total_avg = round(total_strat_pnl / total_strat_trades, 2) if total_strat_trades > 0 else 0.0
-    report += f"| **TOTAL** | {total_strat_trades} | {total_wr}% | ${total_strat_pnl:+,.2f} | ${total_avg:+,.2f} |\n"
-
     report += f"""
 ---
 
-## 6. Market Regime Analysis
+## 5. Market Regime Analysis
 
 | Regime | Trades | Win Rate | Avg P&L % | Total P&L $ |
 |--------|--------|----------|-----------|-------------|
@@ -934,7 +816,7 @@ Does higher score = better performance?
 
 ---
 
-## 7. Benchmark Comparison
+## 6. Benchmark Comparison
 
 | Metric | Our Strategy | Freqtrade Top 10% | Jesse Published |
 |--------|-------------|-------------------|-----------------|
@@ -947,7 +829,7 @@ Does higher score = better performance?
 
 ---
 
-## 8. Strengths
+## 7. Strengths
 
 Based on backtest data:
 
@@ -959,7 +841,7 @@ Based on backtest data:
 
 ---
 
-## 9. Weaknesses
+## 8. Weaknesses
 
 1. **Long-only limitation:** The strategy generates zero revenue during bear markets — it correctly avoids bad entries but misses short opportunities
 2. **Fixed SL/TP:** {SL_PCT}%/{TP_PCT}% does not adapt to volatility — too tight in high-vol periods (premature SL hits), too loose in low-vol (slow TP fills)
@@ -969,7 +851,7 @@ Based on backtest data:
 
 ---
 
-## 10. Recommendations (Prioritized by Impact)
+## 9. Recommendations (Prioritized by Impact)
 
 ### High Impact
 1. **ATR-based dynamic SL/TP** — Replace fixed 2%/4% with 1.5x ATR(14) / 3x ATR(14). Adapts to current volatility automatically.

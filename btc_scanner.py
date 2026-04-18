@@ -785,35 +785,6 @@ def get_cached_regime() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Utilidades de limpieza (extraído para uso en early-return y normal path)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def clean_dict(d):
-    """Convierte tipos numpy a tipos Python nativos para serialización JSON."""
-    if isinstance(d, dict):
-        for k, v in list(d.items()):
-            if isinstance(v, np.bool_):
-                d[k] = bool(v)
-            elif isinstance(v, np.integer):
-                d[k] = int(v)
-            elif isinstance(v, np.floating):
-                d[k] = float(v)
-            elif isinstance(v, dict):
-                clean_dict(v)
-            elif isinstance(v, list):
-                for i, item in enumerate(v):
-                    if isinstance(item, np.bool_):
-                        v[i] = bool(item)
-                    elif isinstance(item, np.integer):
-                        v[i] = int(item)
-                    elif isinstance(item, np.floating):
-                        v[i] = float(item)
-                    elif isinstance(item, dict):
-                        clean_dict(item)
-    return d
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  SCANNER PRINCIPAL
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -858,36 +829,6 @@ def scan(symbol: str = None):
     # ADX 1H (filtro de tendencia)
     adx_1h    = calc_adx(df1h, 14)
     cur_adx   = round(float(adx_1h.iloc[-1]), 2) if not pd.isna(adx_1h.iloc[-1]) else 0
-
-    # ── ADX Strategy Routing ──────────────────────────────────────────────
-    from strategies.router import route as _route_strategy
-    _cfg_path_rt = os.path.join(SCRIPT_DIR, "config.json")
-    _cfg_rt = {}
-    if os.path.exists(_cfg_path_rt):
-        try:
-            with open(_cfg_path_rt) as _f_rt:
-                _cfg_rt = json.load(_f_rt)
-        except Exception:
-            pass
-
-    _strategy = _route_strategy(cur_adx, symbol, _cfg_rt)
-    rep["strategy"] = _strategy
-
-    if _strategy == "trend_following":
-        from strategies.trend_following import assess_signal as _tf_assess, calc_di_components as _calc_di
-        _di_plus, _di_minus = _calc_di(df1h, 14)
-        _tf_result = _tf_assess(
-            df1h=df1h, df4h=df4h, df5m=df5,
-            price=price, symbol=symbol,
-            regime=regime, regime_data=regime_data,
-            adx=cur_adx,
-            di_plus=float(_di_plus.iloc[-1]),
-            di_minus=float(_di_minus.iloc[-1]),
-            config=_cfg_rt,
-        )
-        rep.update(_tf_result)
-        clean_dict(rep)
-        return rep
 
     # ── Indicadores 4H (macro) ────────────────────────────────────────────────
     sma100_4h      = calc_sma(df4h["close"], 100).iloc[-1]
@@ -1082,7 +1023,6 @@ def scan(symbol: str = None):
 
     # ── Consolidar ────────────────────────────────────────────────────────────
     rep.update({
-        "strategy":       "mean_reversion",
         "estado":         estado,
         "señal_activa":   señal,
         "direction":      direction,
@@ -1126,6 +1066,30 @@ def scan(symbol: str = None):
             "pct_capital": round(val_pos / capital * 100, 1),
         },
     })
+    # Convertir tipos numpy a tipos Python nativos para serialización JSON
+    import numpy as np
+    def clean_dict(d):
+        if isinstance(d, dict):
+            for k, v in list(d.items()):
+                if isinstance(v, np.bool_):
+                    d[k] = bool(v)
+                elif isinstance(v, np.integer):
+                    d[k] = int(v)
+                elif isinstance(v, np.floating):
+                    d[k] = float(v)
+                elif isinstance(v, dict):
+                    clean_dict(v)
+                elif isinstance(v, list):
+                    for i, item in enumerate(v):
+                        if isinstance(item, np.bool_):
+                            v[i] = bool(item)
+                        elif isinstance(item, np.integer):
+                            v[i] = int(item)
+                        elif isinstance(item, np.floating):
+                            v[i] = float(item)
+                        elif isinstance(item, dict):
+                            clean_dict(item)
+        return d
     clean_dict(rep)
     return rep
 
