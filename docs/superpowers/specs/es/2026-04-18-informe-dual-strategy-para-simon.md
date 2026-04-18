@@ -179,7 +179,44 @@ Esto esta descrito en el issue #135 y seria el siguiente paso natural.
 
 ---
 
-## 5. Resumen de Todo el Trabajo Desde el 15 de Abril
+## 5. Decision Final: Volvemos a Spot V6 Mejorada
+
+Despues de todo el analisis, la decision es clara:
+
+**Se revirtieron todos los cambios de dual strategy del codigo de produccion.** El sistema en produccion es exactamente el Spot V6 mejorado que teniamos antes de esta investigacion, con todas sus mejoras intactas:
+
+| Componente | Estado |
+|------------|--------|
+| ATR dinamico (SL/TP adaptativo) | Activo |
+| Parametros optimizados per-symbol (735 sims) | Activo |
+| Detector de regimen multi-signal (Fear&Greed + Funding) | Activo |
+| Trailing stop a breakeven | Activo |
+| Senales SHORT gateadas por regimen | Activo |
+| Portfolio curado: 7 symbols | Activo |
+| Dual strategy / trend-following | **Removido de produccion** |
+
+El codigo del motor de dual strategy se preserva como infraestructura disponible (en la carpeta `strategies/`) por si en el futuro encontramos tokens donde si funcione. Pero no afecta al sistema en produccion.
+
+### Por Que Esta Decision Es Correcta
+
+1. **No se perdio nada.** El sistema de produccion es identico al que ya teniamos validado.
+2. **Se gano conocimiento.** Ahora sabemos con certeza que las 13 monedas no son operables — no es cuestion de estrategia, es cuestion de los activos.
+3. **La infraestructura existe.** Si manana encontramos un token donde trend-following funciona, se puede activar sin programar nada nuevo.
+
+### El Camino a Seguir
+
+Cualquier mejora futura estara enfocada en **mejorar la rentabilidad de Spot V6**, no en agregar complejidad:
+
+- Optimizar parametros de las 7 monedas actuales periodicamente
+- Probar tokens nuevos con fundamentales solidos (SUI, TIA, INJ, RUNE) usando nuestra estrategia probada
+- Construir un sistema inteligente que automaticamente pause monedas si empiezan a perder
+- Mejorar el detector de regimen con mas fuentes de datos
+
+**La filosofia: menos monedas operadas mejor > mas monedas operadas mal.**
+
+---
+
+## 6. Resumen de Todo el Trabajo Desde el 15 de Abril
 
 | Fecha | Que se hizo | Resultado |
 |-------|-------------|-----------|
@@ -188,8 +225,9 @@ Esto esta descrito en el issue #135 y seria el siguiente paso natural.
 | 16 Abr | Detector de regimen multi-signal | Proteccion en bear markets |
 | 16 Abr | Senales SHORT (infra lista) | Listas para bear market |
 | 16 Abr | Portfolio curado (7 ganadoras) | +$54,706 total |
-| 17-18 Abr | Dual strategy engine | Construido y validado |
+| 17-18 Abr | Dual strategy engine (investigacion) | Construido, validado, descartado |
 | 18 Abr | Grid search 768 combos | Confirma: monedas muertas son muertas |
+| 18 Abr | Reversion a Spot V6 | Produccion limpia, sin riesgo |
 
 **Total:**
 - 20+ commits
@@ -197,8 +235,9 @@ Esto esta descrito en el issue #135 y seria el siguiente paso natural.
 - 2,000+ lineas de codigo
 - 7M+ velas historicas analizadas
 - 735+ simulaciones de optimizacion
+- 768 combinaciones de parametros probadas en grid search
 - $54,706 de ganancia potencial validada por backtest
 
 ---
 
-*"Los datos no mienten. Mejor operar 7 monedas que funcionan que 20 que no."*
+*"Los datos no mienten. Mejor operar 7 monedas que funcionan que 20 que no. Y mejor revertir una idea que no funciono que dejarla contaminar un sistema que si funciona."*
