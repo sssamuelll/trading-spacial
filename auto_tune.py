@@ -59,6 +59,39 @@ def calculate_periods(today=None):
     return train_start, train_end, val_start, val_end
 
 
+def generate_combos() -> list:
+    """Return all parameter combinations from GRID as a list of dicts.
+
+    Total = 7 x 5 x 3 = 105 combinations.
+    """
+    keys = list(GRID.keys())
+    values = [GRID[k] for k in keys]
+    combos = [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+    return combos
+
+
+def should_recommend(current_pnl: float, proposed_pnl: float, total_trades: int, pf_validate: float) -> bool:
+    """Return True only when ALL acceptance criteria are met.
+
+    Criteria:
+      1. pf_validate >= MIN_PF_VALIDATE (1.1)
+      2. total_trades >= MIN_TRADES (50)
+      3. If current_pnl <= 0: proposed_pnl must be > 0
+         If current_pnl > 0:  improvement must be >= MIN_IMPROVEMENT_PCT (15%)
+    """
+    if pf_validate < MIN_PF_VALIDATE:
+        return False
+
+    if total_trades < MIN_TRADES:
+        return False
+
+    if current_pnl <= 0:
+        return proposed_pnl > 0
+
+    improvement_pct = (proposed_pnl - current_pnl) / current_pnl * 100.0
+    return improvement_pct >= MIN_IMPROVEMENT_PCT
+
+
 def main():
     parser = argparse.ArgumentParser(description="Walk-forward parameter optimizer")
     parser.add_argument("--symbol", default=None, help="Optimize a single symbol (e.g. DOGEUSDT)")
@@ -66,9 +99,28 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing")
     args = parser.parse_args()
 
+    if args.apply:
+        proposed_path = os.path.join(SCRIPT_DIR, "config_proposed.json")
+        config_path = os.path.join(SCRIPT_DIR, "config.json")
+        if not os.path.exists(proposed_path):
+            log.error("config_proposed.json not found — run optimization first")
+            sys.exit(1)
+        if args.dry_run:
+            with open(proposed_path) as f:
+                log.info("Would apply:\n%s", json.dumps(json.load(f), indent=2))
+        else:
+            shutil.copy(config_path, config_path + ".bak")
+            shutil.copy(proposed_path, config_path)
+            log.info("Applied config_proposed.json → config.json (backup saved as config.json.bak)")
+        return
+
     train_start, train_end, val_start, val_end = calculate_periods()
     log.info("Train  : %s → %s", train_start.date(), train_end.date())
     log.info("Validate: %s → %s", val_start.date(), val_end.date())
+
+    combos = generate_combos()
+    log.info("Grid combos: %d", len(combos))
+    log.info("(Full optimization logic will be implemented in subsequent tasks)")
 
 
 if __name__ == "__main__":
