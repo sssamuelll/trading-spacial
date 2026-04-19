@@ -164,3 +164,50 @@ class TestQueryMethods:
         _storage.upsert_many([_mk_bar(open_time=t * 3600_000) for t in times_input])
         result = _storage.times_in_range("BTCUSDT", "1h", 0, 10 * 3600_000)
         assert set(result) == {t * 3600_000 for t in times_input}
+
+
+class TestEmptyDataFrameDtypes:
+    """Empty tail/range_ must preserve numeric dtypes so downstream concat
+    doesn't silently promote float columns to object (regression guard for #142)."""
+
+    _EXPECTED_DTYPES = {
+        "open_time": "int64",
+        "open": "float64",
+        "high": "float64",
+        "low": "float64",
+        "close": "float64",
+        "volume": "float64",
+        "provider": "object",
+        "fetched_at": "int64",
+    }
+
+    def test_tail_on_empty_db_has_typed_dtypes(self, tmp_ohlcv_db):
+        df = _storage.tail("BTCUSDT", "1h", 3)
+        assert len(df) == 0
+        for col, dtype in self._EXPECTED_DTYPES.items():
+            assert str(df[col].dtype) == dtype, f"{col}: {df[col].dtype}"
+
+    def test_range_on_empty_db_has_typed_dtypes(self, tmp_ohlcv_db):
+        df = _storage.range_("BTCUSDT", "1h", 0, 3600_000)
+        assert len(df) == 0
+        for col, dtype in self._EXPECTED_DTYPES.items():
+            assert str(df[col].dtype) == dtype, f"{col}: {df[col].dtype}"
+
+    def test_range_with_no_matches_has_typed_dtypes(self, tmp_ohlcv_db):
+        # Populated DB but query range matches nothing.
+        _storage.upsert_many([_mk_bar(open_time=5 * 3600_000)])
+        df = _storage.range_("BTCUSDT", "1h", 100 * 3600_000, 200 * 3600_000)
+        assert len(df) == 0
+        for col, dtype in self._EXPECTED_DTYPES.items():
+            assert str(df[col].dtype) == dtype, f"{col}: {df[col].dtype}"
+
+    def test_concat_empty_then_populated_preserves_numeric_dtypes(self, tmp_ohlcv_db):
+        # The motivating scenario from #142: fetcher concats cached (may be empty)
+        # with fresh bars. If cached is object-dtype, numerics get promoted.
+        import pandas as pd
+        empty = _storage.tail("BTCUSDT", "1h", 3)
+        _storage.upsert_many([_mk_bar(open_time=1000, price=100.0)])
+        populated = _storage.tail("BTCUSDT", "1h", 3)
+        combined = pd.concat([empty, populated], ignore_index=True)
+        assert str(combined["close"].dtype) == "float64"
+        assert str(combined["open_time"].dtype) == "int64"

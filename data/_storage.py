@@ -170,6 +170,21 @@ def count_tail(symbol: str, timeframe: str, end_time_inclusive: int, limit: int)
 _OHLCV_COLUMNS = ["open_time", "open", "high", "low", "close", "volume", "provider", "fetched_at"]
 
 
+def _empty_ohlcv_df() -> pd.DataFrame:
+    """Typed empty frame. Needed because pd.DataFrame([], columns=...) yields
+    all-object dtypes, which silently promote numerics to object on concat."""
+    return pd.DataFrame({
+        "open_time": pd.Series(dtype="int64"),
+        "open": pd.Series(dtype="float64"),
+        "high": pd.Series(dtype="float64"),
+        "low": pd.Series(dtype="float64"),
+        "close": pd.Series(dtype="float64"),
+        "volume": pd.Series(dtype="float64"),
+        "provider": pd.Series(dtype="object"),
+        "fetched_at": pd.Series(dtype="int64"),
+    })
+
+
 def tail(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
     """Last `limit` bars ordered ascending."""
     rows = _conn().execute(
@@ -178,6 +193,8 @@ def tail(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
            ORDER BY open_time DESC LIMIT ?""",
         (symbol, timeframe, limit),
     ).fetchall()
+    if not rows:
+        return _empty_ohlcv_df()
     df = pd.DataFrame(rows, columns=_OHLCV_COLUMNS)
     return df.iloc[::-1].reset_index(drop=True)
 
@@ -190,6 +207,8 @@ def range_(symbol: str, timeframe: str, start_ms: int, end_ms: int) -> pd.DataFr
            ORDER BY open_time ASC""",
         (symbol, timeframe, start_ms, end_ms),
     ).fetchall()
+    if not rows:
+        return _empty_ohlcv_df()
     return pd.DataFrame(rows, columns=_OHLCV_COLUMNS)
 
 
