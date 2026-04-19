@@ -5,6 +5,8 @@ import sqlite3
 import threading
 from pathlib import Path
 
+import pandas as pd
+
 from data.providers.base import Bar
 from data import metrics
 
@@ -142,3 +144,70 @@ def upsert_many(bars: list[Bar]) -> int:
         raise
     metrics.inc("bars_upserted_total", len(valid))
     return len(valid)
+
+
+def max_open_time(symbol: str, timeframe: str) -> int | None:
+    row = _conn().execute(
+        "SELECT MAX(open_time) FROM ohlcv WHERE symbol=? AND timeframe=?",
+        (symbol, timeframe),
+    ).fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+def count_tail(symbol: str, timeframe: str, end_time_inclusive: int, limit: int) -> int:
+    """Count bars with open_time <= end_time_inclusive, up to `limit`."""
+    row = _conn().execute(
+        """SELECT COUNT(*) FROM (
+               SELECT 1 FROM ohlcv
+               WHERE symbol=? AND timeframe=? AND open_time <= ?
+               ORDER BY open_time DESC LIMIT ?
+           )""",
+        (symbol, timeframe, end_time_inclusive, limit),
+    ).fetchone()
+    return row[0]
+
+
+_OHLCV_COLUMNS = ["open_time", "open", "high", "low", "close", "volume", "provider", "fetched_at"]
+
+
+def tail(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+    """Last `limit` bars ordered ascending."""
+    rows = _conn().execute(
+        """SELECT open_time, open, high, low, close, volume, provider, fetched_at
+           FROM ohlcv WHERE symbol=? AND timeframe=?
+           ORDER BY open_time DESC LIMIT ?""",
+        (symbol, timeframe, limit),
+    ).fetchall()
+    df = pd.DataFrame(rows, columns=_OHLCV_COLUMNS)
+    return df.iloc[::-1].reset_index(drop=True)
+
+
+def range_(symbol: str, timeframe: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    """Bars with open_time in [start_ms, end_ms] inclusive, ordered ascending."""
+    rows = _conn().execute(
+        """SELECT open_time, open, high, low, close, volume, provider, fetched_at
+           FROM ohlcv WHERE symbol=? AND timeframe=? AND open_time BETWEEN ? AND ?
+           ORDER BY open_time ASC""",
+        (symbol, timeframe, start_ms, end_ms),
+    ).fetchall()
+    return pd.DataFrame(rows, columns=_OHLCV_COLUMNS)
+
+
+def range_stats(symbol: str, timeframe: str, start_ms: int, end_ms: int) -> tuple[int | None, int | None, int]:
+    """Return (min_open_time, max_open_time, count) for bars in [start_ms, end_ms] inclusive."""
+    row = _conn().execute(
+        """SELECT MIN(open_time), MAX(open_time), COUNT(*) FROM ohlcv
+           WHERE symbol=? AND timeframe=? AND open_time BETWEEN ? AND ?""",
+        (symbol, timeframe, start_ms, end_ms),
+    ).fetchone()
+    return (row[0], row[1], row[2] or 0)
+
+
+def times_in_range(symbol: str, timeframe: str, start_ms: int, end_ms: int) -> list[int]:
+    """List of open_time values present in [start_ms, end_ms] inclusive."""
+    rows = _conn().execute(
+        """SELECT open_time FROM ohlcv
+           WHERE symbol=? AND timeframe=? AND open_time BETWEEN ? AND ?""",
+        (symbol, timeframe, start_ms, end_ms),
+    ).fetchall()
+    return [r[0] for r in rows]

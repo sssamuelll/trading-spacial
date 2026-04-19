@@ -117,3 +117,50 @@ class TestUpsertMany:
 
     def test_empty_list_is_noop(self, tmp_ohlcv_db):
         assert _storage.upsert_many([]) == 0
+
+
+class TestQueryMethods:
+    def test_max_open_time_empty(self, tmp_ohlcv_db):
+        assert _storage.max_open_time("BTCUSDT", "1h") is None
+
+    def test_max_open_time_returns_latest(self, tmp_ohlcv_db):
+        _storage.upsert_many([_mk_bar(open_time=t * 3600_000) for t in [1, 5, 3]])
+        assert _storage.max_open_time("BTCUSDT", "1h") == 5 * 3600_000
+
+    def test_count_tail(self, tmp_ohlcv_db):
+        _storage.upsert_many([_mk_bar(open_time=t * 3600_000) for t in range(10)])
+        # count bars with open_time <= 5*3600_000, up to 3
+        assert _storage.count_tail("BTCUSDT", "1h", 5 * 3600_000, 3) == 3
+        # no upper bound reached: returns all
+        assert _storage.count_tail("BTCUSDT", "1h", 9 * 3600_000, 100) == 10
+
+    def test_tail_returns_ascending(self, tmp_ohlcv_db):
+        bars = [_mk_bar(open_time=t * 3600_000, price=float(t)) for t in [3, 1, 4, 1, 5, 9, 2, 6]]
+        _storage.upsert_many(bars)
+        df = _storage.tail("BTCUSDT", "1h", 3)
+        # last 3 bars sorted ascending by open_time
+        assert list(df["open_time"]) == [5 * 3600_000, 6 * 3600_000, 9 * 3600_000]
+
+    def test_range_returns_filtered(self, tmp_ohlcv_db):
+        _storage.upsert_many([_mk_bar(open_time=t * 3600_000) for t in range(10)])
+        df = _storage.range_("BTCUSDT", "1h", 2 * 3600_000, 5 * 3600_000)
+        assert list(df["open_time"]) == [t * 3600_000 for t in [2, 3, 4, 5]]
+
+    def test_range_stats(self, tmp_ohlcv_db):
+        _storage.upsert_many([_mk_bar(open_time=t * 3600_000) for t in [2, 3, 7, 8]])
+        min_t, max_t, count = _storage.range_stats("BTCUSDT", "1h", 0, 10 * 3600_000)
+        assert min_t == 2 * 3600_000
+        assert max_t == 8 * 3600_000
+        assert count == 4
+
+    def test_range_stats_empty(self, tmp_ohlcv_db):
+        min_t, max_t, count = _storage.range_stats("BTCUSDT", "1h", 0, 3600_000)
+        assert min_t is None
+        assert max_t is None
+        assert count == 0
+
+    def test_times_in_range(self, tmp_ohlcv_db):
+        times_input = [1, 2, 5, 7]
+        _storage.upsert_many([_mk_bar(open_time=t * 3600_000) for t in times_input])
+        result = _storage.times_in_range("BTCUSDT", "1h", 0, 10 * 3600_000)
+        assert set(result) == {t * 3600_000 for t in times_input}
