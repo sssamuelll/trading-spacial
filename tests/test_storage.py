@@ -1,8 +1,11 @@
 import os
 import sqlite3
 import threading
+import time
+from dataclasses import asdict
 import pytest
 from data import _storage
+from data.providers.base import Bar
 
 
 class TestSchemaInit:
@@ -60,3 +63,57 @@ class TestThreadLocalConns:
         c1 = _storage._conn()
         c2 = _storage._conn()
         assert c1 is c2
+
+
+def _mk_bar(open_time=1000, price=100.0, **overrides):
+    defaults = dict(
+        symbol="BTCUSDT", timeframe="1h", open_time=open_time,
+        open=price, high=price * 1.02, low=price * 0.98, close=price, volume=10.0,
+        provider="test", fetched_at=int(time.time() * 1000),
+    )
+    defaults.update(overrides)
+    return Bar(**defaults)
+
+
+class TestUpsertMany:
+    def test_insert_new_bars(self, tmp_ohlcv_db):
+        bars = [_mk_bar(open_time=t * 3600_000) for t in range(5)]
+        n = _storage.upsert_many(bars)
+        assert n == 5
+        count = _storage._conn().execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0]
+        assert count == 5
+
+    def test_upsert_overwrites_same_pk(self, tmp_ohlcv_db):
+        _storage.upsert_many([_mk_bar(open_time=1000, price=100.0)])
+        _storage.upsert_many([_mk_bar(open_time=1000, price=200.0)])
+        row = _storage._conn().execute(
+            "SELECT close FROM ohlcv WHERE open_time=1000").fetchone()
+        assert row[0] == 200.0
+
+    def test_drops_invalid_bars_high_lt_low(self, tmp_ohlcv_db, caplog):
+        bad = _mk_bar(open_time=1000, price=100.0)
+        bad = Bar(**{**asdict(bad), "high": 50.0, "low": 150.0})  # swapped
+        good = _mk_bar(open_time=2000, price=100.0)
+        n = _storage.upsert_many([bad, good])
+        assert n == 1
+        count = _storage._conn().execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0]
+        assert count == 1
+
+    def test_drops_invalid_bars_negative_volume(self, tmp_ohlcv_db):
+        bad = _mk_bar(open_time=1000)
+        bad = Bar(**{**asdict(bad), "volume": -5.0})
+        assert _storage.upsert_many([bad]) == 0
+
+    def test_drops_invalid_bars_zero_price(self, tmp_ohlcv_db):
+        bad = _mk_bar(open_time=1000)
+        bad = Bar(**{**asdict(bad), "open": 0.0})
+        assert _storage.upsert_many([bad]) == 0
+
+    def test_high_below_open_or_close_is_invalid(self, tmp_ohlcv_db):
+        bad = _mk_bar(open_time=1000, price=100.0)
+        bad = Bar(**{**asdict(bad), "high": 99.0, "low": 95.0, "open": 100.0, "close": 98.0})
+        # high (99) < open (100) → invalid
+        assert _storage.upsert_many([bad]) == 0
+
+    def test_empty_list_is_noop(self, tmp_ohlcv_db):
+        assert _storage.upsert_many([]) == 0

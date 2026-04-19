@@ -1,11 +1,14 @@
 """SQLite storage for OHLCV bars. Thread-local connections, WAL mode, idempotent upserts."""
+import logging
 import os
 import sqlite3
 import threading
 from pathlib import Path
 
 from data.providers.base import Bar
+from data import metrics
 
+log = logging.getLogger("data.market")
 
 SCHEMA_VERSION = 1
 
@@ -92,3 +95,50 @@ def set_first_bar_ms(symbol: str, timeframe: str, value_ms: int) -> None:
         "INSERT OR REPLACE INTO symbol_earliest (symbol, timeframe, first_bar_ms) VALUES (?, ?, ?)",
         (symbol, timeframe, value_ms),
     )
+
+
+def _is_valid_bar(bar: Bar) -> bool:
+    if bar.high < bar.low:
+        return False
+    if bar.high < max(bar.open, bar.close):
+        return False
+    if bar.low > min(bar.open, bar.close):
+        return False
+    if bar.volume < 0:
+        return False
+    if bar.open <= 0 or bar.close <= 0:
+        return False
+    return True
+
+
+_UPSERT_SQL = """
+INSERT OR REPLACE INTO ohlcv
+    (symbol, timeframe, open_time, open, high, low, close, volume, provider, fetched_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+
+def upsert_many(bars: list[Bar]) -> int:
+    """Insert or replace a batch of bars. Returns count persisted.
+
+    Invalid bars (failing _is_valid_bar) are dropped with a WARN log + metric.
+    """
+    if not bars:
+        return 0
+    valid = [b for b in bars if _is_valid_bar(b)]
+    dropped = len(bars) - len(valid)
+    if dropped:
+        metrics.inc("invalid_bars_dropped_total", dropped)
+        log.warning("Dropped %d invalid bars during upsert_many", dropped)
+    if not valid:
+        return 0
+    conn = _conn()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.executemany(_UPSERT_SQL, [b.as_tuple() for b in valid])
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    metrics.inc("bars_upserted_total", len(valid))
+    return len(valid)
