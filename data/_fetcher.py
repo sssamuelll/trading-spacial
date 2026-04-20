@@ -73,3 +73,87 @@ class _RateLimiter:
 
 
 _rate_limiter = _RateLimiter()
+
+
+def _maybe_probe_primary_recovery() -> None:
+    """If we're on a fallback, probe primary health periodically; revert on success."""
+    global _active_idx, _last_probe_ms
+    with _state_lock:
+        if _active_idx == 0:
+            return
+        now_ms = int(time.time() * 1000)
+        if now_ms - _last_probe_ms < RECOVERY_PROBE_INTERVAL_MS:
+            return
+        _last_probe_ms = now_ms
+        primary_to_probe = _PROVIDERS[0]
+
+    healthy = False
+    try:
+        healthy = primary_to_probe.is_healthy()
+    except Exception:
+        pass
+    if healthy:
+        with _state_lock:
+            _active_idx = 0
+        metrics.inc("provider_recoveries_total", labels={"provider": primary_to_probe.name})
+        log.info("Primary provider %s recovered — reverting active", primary_to_probe.name)
+
+
+def fetch_with_failover(symbol: str, timeframe: str, start_ms: int, end_ms: int) -> list[Bar]:
+    """Try providers in priority order (sticky). On failure thresholds, switch active."""
+    global _active_idx, _consecutive_failures
+
+    _maybe_probe_primary_recovery()
+
+    with _state_lock:
+        ordering = list(range(_active_idx, len(_PROVIDERS))) + list(range(_active_idx))
+        primary_name = _PROVIDERS[ordering[0]].name
+
+    for position, idx in enumerate(ordering):
+        provider = _PROVIDERS[idx]
+        try:
+            _rate_limiter.acquire(provider.name, provider.rate_limit_per_min)
+            t0 = time.time()
+            bars = provider.fetch_klines(symbol, timeframe, start_ms, end_ms)
+            latency_ms = int((time.time() - t0) * 1000)
+            metrics.observe("fetch_latency_ms", latency_ms, labels={"provider": provider.name})
+            metrics.inc("fetches_total", labels={"provider": provider.name, "tf": timeframe})
+            if position == 0:
+                # Only reset on primary success so fallback coverage still
+                # accumulates consecutive primary failures across calls.
+                with _state_lock:
+                    _consecutive_failures = 0
+            else:
+                metrics.inc(
+                    "fallback_fetches_total",
+                    labels={"from": primary_name, "to": provider.name},
+                )
+            return bars
+        except ProviderInvalidSymbol:
+            raise
+        except (ProviderRateLimited, ProviderTemporaryError) as e:
+            metrics.inc(
+                "provider_errors_total",
+                labels={"provider": provider.name, "kind": type(e).__name__},
+            )
+            log.warning("%s failed (%s): %s", provider.name, type(e).__name__, e)
+            if position == 0:
+                with _state_lock:
+                    _consecutive_failures += 1
+                    if _consecutive_failures >= FAILOVER_THRESHOLD:
+                        new_idx = (idx + 1) % len(_PROVIDERS)
+                        metrics.inc(
+                            "provider_switches_total",
+                            labels={"from": provider.name, "to": _PROVIDERS[new_idx].name},
+                        )
+                        log.warning(
+                            "Switching active provider %s → %s after %d consecutive failures",
+                            provider.name, _PROVIDERS[new_idx].name, _consecutive_failures,
+                        )
+                        _active_idx = new_idx
+                        _consecutive_failures = 0
+            continue
+
+    raise AllProvidersFailedError(
+        f"All providers failed for {symbol} {timeframe} [{start_ms}, {end_ms}]"
+    )
