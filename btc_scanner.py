@@ -106,6 +106,94 @@ def annualized_vol_yang_zhang(df_daily: pd.DataFrame) -> float:
     var_daily = max(sigma_on + k * sigma_oc + (1 - k) * sigma_rs, 1e-10)
     return float(np.sqrt(var_daily * 365))
 
+
+def _classify_tune_result(count: int, profit_factor: float | None) -> str:
+    """Classify a (symbol, direction) tuning result into one of three tiers.
+
+    Used by scripts/apply_tune_to_config.py to decide whether to commit a
+    dedicated triplet, fall back to a single-triplet per-symbol, or disable
+    the direction entirely.
+
+    Returns one of: "dedicated", "fallback", "disabled".
+
+    Rules (from spec §6):
+        N ≥ 30 AND PF ≥ 1.3   → "dedicated"
+        N ≥ 30 AND 1.0 ≤ PF < 1.3 → "fallback"
+        N < 30 OR PF < 1.0    → "disabled"
+        PF = inf (no losses)  → "dedicated" if N ≥ 30
+        PF is None or NaN     → "disabled" (insufficient info)
+    """
+    if count == 0 or profit_factor is None:
+        return "disabled"
+    try:
+        pf = float(profit_factor)
+    except (TypeError, ValueError):
+        return "disabled"
+    if np.isnan(pf):
+        return "disabled"
+    if count < 30:
+        return "disabled"
+    if pf < 1.0:
+        return "disabled"
+    if pf < 1.3:
+        return "fallback"
+    return "dedicated"  # pf ≥ 1.3 (including inf)
+
+
+def resolve_direction_params(
+    overrides: dict | None,
+    symbol: str,
+    direction: str,
+) -> dict | None:
+    """Resolve {atr_sl_mult, atr_tp_mult, atr_be_mult} for (symbol, direction).
+
+    Returns None if the direction is disabled for that symbol (via `"short": null`).
+    Precedence: direction block (long/short) > flat dict > global defaults.
+    Case insensitive on direction.
+
+    Spec: See spec §6
+    """
+    defaults = {
+        "atr_sl_mult": ATR_SL_MULT,
+        "atr_tp_mult": ATR_TP_MULT,
+        "atr_be_mult": ATR_BE_MULT,
+    }
+
+    if direction is None:
+        return defaults
+
+    if not isinstance(overrides, dict):
+        return defaults
+
+    entry = overrides.get(symbol, {})
+    if not isinstance(entry, dict):
+        return defaults
+
+    sentinel = object()
+    dir_key = direction.lower()
+    dir_block = entry.get(dir_key, sentinel)
+
+    if dir_block is None:
+        return None  # direction disabled
+
+    if isinstance(dir_block, dict):
+        return {
+            "atr_sl_mult": dir_block.get("atr_sl_mult",
+                              entry.get("atr_sl_mult", defaults["atr_sl_mult"])),
+            "atr_tp_mult": dir_block.get("atr_tp_mult",
+                              entry.get("atr_tp_mult", defaults["atr_tp_mult"])),
+            "atr_be_mult": dir_block.get("atr_be_mult",
+                              entry.get("atr_be_mult", defaults["atr_be_mult"])),
+        }
+
+    # dir_block absent (sentinel) or wrong non-None type (e.g. string) — use flat or defaults
+    return {
+        "atr_sl_mult": entry.get("atr_sl_mult", defaults["atr_sl_mult"]),
+        "atr_tp_mult": entry.get("atr_tp_mult", defaults["atr_tp_mult"]),
+        "atr_be_mult": entry.get("atr_be_mult", defaults["atr_be_mult"]),
+    }
+
+
 # ── Parámetros de la estrategia Spot 1H ────────────────────────────────────
 LRC_LONG_MAX   = 25.0     # LRC% ≤ 25  →  zona de entrada
 LRC_SHORT_MIN  = 75.0     # LRC% >= 75  →  zona de entrada SHORT
@@ -681,6 +769,16 @@ def get_cached_regime() -> dict:
 #  SCANNER PRINCIPAL
 # ─────────────────────────────────────────────────────────────────────────────
 
+def metrics_inc_direction_disabled(symbol: str, direction: str) -> None:
+    """Increment the direction_disabled_skips_total metric."""
+    try:
+        from data import metrics
+        metrics.inc("direction_disabled_skips_total",
+                    labels={"symbol": symbol, "direction": direction})
+    except Exception:
+        pass  # metrics optional — don't crash scan on metric failure
+
+
 def scan(symbol: str = None):
     symbol = symbol or SYMBOL
     ts  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -869,9 +967,21 @@ def scan(symbol: str = None):
         rep.update({"estado": f"⛔ {symbol} deshabilitado en config", "señal_activa": False,
                     "direction": None, "price": round(price, 2)})
         return rep
-    _sl_m = _so.get("atr_sl_mult", ATR_SL_MULT) if isinstance(_so, dict) else ATR_SL_MULT
-    _tp_m = _so.get("atr_tp_mult", ATR_TP_MULT) if isinstance(_so, dict) else ATR_TP_MULT
-    _be_m = _so.get("atr_be_mult", ATR_BE_MULT) if isinstance(_so, dict) else ATR_BE_MULT
+    resolved = resolve_direction_params(_sym_overrides, symbol, direction)
+    if resolved is None:
+        # Direction disabled for this symbol (spec §5 form 3).
+        metrics_inc_direction_disabled(symbol, direction)
+        rep.update({
+            "estado": f"⛔ {direction} deshabilitado para {symbol}",
+            "señal_activa": False,
+            "direction": direction,
+            "direction_disabled": True,
+            "price": round(price, 2),
+        })
+        return rep
+    _sl_m = resolved["atr_sl_mult"]
+    _tp_m = resolved["atr_tp_mult"]
+    _be_m = resolved["atr_be_mult"]
 
     sl_dist    = atr_val * _sl_m
     tp_dist    = atr_val * _tp_m

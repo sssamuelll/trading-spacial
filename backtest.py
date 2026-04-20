@@ -39,6 +39,7 @@ from btc_scanner import (
     SCORE_MIN_HALF, SCORE_STANDARD, SCORE_PREMIUM,
     ATR_PERIOD, ATR_SL_MULT, ATR_TP_MULT, ATR_BE_MULT,
     ADX_THRESHOLD,
+    resolve_direction_params,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
@@ -176,7 +177,8 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
                       df1d: pd.DataFrame = None,
                       sim_start: datetime = None, sim_end: datetime = None,
                       df_fng: pd.DataFrame = None,
-                      df_funding: pd.DataFrame = None) -> list[dict]:
+                      df_funding: pd.DataFrame = None,
+                      symbol_overrides: dict | None = None) -> list[dict]:
     """Run bar-by-bar simulation of the Spot V6 strategy."""
     trades = []
     position = None  # {entry_price, entry_time, score, sl, tp, size_mult}
@@ -260,6 +262,9 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
                     "score": position["score"],
                     "size_mult": position["size_mult"],
                     "duration_hours": (bar_time - position["entry_time"]).total_seconds() / 3600,
+                    "atr_sl_mult_used": position.get("atr_sl_mult_used"),
+                    "atr_tp_mult_used": position.get("atr_tp_mult_used"),
+                    "atr_be_mult_used": position.get("atr_be_mult_used"),
                 }
                 trades.append(trade)
                 capital += pnl_usd
@@ -431,15 +436,35 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
             atr_val = float(atr_series.iloc[-1])
             if pd.isna(atr_val) or atr_val <= 0:
                 continue
-            if trade_dir == "SHORT":
-                sl_price = round(price + atr_val * _sl_m, 2)
-                tp_price = round(price - atr_val * _tp_m, 2)
-                be_threshold = price - atr_val * _be_m
+
+            # Per-direction resolver (only when caller explicitly passed symbol_overrides
+            # AND legacy kwargs were NOT set — legacy kwargs retain precedence).
+            legacy_override_active = (atr_sl_mult is not None) or (atr_tp_mult is not None) or (atr_be_mult is not None)
+            if symbol_overrides is not None and not legacy_override_active:
+                resolved = resolve_direction_params(symbol_overrides, symbol, trade_dir)
+                if resolved is None:
+                    # Direction disabled for this symbol — skip opening the position.
+                    continue
+                _sl_m_use = resolved["atr_sl_mult"]
+                _tp_m_use = resolved["atr_tp_mult"]
+                _be_m_use = resolved["atr_be_mult"]
             else:
-                sl_price = round(price - atr_val * _sl_m, 2)
-                tp_price = round(price + atr_val * _tp_m, 2)
-                be_threshold = price + atr_val * _be_m
+                _sl_m_use = _sl_m
+                _tp_m_use = _tp_m
+                _be_m_use = _be_m
+
+            if trade_dir == "SHORT":
+                sl_price = round(price + atr_val * _sl_m_use, 2)
+                tp_price = round(price - atr_val * _tp_m_use, 2)
+                be_threshold = price - atr_val * _be_m_use
+            else:
+                sl_price = round(price - atr_val * _sl_m_use, 2)
+                tp_price = round(price + atr_val * _tp_m_use, 2)
+                be_threshold = price + atr_val * _be_m_use
         else:
+            _sl_m_use = _sl_m
+            _tp_m_use = _tp_m
+            _be_m_use = _be_m
             if trade_dir == "SHORT":
                 sl_price = round(price * (1 + SL_PCT / 100), 2)
                 tp_price = round(price * (1 - TP_PCT / 100), 2)
@@ -458,6 +483,9 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
             "tp": tp_price,
             "size_mult": size_mult,
             "be_threshold": be_threshold,
+            "atr_sl_mult_used": _sl_m_use,
+            "atr_tp_mult_used": _tp_m_use,
+            "atr_be_mult_used": _be_m_use,
         }
 
     # Close any open position at last bar price
@@ -479,6 +507,9 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
             "score": position["score"],
             "size_mult": position["size_mult"],
             "duration_hours": (df1h.index[-1] - position["entry_time"]).total_seconds() / 3600,
+            "atr_sl_mult_used": position.get("atr_sl_mult_used"),
+            "atr_tp_mult_used": position.get("atr_tp_mult_used"),
+            "atr_be_mult_used": position.get("atr_be_mult_used"),
         })
         capital += pnl_usd
 
