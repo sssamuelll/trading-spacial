@@ -186,20 +186,6 @@ def _rate_limit():
         _last_api_call = time.time()
 
 
-def get_klines(symbol: str, interval: str, limit: int = 210) -> pd.DataFrame:
-    """Compatibility shim: returns the legacy shape (DatetimeIndex, includes
-    in-progress bar) on top of the new data layer. btc_api's /ohlcv and
-    performance tracker still consume this shape; full removal lives in
-    Phase 7 Task 23."""
-    df = md.get_klines_live(symbol, interval, limit)
-    if df.empty:
-        return df
-    df = df.copy()
-    df["ts"] = pd.to_datetime(df["open_time"], unit="ms")
-    df.set_index("ts", inplace=True)
-    return df
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  INDICADORES
 # ─────────────────────────────────────────────────────────────────────────────

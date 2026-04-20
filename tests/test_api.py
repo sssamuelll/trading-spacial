@@ -1622,7 +1622,7 @@ class TestSignalPerformance:
         con.close()
 
         # Pass current price — should fill price_1h without calling get_klines for milestones
-        with patch.object(btc_api, "get_klines") as mock_klines:
+        with patch.object(btc_api.md, "get_klines") as mock_klines:
             # get_klines only needed for runup/drawdown (1h candles)
             import pandas as pd
             mock_klines.return_value = pd.DataFrame({
@@ -1661,7 +1661,7 @@ class TestSignalPerformance:
         con.commit()
         con.close()
 
-        with patch.object(btc_api, "get_klines") as mock_klines:
+        with patch.object(btc_api.md, "get_klines") as mock_klines:
             import pandas as pd
             mock_klines.return_value = pd.DataFrame({
                 "open": [2900.0], "high": [3100.0],
