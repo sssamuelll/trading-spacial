@@ -624,13 +624,15 @@ class TestScan:
     def test_scan_sizing_coherente(self, mock_klines):
         """Verifica que el sizing no supere el 98% del capital."""
         df1h, df4h, df5m = self._make_scan_mock()
-        mock_klines.side_effect = [df5m, df1h, df4h, df1h]
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h, df1h]  # +1 for vol 1d lookup
 
         rep = scanner.scan()
         sz = rep["sizing_1h"]
         assert sz["pct_capital"] <= 98.0
         assert sz["capital_usd"] == 1000.0
-        assert sz["riesgo_usd"] == pytest.approx(10.0, abs=0.01)
+        # riesgo = capital * 0.01 * vol_mult, where vol_mult ∈ [VOL_MAX_CEIL, 1.0]
+        assert scanner.VOL_MAX_CEIL * 10.0 <= sz["riesgo_usd"] <= 10.0
+        assert sz["riesgo_usd"] == pytest.approx(10.0 * sz["vol_mult"], abs=0.01)
 
     @patch("btc_scanner.md.get_klines")
     def test_scan_sl_tp_coherentes(self, mock_klines):
@@ -978,3 +980,22 @@ class TestCheckTrigger5MShort:
         active, details = check_trigger_5m_short(df5)
         assert active is False
         assert details == {}
+
+
+class TestVolMultIntegration:
+    def test_high_vol_series_lowers_sizing(self):
+        """High-vol synthetic series should push vol_mult below 1 (#125)."""
+        from btc_scanner import annualized_vol_yang_zhang, TARGET_VOL_ANNUAL
+
+        # High-volatility synthetic series (5% daily σ)
+        n = 35
+        rng = np.random.default_rng(0)
+        prices = 100.0 * np.exp(rng.normal(0, 0.05, n).cumsum())
+        df = pd.DataFrame({
+            "open": prices,
+            "high": prices * 1.03,
+            "low": prices * 0.97,
+            "close": prices,
+        })
+        vol = annualized_vol_yang_zhang(df)
+        assert vol > TARGET_VOL_ANNUAL  # high-vol series → mult < 1
