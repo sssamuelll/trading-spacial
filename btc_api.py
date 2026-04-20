@@ -39,7 +39,8 @@ from logging.handlers import RotatingFileHandler
 import sys
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
-from btc_scanner import scan, get_top_symbols, get_klines
+from btc_scanner import scan, get_top_symbols
+from data import market_data as md
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,7 +98,7 @@ def check_pending_signal_outcomes(current_prices: dict[str, float]):
             if age_hours <= 25.0:
                 if symbol not in _klines_cache:
                     try:
-                        _klines_cache[symbol] = get_klines(symbol, "1h", limit=25)
+                        _klines_cache[symbol] = md.get_klines(symbol, "1h", limit=25)
                     except Exception:
                         _klines_cache[symbol] = None
 
@@ -1409,6 +1410,7 @@ def status():
             "score":   latest["score"]   if latest else None,
         } if latest else None,
         "config": _strip_secrets(load_config()),
+        "market_data": md.get_stats(),
     }
 
 
@@ -1617,12 +1619,12 @@ def get_ohlcv(
     limit:    int = Query(300,       ge=1, le=1000, description="Número de velas"),
 ):
     """Retorna datos OHLCV listos para lightweight-charts (timestamps en segundos UTC).
-    Usa get_klines() del scanner (proxy + fallback a Bybit integrados)."""
+    Usa md.get_klines_live() — incluye la barra en curso para el gráfico animado."""
     VALID = {"1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d","3d","1w","1M"}
     if interval not in VALID:
         raise HTTPException(status_code=400, detail=f"Intervalo invalido: {interval}")
     try:
-        df = get_klines(symbol.upper(), interval, limit=limit)
+        df = md.get_klines_live(symbol.upper(), interval, limit=limit)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Error obteniendo OHLCV: {e}")
 
@@ -1631,7 +1633,7 @@ def get_ohlcv(
 
     candles, volumes = [], []
     for _, row in df.iterrows():
-        ts = int(row.name.timestamp()) if hasattr(row.name, 'timestamp') else 0
+        ts = int(row["open_time"]) // 1000  # ms → seconds for lightweight-charts
         o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
         v = float(row["volume"])
         candles.append({"time": ts, "open": o, "high": h, "low": l, "close": c})
