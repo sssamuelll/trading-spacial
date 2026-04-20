@@ -106,3 +106,58 @@ class TestGetKlinesRange:
         # Left edge fetch: [0, 4]
         assert fake_provider.calls[0][2] == 0
         assert fake_provider.calls[0][3] == 4 * 3600_000
+
+
+class TestPrefetch:
+    def test_parallel_cache_fill(self, tmp_ohlcv_db, fake_provider, monkeypatch):
+        monkeypatch.setattr(md, "last_closed_bar_time", lambda tf, now=None: 9 * 3600_000)
+        monkeypatch.setattr(_fetcher, "last_closed_bar_time", lambda tf, now=None: 9 * 3600_000)
+        for sym in ["BTCUSDT", "ETHUSDT"]:
+            _seed(fake_provider, sym, "1h", 10)
+            _seed(fake_provider, sym, "4h", 10)
+        md.prefetch(["BTCUSDT", "ETHUSDT"], ["1h", "4h"], limit=5)
+        # After prefetch, each (sym, tf) should have data cached
+        for sym in ["BTCUSDT", "ETHUSDT"]:
+            for tf in ["1h", "4h"]:
+                assert _storage.max_open_time(sym, tf) is not None
+
+    def test_exception_does_not_abort_batch(self, tmp_ohlcv_db, fake_provider, monkeypatch):
+        from data.providers.base import ProviderInvalidSymbol
+        monkeypatch.setattr(md, "last_closed_bar_time", lambda tf, now=None: 9 * 3600_000)
+        monkeypatch.setattr(_fetcher, "last_closed_bar_time", lambda tf, now=None: 9 * 3600_000)
+        _seed(fake_provider, "GOODCOIN", "1h", 10)
+        fake_provider.set_error("BADCOIN", "1h", ProviderInvalidSymbol("not listed"))
+        md.prefetch(["GOODCOIN", "BADCOIN"], ["1h"], limit=5)
+        assert _storage.max_open_time("GOODCOIN", "1h") is not None
+        assert _storage.max_open_time("BADCOIN", "1h") is None
+
+
+class TestBackfill:
+    def test_idempotent(self, tmp_ohlcv_db, fake_provider):
+        bars = [make_bar("BTCUSDT", "1h", t * 3600_000) for t in range(50)]
+        fake_provider.set_bars("BTCUSDT", "1h", bars)
+        start = datetime(1970, 1, 1, 0, 0, tzinfo=timezone.utc)
+        end = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(hours=49)
+        md.backfill("BTCUSDT", "1h", start, end)
+        count1 = _storage._conn().execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0]
+        md.backfill("BTCUSDT", "1h", start, end)
+        count2 = _storage._conn().execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0]
+        assert count1 == count2
+        assert count1 >= 1
+
+
+class TestRepair:
+    def test_overwrites_existing_bars(self, tmp_ohlcv_db, fake_provider):
+        original = [make_bar("BTCUSDT", "1h", t * 3600_000, price=100.0) for t in range(10)]
+        revised = [make_bar("BTCUSDT", "1h", t * 3600_000, price=200.0) for t in range(10)]
+        _storage.upsert_many(original)
+        fake_provider.set_bars("BTCUSDT", "1h", revised)
+        # end=10h so last_closed_bar_time caps at 9h and repair covers bars 0..9
+        md.repair(
+            "BTCUSDT", "1h",
+            datetime(1970, 1, 1, 0, 0, tzinfo=timezone.utc),
+            datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(hours=10),
+        )
+        rows = _storage._conn().execute(
+            "SELECT close FROM ohlcv WHERE symbol='BTCUSDT' AND timeframe='1h' ORDER BY open_time").fetchall()
+        assert all(r[0] == 200.0 for r in rows)

@@ -147,3 +147,80 @@ def get_klines_range(
             _fetcher._fill_internal_gaps(symbol, timeframe, start_ms, end_ms)
 
     return _storage.range_(symbol, timeframe, start_ms, end_ms)
+
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+MAX_PARALLEL_FETCH = 5
+
+
+def prefetch(
+    symbols: Iterable[str],
+    timeframes: Iterable[str],
+    limit: int = 210,
+) -> None:
+    """Batch-prefetch cache entries for all (symbol, timeframe) combinations in parallel.
+
+    Internal workers call get_klines, so all freshness/locking semantics are preserved.
+    Per-(sym, tf) failures are logged and recorded as metrics but do NOT abort the batch.
+    """
+    tasks = [(s, tf) for s in symbols for tf in timeframes]
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_FETCH) as ex:
+        futures = {ex.submit(get_klines, s, tf, limit): (s, tf) for s, tf in tasks}
+        for fut in as_completed(futures):
+            s, tf = futures[fut]
+            try:
+                fut.result()
+            except Exception as e:
+                log.warning("Prefetch failed for %s/%s: %s", s, tf, e)
+                metrics.inc("prefetch_errors_total", labels={"symbol": s, "tf": tf})
+
+
+def backfill(
+    symbol: str,
+    timeframe: str,
+    start: datetime,
+    end: datetime | None = None,
+) -> int:
+    """Explicit bulk historical fetch + persist. Idempotent, resumable, pre-listing-aware."""
+    if timeframe not in TIMEFRAMES:
+        raise ValueError(f"Unknown timeframe: {timeframe}")
+    _ensure_schema_once()
+
+    end = end or _utcnow()
+    end_ms = last_closed_bar_time(timeframe, end)
+    start_ms = _to_ms(start)
+    return _fetcher._backfill_range(symbol, timeframe, start_ms, end_ms)
+
+
+def repair(
+    symbol: str,
+    timeframe: str,
+    start: datetime,
+    end: datetime | None = None,
+) -> int:
+    """Force re-fetch + overwrite of a range. Use when data anomaly is detected.
+
+    Internally reuses _backfill_range; INSERT OR REPLACE semantics overwrite existing bars.
+    """
+    if timeframe not in TIMEFRAMES:
+        raise ValueError(f"Unknown timeframe: {timeframe}")
+    _ensure_schema_once()
+
+    end = end or _utcnow()
+    end_ms = last_closed_bar_time(timeframe, end)
+    start_ms = _to_ms(start)
+
+    metrics.inc("repairs_requested_total", labels={"symbol": symbol, "tf": timeframe})
+    before_count = _storage.range_stats(symbol, timeframe, start_ms, end_ms)[2]
+    persisted = _fetcher._backfill_range(symbol, timeframe, start_ms, end_ms)
+    after_count = _storage.range_stats(symbol, timeframe, start_ms, end_ms)[2]
+    metrics.inc("bars_overwritten_total", max(0, persisted - (after_count - before_count)),
+                labels={"symbol": symbol, "tf": timeframe})
+    return persisted
+
+
+def get_stats() -> dict:
+    """Snapshot of market data metrics. Exposed via /status endpoint integration."""
+    return metrics.get_stats()
