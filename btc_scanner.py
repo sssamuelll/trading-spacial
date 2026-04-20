@@ -347,9 +347,27 @@ def detect_bear_engulfing(df: pd.DataFrame):
 
 
 def calc_cvd_delta(df: pd.DataFrame, n=3):
-    """Proxy CVD: volumen taker buy − sell últimas n barras."""
-    buy  = df["taker_buy_base"].tail(n)
-    sell = (df["volume"] - df["taker_buy_base"]).tail(n)
+    """Proxy CVD: volumen taker buy − sell últimas n barras.
+
+    Data layer bars carry only OHLCV (no taker-side metadata), so
+    approximate taker_buy_base from the bar's close position within
+    its high-low range, same heuristic the old bybit adapter used.
+    """
+    if "taker_buy_base" in df.columns:
+        taker_buy = df["taker_buy_base"]
+    else:
+        hl = (df["high"] - df["low"]).replace(0, 1e-9)
+        bullish = df["close"] >= df["open"]
+        taker_buy = pd.Series(
+            np.where(
+                bullish,
+                df["volume"] * (df["close"] - df["low"]) / hl,
+                df["volume"] * (df["high"] - df["close"]) / hl,
+            ),
+            index=df.index,
+        )
+    buy  = taker_buy.tail(n)
+    sell = (df["volume"] - taker_buy).tail(n)
     return float((buy - sell).sum())
 
 
