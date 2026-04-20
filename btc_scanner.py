@@ -27,6 +27,8 @@ import io
 import logging
 import threading
 
+from data import market_data as md
+
 # Reconfigure stdout for Windows Unicode support
 try:
     sys.stdout.reconfigure(encoding='utf-8')
@@ -664,7 +666,7 @@ def detect_regime() -> dict:
     # ── 1. Price Structure (40% weight) ──────────────────────────────────────
     price_score = 100  # default bullish
     try:
-        df1d = get_klines("BTCUSDT", "1d", limit=250)
+        df1d = md.get_klines("BTCUSDT", "1d", limit=250)
         if len(df1d) >= 200:
             sma50  = calc_sma(df1d["close"], 50).iloc[-1]
             sma200 = calc_sma(df1d["close"], 200).iloc[-1]
@@ -792,9 +794,9 @@ def scan(symbol: str = None):
     rep = {"timestamp": ts, "symbol": symbol, "errors": []}
 
     # ── Datos de mercado ──────────────────────────────────────────────────────
-    df5  = get_klines(symbol, "5m",  limit=210)   # gatillo
-    df1h = get_klines(symbol, "1h",  limit=210)   # señal principal
-    df4h = get_klines(symbol, "4h",  limit=150)   # contexto macro
+    df5  = md.get_klines(symbol, "5m",  limit=210)   # gatillo
+    df1h = md.get_klines(symbol, "1h",  limit=210)   # señal principal
+    df4h = md.get_klines(symbol, "4h",  limit=150)   # contexto macro
     price = df1h["close"].iloc[-1]   # precio de cierre de la última vela 1H
 
     # ── Régimen de mercado (compuesto, cacheado por detect_regime()) ──────────
@@ -1231,6 +1233,11 @@ def main():
 
     while True:
         symbols = [sym_arg] if sym_arg else get_top_symbols(20)
+        # Warm cache in parallel so subsequent per-symbol get_klines are cache-hits
+        try:
+            md.prefetch(symbols, ["5m", "1h", "4h"], limit=210)
+        except Exception as e:
+            log.warning("prefetch batch failed: %s", e)
         try:
             for sym in symbols:
                 try:
