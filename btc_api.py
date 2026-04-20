@@ -710,19 +710,29 @@ def _get_binance_usdt_symbols() -> set:
 
 
 def get_active_symbols(n: int = 20) -> List[str]:
-    """Retorna la lista de símbolos validados contra Binance, refrescada cada hora."""
+    """Retorna la lista CURADA de 10 símbolos rentables (epic #135).
+
+    Previamente pedía top-N por market cap a CoinGecko, lo que reinsertaba
+    los 13 tokens confirmados no rentables (BNB, SOL, XRP, DOT, MATIC,
+    LINK, LTC, ATOM, NEAR, FIL, APT, OP, ARB) en cada refresh.
+
+    Diseño actual (epic #121/#135): la lista es ESTÁTICA y vive en
+    `btc_scanner.DEFAULT_SYMBOLS`. La validación contra Binance spot se
+    mantiene como guarda adicional para evitar scanear pares delisted.
+    """
+    from btc_scanner import DEFAULT_SYMBOLS
     global _symbols_cache, _symbols_fetched_at
     if not _symbols_cache or (time.time() - _symbols_fetched_at) > SYMBOLS_REFRESH_SEC:
-        log.info("Actualizando lista de símbolos desde CoinGecko...")
-        # Pedir el doble para tener margen al filtrar
-        candidates   = get_top_symbols(n * 2)
+        candidates = DEFAULT_SYMBOLS[:n]
         valid_on_binance = _get_binance_usdt_symbols()
         if valid_on_binance:
+            dropped = [s for s in candidates if s not in valid_on_binance]
+            if dropped:
+                log.warning(f"Símbolos curados no listados en Binance (serán omitidos): {dropped}")
             candidates = [s for s in candidates if s in valid_on_binance]
-            log.info(f"Simbolos validos en Binance: {len(candidates)} de {n*2} candidatos")
-        _symbols_cache = candidates[:n]
+        _symbols_cache = candidates
         _symbols_fetched_at = time.time()
-        log.info(f"Simbolos activos: {_symbols_cache}")
+        log.info(f"Símbolos activos (curados): {_symbols_cache}")
     return _symbols_cache
 
 
@@ -1280,6 +1290,14 @@ def scanner_loop():
         symbols     = get_active_symbols(n_sym)
         _scanner_state["symbols_active"] = symbols
         log.info(f"Ciclo iniciado — {len(symbols)} simbolos")
+
+        # Calentar el caché OHLCV en paralelo para que los scans por símbolo
+        # siguientes sean hits del caché en lugar de cold fetches a Binance.
+        # El diagnóstico per-símbolo luego hace md.get_klines en 5m/1h/4h/1d.
+        try:
+            md.prefetch(symbols, ["5m", "1h", "4h"], limit=210)
+        except Exception as e:
+            log.warning(f"prefetch batch fallo: {e}")
 
         cycle_prices = {}
         for sym in symbols:
