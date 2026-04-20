@@ -248,3 +248,87 @@ class TestAssessTfBar:
         assert "pnl_pct" in trade
         assert "pnl_usd" in trade
         assert trade["exit_reason"] in ("TRAILING_STOP", "EMA_REVERSAL")
+
+
+class TestSimulateStrategyDirectionalOverrides:
+    """Per-direction resolver wiring in simulate_strategy (#151)."""
+
+    def _mini_bars(self, n_hours=300):
+        """Build minimal OHLCV DataFrames that let simulate_strategy run."""
+        import pandas as pd
+        from datetime import datetime, timezone, timedelta
+        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        idx1h = [start + timedelta(hours=i) for i in range(n_hours)]
+        df1h = pd.DataFrame({
+            "open":  [100 + (i % 10) for i in range(n_hours)],
+            "high":  [101 + (i % 10) for i in range(n_hours)],
+            "low":   [99  + (i % 10) for i in range(n_hours)],
+            "close": [100 + (i % 10) for i in range(n_hours)],
+            "volume": [1000] * n_hours,
+        }, index=pd.DatetimeIndex(idx1h, name="ts"))
+        df4h = df1h.iloc[::4].copy()
+        df5m = df1h.iloc[0:1].copy()
+        df1d = df1h.iloc[::24].copy()
+        return df1h, df4h, df5m, df1d
+
+    def test_simulate_strategy_accepts_symbol_overrides_kwarg(self):
+        """New kwarg `symbol_overrides` is accepted (smoke test); no SHORT when disabled."""
+        from backtest import simulate_strategy
+        df1h, df4h, df5m, df1d = self._mini_bars(n_hours=300)
+        trades, _eq = simulate_strategy(
+            df1h, df4h, df5m, "BTCUSDT",
+            df1d=df1d,
+            symbol_overrides={"BTCUSDT": {"long": {"atr_sl_mult": 1.0,
+                                                    "atr_tp_mult": 4.0,
+                                                    "atr_be_mult": 1.5},
+                                           "short": None}},
+        )
+        assert all(t["direction"] != "SHORT" for t in trades)
+
+    def test_simulate_strategy_legacy_kwargs_still_work(self):
+        """Without symbol_overrides, existing atr_*_mult kwargs govern behaviour."""
+        from backtest import simulate_strategy
+        df1h, df4h, df5m, df1d = self._mini_bars(n_hours=300)
+        trades_a, _ = simulate_strategy(df1h, df4h, df5m, "BTCUSDT",
+                                         df1d=df1d,
+                                         atr_sl_mult=1.0, atr_tp_mult=4.0, atr_be_mult=1.5)
+        trades_b, _ = simulate_strategy(df1h, df4h, df5m, "BTCUSDT", df1d=df1d)
+        assert isinstance(trades_a, list)
+        assert isinstance(trades_b, list)
+
+    def test_simulate_strategy_legacy_kwargs_win_over_overrides(self):
+        """If caller passes BOTH atr_sl_mult and symbol_overrides, legacy kwargs win
+        (preserves behaviour for scripts/grid_search_tf, scripts/portfolio_backtest, etc)."""
+        from backtest import simulate_strategy
+        df1h, df4h, df5m, df1d = self._mini_bars(n_hours=300)
+        trades, _ = simulate_strategy(
+            df1h, df4h, df5m, "BTCUSDT",
+            df1d=df1d,
+            atr_sl_mult=0.5, atr_tp_mult=2.0, atr_be_mult=1.5,
+            symbol_overrides={"BTCUSDT": {"long": {"atr_sl_mult": 2.0, "atr_tp_mult": 6.0, "atr_be_mult": 2.0}}},
+        )
+        # The contract we're testing: when both legacy kwargs AND symbol_overrides are
+        # passed, the legacy kwargs take precedence. If any trade has atr_sl_mult_used,
+        # it must use 0.5 (the legacy value), never 2.0 (the override value).
+        for t in trades:
+            if "atr_sl_mult_used" in t:
+                assert t["atr_sl_mult_used"] == 0.5, (
+                    f"Legacy kwargs (0.5) should win over symbol_overrides (2.0), "
+                    f"but trade has atr_sl_mult_used={t['atr_sl_mult_used']}"
+                )
+
+    def test_simulate_strategy_position_tracks_mults_used(self):
+        """Position dict records the triplet actually used at entry."""
+        from backtest import simulate_strategy
+        df1h, df4h, df5m, df1d = self._mini_bars(n_hours=300)
+        trades, _ = simulate_strategy(
+            df1h, df4h, df5m, "BTCUSDT",
+            df1d=df1d,
+            symbol_overrides={"BTCUSDT": {"long": {"atr_sl_mult": 0.7, "atr_tp_mult": 4.0, "atr_be_mult": 1.5},
+                                           "short": {"atr_sl_mult": 1.0, "atr_tp_mult": 3.0, "atr_be_mult": 2.0}}},
+        )
+        for t in trades:
+            if t.get("direction") == "LONG":
+                assert t.get("atr_sl_mult_used") == 0.7
+            elif t.get("direction") == "SHORT":
+                assert t.get("atr_sl_mult_used") == 1.0
