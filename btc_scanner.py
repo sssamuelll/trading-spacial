@@ -151,25 +151,6 @@ def get_top_symbols(n: int = 20, quote: str = "USDT") -> list:
 #  Proxy: configurar en config.json  →  "proxy": "socks5://127.0.0.1:1080"
 #         o variable de entorno  HTTPS_PROXY / HTTP_PROXY
 
-BINANCE_URLS = [
-    "https://api.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://api4.binance.com",
-]
-
-# Intervalos Bybit  (distintos a Binance)
-_BYBIT_INTERVAL = {"1m":"1","3m":"3","5m":"5","15m":"15","30m":"30",
-                   "1h":"60","2h":"120","4h":"240","6h":"360","12h":"720",
-                   "1d":"D","1w":"W","1M":"M"}
-
-_active_provider = None   # "binance" | "bybit"  — se detecta la primera vez
-_provider_lock = threading.Lock()           # protege escrituras a _active_provider
-_provider_fail_count = 0                    # llamadas en modo Bybit desde el último intento de Binance
-_RECOVERY_INTERVAL = 10                     # cada N llamadas en Bybit, reintentar Binance
-
-
 def _load_proxy() -> dict:
     """Lee proxy de config.json o de variables de entorno."""
     cfg_path = os.path.join(SCRIPT_DIR, "config.json")
@@ -205,143 +186,17 @@ def _rate_limit():
         _last_api_call = time.time()
 
 
-def _get(url: str, params: dict = None) -> dict:
-    """HTTP GET con soporte de proxy, timeout y rate limiting."""
-    _rate_limit()
-    proxies = _load_proxy()
-    r = requests.get(url, params=params, proxies=proxies or None,
-                     timeout=12, headers={"User-Agent": "btc-scanner/1.0"})
-    r.raise_for_status()
-    return r.json()
-
-
-# ── Binance ───────────────────────────────────────────────────────────────────
-
-def _klines_binance(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    """
-    Intenta cada URL mirror de Binance en orden.
-    Devuelve DataFrame normalizado o lanza excepción si todos fallan.
-    """
-    last_err = None
-    for base in BINANCE_URLS:
-        try:
-            data = _get(f"{base}/api/v3/klines",
-                        {"symbol": symbol, "interval": interval, "limit": limit})
-            df = pd.DataFrame(data, columns=[
-                "ts","open","high","low","close","volume",
-                "close_time","quote_vol","trades",
-                "taker_buy_base","taker_buy_quote","ignore"
-            ])
-            for c in ["open","high","low","close","volume",
-                      "taker_buy_base","taker_buy_quote"]:
-                df[c] = df[c].astype(float)
-            df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-            df.set_index("ts", inplace=True)
-            log.debug(f"Binance OK ({base})")
-            return df
-        except Exception as e:
-            log.warning(f"Binance {base} → {type(e).__name__}: {e}")
-            last_err = e
-    raise last_err
-
-
-# ── Bybit ─────────────────────────────────────────────────────────────────────
-
-def _klines_bybit(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    """
-    Bybit V5 Spot klines → mismo formato de DataFrame que Binance.
-
-    Bybit no provee taker_buy_base directamente en klines;
-    se aproxima con el ratio (close-low)/(high-low) × volume
-    para velas alcistas, y el inverso para bajistas.
-    Esta aproximación es suficiente para el cálculo de CVD delta.
-    """
-    byt_interval = _BYBIT_INTERVAL.get(interval, interval.replace("m","").replace("h","60"))
-    data = _get("https://api.bybit.com/v5/market/kline",
-                {"category": "spot", "symbol": symbol,
-                 "interval": byt_interval, "limit": limit})
-    if data.get("retCode", -1) != 0:
-        raise RuntimeError(f"Bybit error: {data.get('retMsg')}")
-
-    rows = data["result"]["list"]          # orden: más reciente primero
-    rows = list(reversed(rows))            # → cronológico
-    df = pd.DataFrame(rows, columns=[
-        "ts","open","high","low","close","volume","turnover"
-    ])
-    for c in ["open","high","low","close","volume","turnover"]:
-        df[c] = df[c].astype(float)
-    df["ts"] = pd.to_datetime(df["ts"].astype(float), unit="ms")
-    df.set_index("ts", inplace=True)
-
-    # Aproximar taker_buy_base
-    hl = (df["high"] - df["low"]).replace(0, 1e-9)
-    bullish = df["close"] >= df["open"]
-    df["taker_buy_base"] = np.where(
-        bullish,
-        df["volume"] * (df["close"] - df["low"]) / hl,
-        df["volume"] * (df["high"] - df["close"]) / hl,
-    )
-    df["taker_buy_quote"] = df["taker_buy_base"] * df["close"]
-    log.debug("Bybit OK")
-    return df
-
-
-# ── Punto de entrada unificado ────────────────────────────────────────────────
-
 def get_klines(symbol: str, interval: str, limit: int = 210) -> pd.DataFrame:
-    """
-    Obtiene velas OHLCV con detección automática de proveedor.
-
-    Intenta Binance primero (todos los mirrors). Si todos fallan con
-    error de red o HTTP >= 400, cambia a Bybit automáticamente y
-    registra el proveedor activo para los siguientes ciclos.
-
-    Cuando el proveedor activo es Bybit, cada _RECOVERY_INTERVAL
-    llamadas se reintenta Binance. Si responde, se restaura como
-    proveedor principal.
-    """
-    global _active_provider, _provider_fail_count
-
-    # Si ya sabemos que Bybit funciona, ir directo — pero reintentar
-    # Binance periódicamente para recuperar el proveedor preferido.
-    if _active_provider == "bybit":
-        with _provider_lock:
-            _provider_fail_count += 1
-            should_retry = (_provider_fail_count >= _RECOVERY_INTERVAL)
-            if should_retry:
-                _provider_fail_count = 0
-
-        if should_retry:
-            try:
-                df = _klines_binance(symbol, interval, limit)
-                with _provider_lock:
-                    _active_provider = "binance"
-                log.info("✅ Binance recuperado — volviendo a proveedor principal")
-                return df
-            except Exception:
-                log.debug("Binance sigue sin responder, manteniendo Bybit")
-
-        return _klines_bybit(symbol, interval, limit)
-
-    # Intentar Binance
-    try:
-        df = _klines_binance(symbol, interval, limit)
-        if _active_provider != "binance":
-            with _provider_lock:
-                _active_provider = "binance"
-            log.info("✅ Proveedor de datos: Binance")
+    """Compatibility shim: returns the legacy shape (DatetimeIndex, includes
+    in-progress bar) on top of the new data layer. btc_api's /ohlcv and
+    performance tracker still consume this shape; full removal lives in
+    Phase 7 Task 23."""
+    df = md.get_klines_live(symbol, interval, limit)
+    if df.empty:
         return df
-    except Exception as binance_err:
-        log.warning(f"⚠️  Todos los mirrors de Binance fallaron ({binance_err}). "
-                    f"Cambiando a Bybit…")
-
-    # Fallback a Bybit
-    df = _klines_bybit(symbol, interval, limit)
-    if _active_provider != "bybit":
-        with _provider_lock:
-            _active_provider = "bybit"
-            _provider_fail_count = 0
-        log.info("✅ Proveedor de datos: Bybit (fallback automático)")
+    df = df.copy()
+    df["ts"] = pd.to_datetime(df["open_time"], unit="ms")
+    df.set_index("ts", inplace=True)
     return df
 
 

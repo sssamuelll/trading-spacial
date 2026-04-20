@@ -725,64 +725,6 @@ class TestLoadProxy:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  TESTS — _klines_bybit (formato de DataFrame)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestKlinesBybit:
-    @patch("btc_scanner._get")
-    def test_retorna_dataframe_correcto(self, mock_get):
-        """Verifica que el DataFrame de Bybit tenga el mismo formato que Binance."""
-        # Simular respuesta de Bybit (formato: más reciente primero)
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        rows = []
-        for i in range(5):
-            ts = now_ms - (4 - i) * 5 * 60 * 1000  # cada 5 min
-            rows.append([str(ts), "85000", "85500", "84800", "85200", "10.5", "892650"])
-        rows_reversed = list(reversed(rows))  # Bybit envía más reciente primero
-
-        mock_get.return_value = {
-            "retCode": 0,
-            "result": {"list": rows_reversed},
-        }
-
-        df = scanner._klines_bybit("BTCUSDT", "5m", 5)
-
-        assert isinstance(df, pd.DataFrame)
-        assert "open" in df.columns
-        assert "close" in df.columns
-        assert "taker_buy_base" in df.columns
-        assert len(df) == 5
-
-    @patch("btc_scanner._get")
-    def test_bybit_error_lanza_excepcion(self, mock_get):
-        mock_get.return_value = {
-            "retCode": 10001,
-            "retMsg": "Invalid symbol",
-        }
-        with pytest.raises(RuntimeError, match="Bybit error"):
-            scanner._klines_bybit("INVALID", "5m", 10)
-
-    @patch("btc_scanner._get")
-    def test_taker_buy_base_aproximado(self, mock_get):
-        """Verifica que taker_buy_base esté entre 0 y volume."""
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        rows = []
-        for i in range(10):
-            ts = now_ms - (9 - i) * 60 * 1000
-            rows.append([str(ts), "85000", "85500", "84500", "85200", "100", "8520000"])
-        rows_reversed = list(reversed(rows))
-
-        mock_get.return_value = {
-            "retCode": 0,
-            "result": {"list": rows_reversed},
-        }
-
-        df = scanner._klines_bybit("BTCUSDT", "1m", 10)
-        assert (df["taker_buy_base"] >= 0).all()
-        assert (df["taker_buy_base"] <= df["volume"] + 1e-6).all()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  TESTS — fmt() (formato de salida)
 # ─────────────────────────────────────────────────────────────────────────────
 
