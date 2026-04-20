@@ -99,3 +99,44 @@ class TestApplyTuneScript:
         # Expected form: mix — flat triplet from long (the non-disabled tier), short: null
         assert rune.get("short") is None
         assert rune.get("atr_sl_mult") == 0.7  # from the "fallback" LONG tier
+
+
+class TestGateScript:
+    def test_gate_pass_when_improvement(self):
+        """Synthetic case where tuned beats baseline — PASS."""
+        from scripts.gate_per_direction import evaluate_gate
+        baseline = {
+            "total_pnl": 20000, "max_dd_pct": -10.0,
+            "per_symbol": {"BTCUSDT": {"pnl": 5000, "pf": 1.4},
+                            "DOGEUSDT": {"pnl": 10000, "pf": 4.5}},
+        }
+        tuned = {
+            "total_pnl": 23000,  # +15%
+            "max_dd_pct": -9.0,   # better
+            "per_symbol": {"BTCUSDT": {"pnl": 5200, "pf": 1.4},
+                            "DOGEUSDT": {"pnl": 11000, "pf": 4.7}},
+        }
+        verdict, reasons = evaluate_gate(baseline, tuned)
+        assert verdict == "PASS", reasons
+
+    def test_gate_fail_when_doge_pf_drops(self):
+        from scripts.gate_per_direction import evaluate_gate
+        baseline = {"total_pnl": 20000, "max_dd_pct": -10.0,
+                    "per_symbol": {"DOGEUSDT": {"pnl": 10000, "pf": 4.5}}}
+        tuned = {"total_pnl": 25000, "max_dd_pct": -9.0,
+                 "per_symbol": {"DOGEUSDT": {"pnl": 10500, "pf": 3.8}}}
+        verdict, reasons = evaluate_gate(baseline, tuned)
+        assert verdict == "FAIL"
+        assert any("DOGE" in r for r in reasons)
+
+    def test_gate_fail_when_per_symbol_regresses(self):
+        from scripts.gate_per_direction import evaluate_gate
+        baseline = {"total_pnl": 20000, "max_dd_pct": -10.0,
+                    "per_symbol": {"BTCUSDT": {"pnl": 5000, "pf": 1.4},
+                                     "DOGEUSDT": {"pnl": 10000, "pf": 4.5}}}
+        tuned = {"total_pnl": 25000, "max_dd_pct": -9.0,
+                 "per_symbol": {"BTCUSDT": {"pnl": 3000, "pf": 1.4},  # -40%
+                                  "DOGEUSDT": {"pnl": 12000, "pf": 4.6}}}
+        verdict, reasons = evaluate_gate(baseline, tuned)
+        assert verdict == "FAIL"
+        assert any("BTCUSDT" in r for r in reasons)
