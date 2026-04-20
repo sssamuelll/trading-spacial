@@ -571,7 +571,7 @@ class TestScan:
 
         return df1h, df4h, df5m
 
-    @patch("btc_scanner.get_klines")
+    @patch("btc_scanner.md.get_klines")
     def test_scan_retorna_dict_con_claves(self, mock_klines):
         df1h, df4h, df5m = self._make_scan_mock()
         mock_klines.side_effect = [df5m, df1h, df4h, df1h]  # 5m, 1h, 4h, 1d
@@ -586,7 +586,7 @@ class TestScan:
         for clave in claves:
             assert clave in rep, f"Clave faltante: {clave}"
 
-    @patch("btc_scanner.get_klines")
+    @patch("btc_scanner.md.get_klines")
     def test_scan_precio_es_float(self, mock_klines):
         df1h, df4h, df5m = self._make_scan_mock()
         mock_klines.side_effect = [df5m, df1h, df4h, df1h]
@@ -595,7 +595,7 @@ class TestScan:
         assert isinstance(rep["price"], float)
         assert rep["symbol"] == "ETHUSDT"
 
-    @patch("btc_scanner.get_klines")
+    @patch("btc_scanner.md.get_klines")
     def test_scan_señal_activa_es_bool(self, mock_klines):
         df1h, df4h, df5m = self._make_scan_mock()
         mock_klines.side_effect = [df5m, df1h, df4h, df1h]
@@ -603,7 +603,7 @@ class TestScan:
         rep = scanner.scan()
         assert isinstance(rep["señal_activa"], bool)
 
-    @patch("btc_scanner.get_klines")
+    @patch("btc_scanner.md.get_klines")
     def test_scan_sin_zona_lrc_no_señal(self, mock_klines):
         """Si LRC% > 25, no debe haber señal ni setup."""
         n = 210
@@ -620,7 +620,7 @@ class TestScan:
         if not rep["señal_activa"]:
             assert "✅ SEÑAL" not in rep["estado"] or not rep["señal_activa"]
 
-    @patch("btc_scanner.get_klines")
+    @patch("btc_scanner.md.get_klines")
     def test_scan_sizing_coherente(self, mock_klines):
         """Verifica que el sizing no supere el 98% del capital."""
         df1h, df4h, df5m = self._make_scan_mock()
@@ -632,7 +632,7 @@ class TestScan:
         assert sz["capital_usd"] == 1000.0
         assert sz["riesgo_usd"] == pytest.approx(10.0, abs=0.01)
 
-    @patch("btc_scanner.get_klines")
+    @patch("btc_scanner.md.get_klines")
     def test_scan_sl_tp_coherentes(self, mock_klines):
         """SL debe ser menor al precio, TP mayor."""
         df1h, df4h, df5m = self._make_scan_mock()
@@ -644,7 +644,7 @@ class TestScan:
         assert sz["sl_precio"] < price
         assert sz["tp_precio"] > price
 
-    @patch("btc_scanner.get_klines")
+    @patch("btc_scanner.md.get_klines")
     def test_scan_json_serializable(self, mock_klines):
         """El reporte debe ser completamente serializable a JSON."""
         df1h, df4h, df5m = self._make_scan_mock()
@@ -655,7 +655,7 @@ class TestScan:
         serialized = json.dumps(rep, ensure_ascii=False)
         assert len(serialized) > 0
 
-    @patch("btc_scanner.get_klines")
+    @patch("btc_scanner.md.get_klines")
     def test_scan_score_en_rango(self, mock_klines):
         """El score debe estar entre 0 y 10."""
         df1h, df4h, df5m = self._make_scan_mock()
@@ -664,7 +664,7 @@ class TestScan:
         rep = scanner.scan()
         assert 0 <= rep["score"] <= 10
 
-    @patch("btc_scanner.get_klines")
+    @patch("btc_scanner.md.get_klines")
     def test_scan_sizing_uses_atr(self, mock_klines):
         df1h, df4h, df5m = self._make_scan_mock()
         mock_klines.side_effect = [df5m, df1h, df4h, df1h]
@@ -722,64 +722,6 @@ class TestLoadProxy:
         monkeypatch.setattr(scanner, "SCRIPT_DIR", str(tmp_path))
         result = scanner._load_proxy()
         assert result["https"] == env_proxy
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  TESTS — _klines_bybit (formato de DataFrame)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestKlinesBybit:
-    @patch("btc_scanner._get")
-    def test_retorna_dataframe_correcto(self, mock_get):
-        """Verifica que el DataFrame de Bybit tenga el mismo formato que Binance."""
-        # Simular respuesta de Bybit (formato: más reciente primero)
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        rows = []
-        for i in range(5):
-            ts = now_ms - (4 - i) * 5 * 60 * 1000  # cada 5 min
-            rows.append([str(ts), "85000", "85500", "84800", "85200", "10.5", "892650"])
-        rows_reversed = list(reversed(rows))  # Bybit envía más reciente primero
-
-        mock_get.return_value = {
-            "retCode": 0,
-            "result": {"list": rows_reversed},
-        }
-
-        df = scanner._klines_bybit("BTCUSDT", "5m", 5)
-
-        assert isinstance(df, pd.DataFrame)
-        assert "open" in df.columns
-        assert "close" in df.columns
-        assert "taker_buy_base" in df.columns
-        assert len(df) == 5
-
-    @patch("btc_scanner._get")
-    def test_bybit_error_lanza_excepcion(self, mock_get):
-        mock_get.return_value = {
-            "retCode": 10001,
-            "retMsg": "Invalid symbol",
-        }
-        with pytest.raises(RuntimeError, match="Bybit error"):
-            scanner._klines_bybit("INVALID", "5m", 10)
-
-    @patch("btc_scanner._get")
-    def test_taker_buy_base_aproximado(self, mock_get):
-        """Verifica que taker_buy_base esté entre 0 y volume."""
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        rows = []
-        for i in range(10):
-            ts = now_ms - (9 - i) * 60 * 1000
-            rows.append([str(ts), "85000", "85500", "84500", "85200", "100", "8520000"])
-        rows_reversed = list(reversed(rows))
-
-        mock_get.return_value = {
-            "retCode": 0,
-            "result": {"list": rows_reversed},
-        }
-
-        df = scanner._klines_bybit("BTCUSDT", "1m", 10)
-        assert (df["taker_buy_base"] >= 0).all()
-        assert (df["taker_buy_base"] <= df["volume"] + 1e-6).all()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
