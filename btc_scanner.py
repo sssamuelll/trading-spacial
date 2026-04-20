@@ -850,7 +850,17 @@ def scan(symbol: str = None):
     # ── Sizing informativo ────────────────────────────────────────────────────
     atr_val    = float(calc_atr(df1h, ATR_PERIOD).iloc[-1])
     capital    = 1000.0
-    risk_usd   = capital * 0.01
+
+    # Vol-normalized risk (#125): fetch daily bars, compute vol, scale risk per symbol
+    try:
+        df_daily = md.get_klines(symbol, "1d", VOL_LOOKBACK_DAYS + 5)
+        asset_vol = annualized_vol_yang_zhang(df_daily)
+    except Exception as e:
+        log.warning("Vol calc failed for %s: %s — using neutral sizing", symbol, e)
+        asset_vol = TARGET_VOL_ANNUAL
+
+    vol_mult = max(VOL_MAX_CEIL, min(1.0, TARGET_VOL_ANNUAL / max(asset_vol, VOL_MIN_FLOOR)))
+    risk_usd = capital * 0.01 * vol_mult
 
     # Per-symbol ATR overrides from config
     _cfg_path = os.path.join(SCRIPT_DIR, "config.json")
@@ -955,6 +965,9 @@ def scan(symbol: str = None):
             "qty_btc":     round(qty_btc, 6),
             "valor_pos":   round(val_pos, 2),
             "pct_capital": round(val_pos / capital * 100, 1),
+            "asset_vol":   round(asset_vol, 4),
+            "vol_mult":    round(vol_mult, 3),
+            "target_vol":  TARGET_VOL_ANNUAL,
         },
     })
     # Convertir tipos numpy a tipos Python nativos para serialización JSON
