@@ -17,7 +17,13 @@ class TokenBucket:
         self._lock = threading.Lock()
 
     def acquire(self, n: float = 1.0) -> bool:
-        """Try to acquire n tokens. Returns True if granted, False if not."""
+        """Try to acquire n tokens. Returns True if granted, False if not.
+
+        Rejects non-positive n — a bug at the call site would otherwise silently
+        mutate bucket state (negative n adds tokens via `tokens -= n`).
+        """
+        if n <= 0:
+            raise ValueError(f"n must be positive, got {n!r}")
         with self._lock:
             now = time.monotonic()
             elapsed = now - self._last_refill

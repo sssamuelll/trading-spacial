@@ -33,3 +33,14 @@ def test_bucket_never_exceeds_capacity():
     for _ in range(5):
         assert b.acquire() is True
     assert b.acquire() is False
+
+
+def test_non_positive_n_rejected():
+    """Guard against caller bugs — `tokens -= -1` would silently inject tokens."""
+    import pytest
+    from notifier.ratelimit import TokenBucket
+    b = TokenBucket(capacity=5, refill_per_sec=1.0)
+    with pytest.raises(ValueError):
+        b.acquire(n=-1)
+    with pytest.raises(ValueError):
+        b.acquire(n=0)
