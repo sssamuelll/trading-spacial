@@ -1166,3 +1166,74 @@ class TestScanWithDirectionalOverrides:
         assert sz["atr_sl_mult"] == scanner.ATR_SL_MULT
         assert sz["atr_tp_mult"] == scanner.ATR_TP_MULT
         assert sz["atr_be_mult"] == scanner.ATR_BE_MULT
+
+
+class TestScanRegimeModeDispatch:
+    """Tests for scan() reading regime_mode from config (#152)."""
+
+    def _make_mock(self):
+        instance = TestScan()
+        return instance._make_scan_mock()
+
+    @patch("btc_scanner.md.get_klines")
+    def test_scan_default_mode_is_global(self, mock_klines, monkeypatch, tmp_path):
+        """Config without 'regime_mode' → scanner uses legacy get_cached_regime()."""
+        import btc_scanner as scanner
+        df1h, df4h, df5m = self._make_mock()
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h, df1h]
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({}))
+        monkeypatch.setattr(scanner, "SCRIPT_DIR", str(tmp_path))
+
+        called_with = {}
+        original_get_cached_regime = scanner.get_cached_regime
+        def mock_cached_regime(*args, **kwargs):
+            called_with["args"] = args
+            called_with["kwargs"] = kwargs
+            return {"regime": "BULL", "score": 80.0}
+        monkeypatch.setattr(scanner, "get_cached_regime", mock_cached_regime)
+
+        scanner.scan("BTCUSDT")
+        # Legacy path: get_cached_regime() invoked (args may be () or (None,))
+        assert "args" in called_with
+
+    @patch("btc_scanner.md.get_klines")
+    def test_scan_hybrid_mode_passes_symbol(self, mock_klines, monkeypatch, tmp_path):
+        """Config with regime_mode='hybrid' → detect_regime_for_symbol called with symbol."""
+        import btc_scanner as scanner
+        df1h, df4h, df5m = self._make_mock()
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h, df1h]
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({"regime_mode": "hybrid"}))
+        monkeypatch.setattr(scanner, "SCRIPT_DIR", str(tmp_path))
+
+        called_with = {}
+        def mock_dispatcher(symbol, mode):
+            called_with["symbol"] = symbol
+            called_with["mode"] = mode
+            return {"regime": "BULL", "score": 80.0}
+        monkeypatch.setattr(scanner, "detect_regime_for_symbol", mock_dispatcher)
+
+        scanner.scan("BTCUSDT")
+        assert called_with.get("symbol") == "BTCUSDT"
+        assert called_with.get("mode") == "hybrid"
+
+    @patch("btc_scanner.md.get_klines")
+    def test_scan_invalid_mode_fallback_to_global(self, mock_klines, monkeypatch, tmp_path):
+        """Invalid regime_mode → warning + uses global (no crash)."""
+        import btc_scanner as scanner
+        df1h, df4h, df5m = self._make_mock()
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h, df1h]
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({"regime_mode": "typo_mode"}))
+        monkeypatch.setattr(scanner, "SCRIPT_DIR", str(tmp_path))
+
+        monkeypatch.setattr(scanner, "get_cached_regime",
+                            lambda: {"regime": "BULL", "score": 80.0})
+        # Just needs to not crash
+        rep = scanner.scan("BTCUSDT")
+        assert rep is not None
+        assert isinstance(rep, dict)

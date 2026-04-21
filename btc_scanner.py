@@ -1014,8 +1014,27 @@ def scan(symbol: str = None):
     df4h = md.get_klines(symbol, "4h",  limit=150)   # contexto macro
     price = df1h["close"].iloc[-1]   # precio de cierre de la última vela 1H
 
+    # ── Load config (reused for regime_mode + symbol_overrides) ─────────────
+    _cfg_path = os.path.join(SCRIPT_DIR, "config.json")
+    _cfg = {}
+    if os.path.exists(_cfg_path):
+        try:
+            with open(_cfg_path) as _f:
+                _cfg = json.load(_f)
+        except Exception:
+            pass
+
     # ── Régimen de mercado (compuesto, cacheado por detect_regime()) ──────────
-    regime_data = get_cached_regime()
+    _regime_mode = _cfg.get("regime_mode", "global")
+    if _regime_mode not in ("global", "hybrid", "hybrid_momentum"):
+        log.warning(f"Invalid regime_mode='{_regime_mode}' in config; falling back to 'global'")
+        _regime_mode = "global"
+
+    if _regime_mode == "global":
+        regime_data = get_cached_regime()
+    else:
+        regime_data = detect_regime_for_symbol(symbol, _regime_mode)
+
     regime = regime_data.get("regime", "BULL")
     regime = "LONG" if regime == "BULL" else "SHORT" if regime == "BEAR" else "LONG"
 
@@ -1176,15 +1195,8 @@ def scan(symbol: str = None):
     capital    = 1000.0
     risk_usd   = capital * 0.01
 
-    # Per-symbol ATR overrides from config
-    _cfg_path = os.path.join(SCRIPT_DIR, "config.json")
-    _sym_overrides = {}
-    if os.path.exists(_cfg_path):
-        try:
-            with open(_cfg_path) as _f:
-                _sym_overrides = json.load(_f).get("symbol_overrides", {})
-        except Exception:
-            pass
+    # Per-symbol ATR overrides from config (reuse _cfg loaded above)
+    _sym_overrides = _cfg.get("symbol_overrides", {})
     _so = _sym_overrides.get(symbol, {})
     if _so is False:
         # Symbol disabled — no signal
