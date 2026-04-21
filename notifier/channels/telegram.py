@@ -44,13 +44,31 @@ class TelegramChannel(Channel):
                 r = requests.post(url, json=payload, timeout=10)
                 if r.ok:
                     return DeliveryReceipt(channel=self.name, status="ok")
+
+                # 4xx except 429 are permanent — fail fast instead of wasting retries.
+                if 400 <= r.status_code < 500 and r.status_code != 429:
+                    err = f"HTTP {r.status_code}: {r.text[:200]}"
+                    log.error("telegram permanent error, not retrying: %s", err)
+                    return DeliveryReceipt(channel=self.name, status="failed", error=err)
+
                 last_error = f"HTTP {r.status_code}: {r.text[:200]}"
                 log.warning("telegram attempt %d/%d failed: %s", attempt, max_retries, last_error)
+
+                # 429 respects Retry-After header when present.
+                if r.status_code == 429 and attempt < max_retries:
+                    try:
+                        retry_after = int(r.headers.get("Retry-After", "0"))
+                    except (TypeError, ValueError):
+                        retry_after = 0
+                    if retry_after > 0:
+                        time.sleep(retry_after)
+                        continue
             except requests.RequestException as e:
                 last_error = f"{type(e).__name__}: {e}"
                 log.warning("telegram attempt %d/%d exception: %s", attempt, max_retries, last_error)
 
             if attempt < max_retries:
-                time.sleep(2 ** (attempt - 1))  # 1s, 2s, 4s backoff
+                # Exponential backoff: 1s, 2s (and 4s+ if max_retries>3).
+                time.sleep(2 ** (attempt - 1))
 
         return DeliveryReceipt(channel=self.name, status="failed", error=last_error)
