@@ -58,3 +58,79 @@ class TestComputePriceScore:
         df = _df_daily(closes)
         score = _compute_price_score(df)
         assert 0 <= score <= 100
+
+
+class TestComputeFngScore:
+    def test_pass_through_zero(self):
+        from btc_scanner import _compute_fng_score
+        assert _compute_fng_score(0) == 0
+
+    def test_pass_through_50(self):
+        from btc_scanner import _compute_fng_score
+        assert _compute_fng_score(50) == 50
+
+    def test_pass_through_100(self):
+        from btc_scanner import _compute_fng_score
+        assert _compute_fng_score(100) == 100
+
+
+class TestComputeFundingScore:
+    def test_rate_minus_one_percent(self):
+        from btc_scanner import _compute_funding_score
+        assert _compute_funding_score(-0.01) == 0
+
+    def test_rate_zero(self):
+        from btc_scanner import _compute_funding_score
+        assert _compute_funding_score(0) == 50
+
+    def test_rate_plus_one_percent(self):
+        from btc_scanner import _compute_funding_score
+        assert _compute_funding_score(0.01) == 100
+
+    def test_extreme_positive_clamped(self):
+        from btc_scanner import _compute_funding_score
+        assert _compute_funding_score(0.05) == 100
+
+    def test_extreme_negative_clamped(self):
+        from btc_scanner import _compute_funding_score
+        assert _compute_funding_score(-0.05) == 0
+
+
+class TestComputeRsiScore:
+    def test_rsi_30_gives_70(self):
+        from btc_scanner import _compute_rsi_score
+        assert _compute_rsi_score(30) == 70
+
+    def test_rsi_50_neutral(self):
+        from btc_scanner import _compute_rsi_score
+        assert _compute_rsi_score(50) == 50
+
+    def test_rsi_70_gives_30(self):
+        from btc_scanner import _compute_rsi_score
+        assert _compute_rsi_score(70) == 30
+
+    def test_rsi_20_oversold_bullish(self):
+        from btc_scanner import _compute_rsi_score
+        assert _compute_rsi_score(20) == 80
+
+    def test_rsi_80_overbought_bearish(self):
+        from btc_scanner import _compute_rsi_score
+        assert _compute_rsi_score(80) == 20
+
+
+class TestComputeAdxScore:
+    def test_adx_below_20_ranging(self):
+        from btc_scanner import _compute_adx_score
+        assert _compute_adx_score(15) == 75
+
+    def test_adx_20_30_medium(self):
+        from btc_scanner import _compute_adx_score
+        assert _compute_adx_score(25) == 50
+
+    def test_adx_above_30_trending(self):
+        from btc_scanner import _compute_adx_score
+        assert _compute_adx_score(35) == 25
+
+    def test_adx_strong_trend(self):
+        from btc_scanner import _compute_adx_score
+        assert _compute_adx_score(50) == 25

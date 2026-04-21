@@ -144,6 +144,35 @@ def _compute_price_score(df_daily: pd.DataFrame) -> int:
         return 100
 
 
+def _compute_fng_score(fng_value: int) -> int:
+    """F&G ya es 0-100. Pass-through con clamp."""
+    return max(0, min(100, int(fng_value)))
+
+
+def _compute_funding_score(rate: float) -> int:
+    """Rate típicamente entre -0.01 y +0.01.
+    Mapping: -0.01 → 0, 0 → 50, +0.01 → 100. Clamp [0,100]."""
+    return max(0, min(100, int(50 + rate * 5000)))
+
+
+def _compute_rsi_score(rsi_1d_last: float) -> int:
+    """RSI 0-100. Invertido vs. momentum tradicional porque nuestra estrategia
+    es mean-reversion. Oversold (RSI bajo) → bullish. Overbought (RSI alto) → bearish.
+    Mapping: RSI=30 → 70, RSI=50 → 50, RSI=70 → 30. Returns 100 - rsi (clamped)."""
+    return max(0, min(100, int(100 - rsi_1d_last)))
+
+
+def _compute_adx_score(adx_1d_last: float) -> int:
+    """ADX mide fuerza de trend. Alto ADX = trending = mean-reversion falla.
+    Score alto = ranging = strategy-friendly.
+    Mapping: ADX<20 → 75 (ranging); ADX 20-30 → 50; ADX ≥30 → 25 (strong trend)."""
+    if adx_1d_last < 20:
+        return 75
+    if adx_1d_last < 30:
+        return 50
+    return 25
+
+
 def _classify_tune_result(count: int, profit_factor: float | None) -> str:
     """Classify a (symbol, direction) tuning result into one of three tiers.
 
