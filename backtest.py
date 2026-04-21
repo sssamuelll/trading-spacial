@@ -245,6 +245,40 @@ def _regime_at_time(
     )
 
 
+def _close_position(position: dict, exit_price: float, exit_time, exit_reason: str,
+                    capital: float) -> dict:
+    """Compute P&L + trade dict for closing `position` at exit_price.
+
+    Handles LONG and SHORT symmetrically: SHORT gains when exit_price < entry_price,
+    SHORT stop-loss distance uses |entry − sl_orig| so pnl_usd never short-circuits
+    to 0 for a valid SHORT setup (fix for #156, #157).
+    """
+    entry_price = position["entry_price"]
+    if position.get("direction") == "SHORT":
+        pnl_pct = (entry_price - exit_price) / entry_price * 100
+    else:
+        pnl_pct = (exit_price - entry_price) / entry_price * 100
+    risk_amount = capital * RISK_PER_TRADE * position["size_mult"]
+    sl_pct_actual = abs(entry_price - position["sl_orig"]) / entry_price * 100
+    pnl_usd = risk_amount * (pnl_pct / sl_pct_actual) if sl_pct_actual > 0 else 0
+    return {
+        "entry_time": position["entry_time"],
+        "exit_time": exit_time,
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "exit_reason": exit_reason,
+        "direction": position.get("direction", "LONG"),
+        "pnl_pct": round(pnl_pct, 4),
+        "pnl_usd": round(pnl_usd, 2),
+        "score": position["score"],
+        "size_mult": position["size_mult"],
+        "duration_hours": (exit_time - position["entry_time"]).total_seconds() / 3600,
+        "atr_sl_mult_used": position.get("atr_sl_mult_used"),
+        "atr_tp_mult_used": position.get("atr_tp_mult_used"),
+        "atr_be_mult_used": position.get("atr_be_mult_used"),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  SIMULATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -324,32 +358,12 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
                 exit_reason = None
 
             if exit_price is not None:
-                if pos_dir == "SHORT":
-                    pnl_pct = (position["entry_price"] - exit_price) / position["entry_price"] * 100
-                else:
-                    pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] * 100
-                risk_amount = capital * RISK_PER_TRADE * position["size_mult"]
-                sl_pct_actual = abs(position["entry_price"] - position["sl_orig"]) / position["entry_price"] * 100
-                pnl_usd = risk_amount * (pnl_pct / sl_pct_actual) if sl_pct_actual > 0 else 0
-
-                trade = {
-                    "entry_time": position["entry_time"],
-                    "exit_time": bar_time,
-                    "entry_price": position["entry_price"],
-                    "exit_price": exit_price,
-                    "exit_reason": exit_reason,
-                    "direction": pos_dir,
-                    "pnl_pct": round(pnl_pct, 4),
-                    "pnl_usd": round(pnl_usd, 2),
-                    "score": position["score"],
-                    "size_mult": position["size_mult"],
-                    "duration_hours": (bar_time - position["entry_time"]).total_seconds() / 3600,
-                    "atr_sl_mult_used": position.get("atr_sl_mult_used"),
-                    "atr_tp_mult_used": position.get("atr_tp_mult_used"),
-                    "atr_be_mult_used": position.get("atr_be_mult_used"),
-                }
+                trade = _close_position(
+                    position, exit_price=exit_price, exit_time=bar_time,
+                    exit_reason=exit_reason, capital=capital,
+                )
                 trades.append(trade)
-                capital += pnl_usd
+                capital += trade["pnl_usd"]
                 position = None
                 last_exit_time = bar_time
 
@@ -537,26 +551,12 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
     if position is not None:
         last_bar = df1h.iloc[-1]
         exit_price = float(last_bar["close"])
-        pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] * 100
-        risk_amount = capital * RISK_PER_TRADE * position["size_mult"]
-        sl_pct_actual = (position["entry_price"] - position["sl_orig"]) / position["entry_price"] * 100
-        pnl_usd = risk_amount * (pnl_pct / sl_pct_actual) if sl_pct_actual > 0 else 0
-        trades.append({
-            "entry_time": position["entry_time"],
-            "exit_time": df1h.index[-1],
-            "entry_price": position["entry_price"],
-            "exit_price": exit_price,
-            "exit_reason": "OPEN",
-            "pnl_pct": round(pnl_pct, 4),
-            "pnl_usd": round(pnl_usd, 2),
-            "score": position["score"],
-            "size_mult": position["size_mult"],
-            "duration_hours": (df1h.index[-1] - position["entry_time"]).total_seconds() / 3600,
-            "atr_sl_mult_used": position.get("atr_sl_mult_used"),
-            "atr_tp_mult_used": position.get("atr_tp_mult_used"),
-            "atr_be_mult_used": position.get("atr_be_mult_used"),
-        })
-        capital += pnl_usd
+        trade = _close_position(
+            position, exit_price=exit_price, exit_time=df1h.index[-1],
+            exit_reason="OPEN", capital=capital,
+        )
+        trades.append(trade)
+        capital += trade["pnl_usd"]
 
     return trades, equity_curve
 
