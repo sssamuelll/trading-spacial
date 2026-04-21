@@ -208,6 +208,28 @@ class TestSymbolEarliestSelfHeal:
         _storage.upsert_many(newer_bars)
         assert _storage.first_bar_ms("BTCUSDT", "1h") == 0
 
+    def test_empty_provider_response_does_not_corrupt_earliest_when_older_bars_cached(
+        self, tmp_ohlcv_db, fake_provider, monkeypatch
+    ):
+        """If _backfill_range fetches and the provider returns empty for a chunk,
+        it must NOT push first_bar_ms forward past cached bars. Otherwise a
+        transient mid-history gap silently collapses the symbol's known history."""
+        monkeypatch.setattr(md, "last_closed_bar_time", lambda tf, now=None: 100 * 3600_000)
+        monkeypatch.setattr(_fetcher, "last_closed_bar_time", lambda tf, now=None: 100 * 3600_000)
+        # Cache has bars 0..50 already (older history)
+        old_bars = [make_bar("BTCUSDT", "1h", t * 3600_000) for t in range(51)]
+        _storage.upsert_many(old_bars)
+        # Provider has no new data for the 60..80 range we're about to ask for
+        fake_provider.set_bars("BTCUSDT", "1h", [])
+
+        _fetcher._backfill_range("BTCUSDT", "1h", 60 * 3600_000, 80 * 3600_000)
+
+        # first_bar_ms must still reflect the older cached min (0), not the
+        # provider-empty marker (which would be 81 * 3600_000 = ahead of all cached data)
+        earliest = _storage.first_bar_ms("BTCUSDT", "1h")
+        assert earliest is None or earliest <= 0, (
+            f"empty-response pushed first_bar_ms to {earliest} despite cached bars from 0")
+
 
 class TestGetCachedDataNoRedundantBackfill:
     """Regression for the 'backtest.get_cached_data calls md.backfill on every call' bug.

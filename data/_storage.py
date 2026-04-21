@@ -206,6 +206,14 @@ def max_open_time(symbol: str, timeframe: str) -> int | None:
     return row[0] if row and row[0] is not None else None
 
 
+def min_open_time(symbol: str, timeframe: str) -> int | None:
+    row = _conn().execute(
+        "SELECT MIN(open_time) FROM ohlcv WHERE symbol=? AND timeframe=?",
+        (symbol, timeframe),
+    ).fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
 def count_tail(symbol: str, timeframe: str, end_time_inclusive: int, limit: int) -> int:
     """Count bars with open_time <= end_time_inclusive, up to `limit`."""
     row = _conn().execute(
