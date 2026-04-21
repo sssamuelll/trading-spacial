@@ -173,6 +173,151 @@ def _compute_adx_score(adx_1d_last: float) -> int:
     return 25
 
 
+def _regime_cache_key(symbol: str | None, mode: str) -> str:
+    """Return cache key: 'global' for legacy mode, '{mode}:{symbol}' otherwise."""
+    if mode == "global":
+        return "global"
+    return f"{mode}:{symbol}"
+
+
+def _compute_local_regime(
+    symbol: str | None,
+    mode: str,
+    df_daily_sym: pd.DataFrame,
+    fng_score: int,
+    funding_score: int,
+    rsi_score: int = 50,
+    adx_score: int = 50,
+) -> dict:
+    """Compose final regime score per mode. Returns {ts, regime, score, mode, symbol, components}.
+
+    Weights:
+      mode='global':           40% price + 30% F&G + 30% funding
+      mode='hybrid':           50% price + 25% F&G + 25% funding
+      mode='hybrid_momentum':  30% price + 15% RSI + 20% ADX + 20% F&G + 15% funding
+
+    Thresholds: score > 60 = BULL; score < 40 = BEAR; else NEUTRAL.
+    """
+    price_score = _compute_price_score(df_daily_sym)
+
+    if mode == "global":
+        composite = price_score * 0.40 + fng_score * 0.30 + funding_score * 0.30
+        components = {"price": price_score, "fng": fng_score, "funding": funding_score}
+    elif mode == "hybrid":
+        composite = price_score * 0.50 + fng_score * 0.25 + funding_score * 0.25
+        components = {"price": price_score, "fng": fng_score, "funding": funding_score}
+    elif mode == "hybrid_momentum":
+        composite = (price_score * 0.30 + rsi_score * 0.15 + adx_score * 0.20
+                     + fng_score * 0.20 + funding_score * 0.15)
+        components = {
+            "price": price_score, "rsi": rsi_score, "adx": adx_score,
+            "fng": fng_score, "funding": funding_score,
+        }
+    else:
+        raise ValueError(f"Unknown regime mode: {mode}")
+
+    if composite > 60:
+        regime = "BULL"
+    elif composite < 40:
+        regime = "BEAR"
+    else:
+        regime = "NEUTRAL"
+
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "regime": regime,
+        "score": round(composite, 2),
+        "mode": mode,
+        "symbol": symbol,
+        "components": components,
+    }
+
+
+def detect_regime_for_symbol(symbol: str | None, mode: str = "global") -> dict:
+    """Public entry. Dispatches by mode; 24h TTL cache.
+
+    mode='global' delegates to get_cached_regime() (legacy path).
+    Invalid mode → warning + fallback to 'global'.
+    """
+    VALID_MODES = {"global", "hybrid", "hybrid_momentum"}
+    if mode not in VALID_MODES:
+        log.warning(f"Invalid regime mode '{mode}'; falling back to 'global'")
+        mode = "global"
+
+    if mode == "global":
+        return get_cached_regime()
+
+    # Per-symbol path for hybrid / hybrid_momentum
+    key = _regime_cache_key(symbol, mode)
+    global _regime_cache
+    cached = _regime_cache.get(key)
+    if cached and cached.get("ts"):
+        try:
+            age = (datetime.now(timezone.utc) -
+                   datetime.fromisoformat(cached["ts"])).total_seconds()
+            if age < 86400:  # 24h TTL
+                return cached
+        except Exception:
+            pass
+
+    # Cache miss — compute
+    df_daily = None
+    try:
+        df_daily = md.get_klines(symbol, "1d", limit=250) if symbol else None
+    except Exception as e:
+        log.warning(f"detect_regime_for_symbol: md.get_klines failed for {symbol}: {e}")
+
+    fng_score = 50
+    funding_score = 50
+    rsi_score = 50
+    adx_score = 50
+
+    # Fetch F&G and funding via shared HTTP calls (acceptable duplication of detect_regime).
+    try:
+        import requests as _req
+        r = _req.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        if r.ok:
+            fng_value = int(r.json()["data"][0]["value"])
+            fng_score = _compute_fng_score(fng_value)
+    except Exception:
+        pass
+
+    try:
+        import requests as _req
+        r = _req.get(
+            "https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1",
+            timeout=10,
+        )
+        if r.ok and r.json():
+            rate = float(r.json()[0]["fundingRate"])
+            funding_score = _compute_funding_score(rate)
+    except Exception:
+        pass
+
+    if mode == "hybrid_momentum" and df_daily is not None and len(df_daily) >= 20:
+        try:
+            rsi_val = calc_rsi(df_daily["close"], 14).iloc[-1]
+            if not pd.isna(rsi_val):
+                rsi_score = _compute_rsi_score(rsi_val)
+        except Exception:
+            pass
+        try:
+            adx_val = calc_adx(df_daily, 14).iloc[-1]
+            if not pd.isna(adx_val):
+                adx_score = _compute_adx_score(adx_val)
+        except Exception:
+            pass
+
+    result = _compute_local_regime(
+        symbol, mode, df_daily,
+        fng_score, funding_score, rsi_score, adx_score,
+    )
+
+    _regime_cache[key] = result
+    _save_regime_cache(_regime_cache)
+    return result
+
+
 def _classify_tune_result(count: int, profit_factor: float | None) -> str:
     """Classify a (symbol, direction) tuning result into one of three tiers.
 
@@ -667,21 +812,29 @@ def check_trigger_5m_short(df5: pd.DataFrame):
 # ─────────────────────────────────────────────────────────────────────────────
 
 _REGIME_CACHE_FILE = os.path.join(SCRIPT_DIR, "data", "regime_cache.json")
+_REGIME_CACHE_PATH = _REGIME_CACHE_FILE  # canonical name used by new code (monkeypatchable)
 _REGIME_TTL_SEC = 86400  # 24 hours
 
 
 def _load_regime_cache() -> dict:
-    """Load regime cache from disk. Returns default if missing/corrupt."""
-    default = {"regime": "BULL", "score": 100, "details": {}, "ts": None}
+    """Load regime cache from JSON with soft migration.
+
+    Legacy shape: {"ts": ..., "regime": ..., "score": ...}  (pre-#152)
+    New shape:    {"global": {...}, "hybrid:BTCUSDT": {...}, ...}
+
+    Legacy auto-wraps into {"global": legacy}. Returns {} if file missing or malformed.
+    """
+    if not os.path.exists(_REGIME_CACHE_PATH):
+        return {}
     try:
-        if os.path.exists(_REGIME_CACHE_FILE):
-            with open(_REGIME_CACHE_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-            if "regime" in data and "ts" in data:
-                return data
+        with open(_REGIME_CACHE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
     except Exception:
-        pass
-    return default
+        return {}
+    if isinstance(data, dict) and "ts" in data and "regime" in data:
+        # Legacy format — wrap into new structure
+        return {"global": data}
+    return data if isinstance(data, dict) else {}
 
 
 def _save_regime_cache(data: dict):
@@ -812,8 +965,8 @@ def detect_regime() -> dict:
 
     # Update cache (RAM + disk)
     global _regime_cache
-    _regime_cache = result
-    _save_regime_cache(result)
+    _regime_cache["global"] = result
+    _save_regime_cache(_regime_cache)
     log.info(f"Regime Detection: {regime} (score={composite}) "
              f"[price={price_score} fng={fng_score} funding={funding_score}]")
 
@@ -821,14 +974,19 @@ def detect_regime() -> dict:
 
 
 def get_cached_regime() -> dict:
-    """Return cached regime, refreshing if older than TTL."""
-    if _regime_cache["ts"] is None:
+    """Return cached regime, refreshing if older than TTL.
+
+    _regime_cache is now a composite dict keyed by cache keys.
+    The legacy 'global' regime lives at _regime_cache['global'].
+    """
+    global_entry = _regime_cache.get("global", {})
+    if not global_entry or global_entry.get("ts") is None:
         return detect_regime()
     cache_age = (datetime.now(timezone.utc) -
-                 datetime.fromisoformat(_regime_cache["ts"])).total_seconds()
+                 datetime.fromisoformat(global_entry["ts"])).total_seconds()
     if cache_age > _REGIME_TTL_SEC:
         return detect_regime()
-    return _regime_cache
+    return global_entry
 
 
 # ─────────────────────────────────────────────────────────────────────────────

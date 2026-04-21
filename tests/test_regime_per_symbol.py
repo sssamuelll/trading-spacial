@@ -134,3 +134,118 @@ class TestComputeAdxScore:
     def test_adx_strong_trend(self):
         from btc_scanner import _compute_adx_score
         assert _compute_adx_score(50) == 25
+
+
+class TestComposeLocalRegime:
+    def test_hybrid_mode_composition(self):
+        """hybrid mode: 50% price + 25% F&G + 25% funding.
+
+        Series: death cross (SMA50=172 < SMA200=193) but price=250 > SMA200 and ret30>0.
+        price_score = 60. composite = 60*0.5 + 60*0.25 + 60*0.25 = 60.
+        """
+        from btc_scanner import _compute_local_regime
+        closes = [200.0] * 160 + [120.0] * 30 + [250.0] * 20
+        df = _df_daily(closes)
+        result = _compute_local_regime(
+            symbol="BTCUSDT", mode="hybrid",
+            df_daily_sym=df,
+            fng_score=60, funding_score=60,
+        )
+        assert "regime" in result
+        assert 55 <= result["score"] <= 65
+        assert result["mode"] == "hybrid"
+        assert result["symbol"] == "BTCUSDT"
+
+    def test_hybrid_mode_bear(self):
+        """All scores low → BEAR."""
+        from btc_scanner import _compute_local_regime
+        closes = [150.0] * 100 + [80.0] * 60 + [60.0] * 50
+        df = _df_daily(closes)
+        result = _compute_local_regime(
+            symbol="DOGEUSDT", mode="hybrid",
+            df_daily_sym=df,
+            fng_score=20, funding_score=20,
+        )
+        assert result["score"] < 40
+        assert result["regime"] == "BEAR"
+
+    def test_hybrid_momentum_uses_rsi_adx(self):
+        """hybrid_momentum includes RSI and ADX components."""
+        from btc_scanner import _compute_local_regime
+        closes = list(range(100, 310))
+        df = _df_daily(closes)
+        result = _compute_local_regime(
+            symbol="BTCUSDT", mode="hybrid_momentum",
+            df_daily_sym=df,
+            fng_score=70, funding_score=60,
+            rsi_score=50, adx_score=75,
+        )
+        # 0.30*100 + 0.15*50 + 0.20*75 + 0.20*70 + 0.15*60 = 30+7.5+15+14+9 = 75.5
+        assert 70 <= result["score"] <= 80
+        assert result["regime"] == "BULL"
+        assert "rsi" in result["components"]
+        assert "adx" in result["components"]
+
+    def test_global_mode_uses_40_30_30_weights(self):
+        """mode='global' uses 40/30/30 weights."""
+        from btc_scanner import _compute_local_regime
+        closes = list(range(100, 310))
+        df = _df_daily(closes)
+        result = _compute_local_regime(
+            symbol=None, mode="global",
+            df_daily_sym=df,
+            fng_score=50, funding_score=50,
+        )
+        # 0.40*100 + 0.30*50 + 0.30*50 = 70
+        assert 65 <= result["score"] <= 75
+
+
+class TestDetectRegimeForSymbol:
+    def test_global_mode_delegates_to_legacy(self, monkeypatch):
+        """mode='global' delegates to detect_regime() unchanged."""
+        import btc_scanner as scanner
+        from btc_scanner import detect_regime_for_symbol
+        expected = {"ts": "2026-01-01T00:00:00Z", "regime": "NEUTRAL", "score": 50.0}
+        monkeypatch.setattr(scanner, "detect_regime", lambda: expected)
+        monkeypatch.setattr(scanner, "_regime_cache", {})
+        result = detect_regime_for_symbol(symbol=None, mode="global")
+        assert result["regime"] == "NEUTRAL"
+
+    def test_invalid_mode_falls_back_to_global(self, monkeypatch):
+        """Invalid mode → falls back to 'global'."""
+        import btc_scanner as scanner
+        from btc_scanner import detect_regime_for_symbol
+        expected = {"ts": "2026-01-01T00:00:00Z", "regime": "BULL", "score": 80.0}
+        monkeypatch.setattr(scanner, "detect_regime", lambda: expected)
+        monkeypatch.setattr(scanner, "_regime_cache", {})
+        result = detect_regime_for_symbol(symbol="BTCUSDT", mode="garbage_mode")
+        assert result["regime"] == "BULL"
+
+
+class TestCacheKeyResolution:
+    def test_cache_key_global(self):
+        from btc_scanner import _regime_cache_key
+        assert _regime_cache_key(None, "global") == "global"
+
+    def test_cache_key_hybrid(self):
+        from btc_scanner import _regime_cache_key
+        assert _regime_cache_key("BTCUSDT", "hybrid") == "hybrid:BTCUSDT"
+
+    def test_cache_key_hybrid_momentum(self):
+        from btc_scanner import _regime_cache_key
+        assert _regime_cache_key("DOGEUSDT", "hybrid_momentum") == "hybrid_momentum:DOGEUSDT"
+
+    def test_legacy_cache_soft_migration(self, tmp_path, monkeypatch):
+        """Legacy flat format {ts, regime, score} loads wrapped in {'global': {...}}."""
+        import json
+        import btc_scanner as scanner
+        legacy_path = tmp_path / "regime_cache.json"
+        legacy_path.write_text(json.dumps({
+            "ts": "2026-01-01T00:00:00Z",
+            "regime": "NEUTRAL",
+            "score": 50.0,
+        }))
+        monkeypatch.setattr(scanner, "_REGIME_CACHE_PATH", str(legacy_path))
+        data = scanner._load_regime_cache()
+        assert "global" in data
+        assert data["global"]["regime"] == "NEUTRAL"
