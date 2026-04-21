@@ -42,6 +42,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 *.egg-info/
 dist/
 build/
@@ -56,6 +58,7 @@ frontend/dist/
 # ── Claude Code ──────────────────────────────────────────────
 # settings.local.json puede contener rutas/permisos personales
 .claude/settings.local.json
+.claude/worktrees/
 
 # ── MemPalace ────────────────────────────────────────────────
 # Índice de minado local — se regenera con `mempalace mine .`
