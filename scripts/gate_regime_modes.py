@@ -130,8 +130,12 @@ def run_portfolio(config_path: str, start, end, symbols, regime_mode: str, df1d_
         except Exception as e:
             per_sym[sym] = {"pnl": 0, "pf": 0, "max_dd_pct": 0, "error": str(e)}
             continue
-        if df1h.empty:
-            per_sym[sym] = {"pnl": 0, "pf": 0, "max_dd_pct": 0, "error": "no data"}
+        missing = [n for n, d in
+                   (("1h", df1h), ("4h", df4h), ("5m", df5m), ("1d", df1d))
+                   if d.empty]
+        if missing:
+            per_sym[sym] = {"pnl": 0, "pf": 0, "max_dd_pct": 0,
+                            "error": f"no data: {','.join(missing)}"}
             continue
         trades, equity = simulate_strategy(
             df1h, df4h, df5m, sym, df1d=df1d,
