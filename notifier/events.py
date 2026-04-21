@@ -6,7 +6,6 @@ Specific events add their own fields.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
 from typing import Any
 
 
@@ -15,8 +14,13 @@ Priority = str  # 'info' | 'warning' | 'critical'
 
 @dataclass
 class _BaseEvent:
-    """Shared behavior. Do not instantiate directly."""
-    event_type: str = field(init=False)
+    """Shared behavior. Do not instantiate directly.
+
+    Subclasses MUST set `self.event_type` in `__post_init__`. The default empty
+    string is a safety net so missing-override bugs surface as empty strings
+    in logs rather than as `AttributeError` on the first attribute access.
+    """
+    event_type: str = field(init=False, default="")
     priority: Priority = field(init=False, default="info")
 
     @property
