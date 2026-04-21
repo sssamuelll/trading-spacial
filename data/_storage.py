@@ -12,7 +12,7 @@ from data import metrics
 
 log = logging.getLogger("data.market")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = str(_ROOT / "data" / "ohlcv.db")
@@ -73,15 +73,45 @@ CREATE TABLE IF NOT EXISTS symbol_earliest (
 
 
 def init_schema() -> None:
-    """Create tables and seed schema_version if new DB."""
+    """Create tables and seed schema_version if new DB.
+
+    Idempotently runs migrations up to SCHEMA_VERSION on existing DBs.
+    """
     conn = _conn()
     conn.executescript(_SCHEMA_SQL)
-    current = conn.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()
-    if current is None:
+    row = conn.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()
+    current_version = int(row[0]) if row else 0
+    if row is None:
         conn.execute(
             "INSERT INTO meta (k, v) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
+        current_version = SCHEMA_VERSION
+
+    if current_version < 2:
+        _migrate_repair_symbol_earliest(conn)
+        conn.execute(
+            "UPDATE meta SET v = ? WHERE k = 'schema_version'",
+            (str(SCHEMA_VERSION),),
+        )
+
+
+def _migrate_repair_symbol_earliest(conn: sqlite3.Connection) -> None:
+    """One-shot: sync symbol_earliest.first_bar_ms with MIN(ohlcv.open_time).
+
+    Needed because earlier builds only wrote symbol_earliest on pre-listing
+    (empty-response) events, so legacy DBs carry stale earliest markers that
+    silently truncate range queries. See TestSymbolEarliestSelfHeal.
+    """
+    conn.execute("""
+        INSERT INTO symbol_earliest (symbol, timeframe, first_bar_ms)
+        SELECT symbol, timeframe, MIN(open_time)
+        FROM ohlcv
+        GROUP BY symbol, timeframe
+        ON CONFLICT(symbol, timeframe) DO UPDATE SET
+          first_bar_ms = MIN(first_bar_ms, excluded.first_bar_ms)
+    """)
+    log.info("schema migration v2: repaired symbol_earliest from ohlcv MIN(open_time)")
 
 
 def first_bar_ms(symbol: str, timeframe: str) -> int | None:
@@ -124,6 +154,11 @@ def upsert_many(bars: list[Bar]) -> int:
     """Insert or replace a batch of bars. Returns count persisted.
 
     Invalid bars (failing _is_valid_bar) are dropped with a WARN log + metric.
+
+    Also self-heals symbol_earliest: if any upserted bar is older than the
+    recorded first_bar_ms for its (symbol, timeframe), revises first_bar_ms
+    down to match. Prevents stale metadata from silently truncating range
+    queries (see TestSymbolEarliestSelfHeal).
     """
     if not bars:
         return 0
@@ -134,10 +169,27 @@ def upsert_many(bars: list[Bar]) -> int:
         log.warning("Dropped %d invalid bars during upsert_many", dropped)
     if not valid:
         return 0
+    min_by_key: dict[tuple[str, str], int] = {}
+    for b in valid:
+        key = (b.symbol, b.timeframe)
+        t = b.open_time
+        if key not in min_by_key or t < min_by_key[key]:
+            min_by_key[key] = t
     conn = _conn()
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.executemany(_UPSERT_SQL, [b.as_tuple() for b in valid])
+        # Only revise first_bar_ms DOWN when we see older bars than claimed.
+        # Don't INSERT on new keys — that would falsely assert "this is the
+        # earliest" based on whatever partial range the caller happened to
+        # upsert. first_bar_ms should only be set once we've proven
+        # pre-listing via an empty-response (see _fetcher._backfill_range).
+        for (symbol, timeframe), new_min in min_by_key.items():
+            conn.execute(
+                """UPDATE symbol_earliest SET first_bar_ms = ?
+                   WHERE symbol=? AND timeframe=? AND first_bar_ms > ?""",
+                (new_min, symbol, timeframe, new_min),
+            )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -149,6 +201,14 @@ def upsert_many(bars: list[Bar]) -> int:
 def max_open_time(symbol: str, timeframe: str) -> int | None:
     row = _conn().execute(
         "SELECT MAX(open_time) FROM ohlcv WHERE symbol=? AND timeframe=?",
+        (symbol, timeframe),
+    ).fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+def min_open_time(symbol: str, timeframe: str) -> int | None:
+    row = _conn().execute(
+        "SELECT MIN(open_time) FROM ohlcv WHERE symbol=? AND timeframe=?",
         (symbol, timeframe),
     ).fetchone()
     return row[0] if row and row[0] is not None else None

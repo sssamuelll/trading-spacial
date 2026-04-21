@@ -211,8 +211,15 @@ def _backfill_range(symbol: str, timeframe: str, start_ms: int, end_ms: int) -> 
         chunk_end = min(cur + (CHUNK_SIZE - 1) * delta, end_ms)
         bars = fetch_with_failover(symbol, timeframe, cur, chunk_end)
         if not bars:
-            # Empty response — mark pre-listing and stop
-            _storage.set_first_bar_ms(symbol, timeframe, chunk_end + delta)
+            # Empty response — mark pre-listing and stop, but ONLY if we
+            # don't already have older cached bars. Otherwise a transient
+            # provider gap in the middle of valid history would falsely
+            # collapse first_bar_ms forward and silently truncate future
+            # range queries.
+            cached_min = _storage.min_open_time(symbol, timeframe)
+            new_marker = chunk_end + delta
+            if cached_min is None or new_marker <= cached_min:
+                _storage.set_first_bar_ms(symbol, timeframe, new_marker)
             break
         persisted = _storage.upsert_many(bars)
         total += persisted

@@ -155,9 +155,6 @@ def get_cached_data(symbol: str, interval: str, start_date: datetime = None) -> 
     want_start = start_date or DEFAULT_START
     now = datetime.now(timezone.utc)
 
-    # Bulk-backfill ahead of the range query so the first read doesn't
-    # trigger piecewise fetches inside get_klines_range.
-    md.backfill(symbol, interval, want_start, now)
     df = md.get_klines_range(symbol, interval, want_start, now)
     if df.empty:
         return df

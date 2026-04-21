@@ -27,7 +27,7 @@ class TestSchemaInit:
     def test_init_sets_schema_version(self, tmp_ohlcv_db):
         conn = _storage._conn()
         v = conn.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()
-        assert v[0] == "1"
+        assert v[0] == str(_storage.SCHEMA_VERSION)
 
     def test_pragmas_wal_mode(self, tmp_ohlcv_db):
         conn = _storage._conn()

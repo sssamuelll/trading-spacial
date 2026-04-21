@@ -161,3 +161,99 @@ class TestRepair:
         rows = _storage._conn().execute(
             "SELECT close FROM ohlcv WHERE symbol='BTCUSDT' AND timeframe='1h' ORDER BY open_time").fetchall()
         assert all(r[0] == 200.0 for r in rows)
+
+
+class TestSymbolEarliestSelfHeal:
+    """Regression for the 'symbol_earliest says 2023-03-24 but ohlcv has 2021 data' bug.
+    When symbol_earliest is stale (older bars exist in ohlcv than it claims),
+    get_klines_range used to clamp the caller's start to the stale value and
+    silently truncate the returned range."""
+
+    def test_migration_repairs_stale_earliest(self, tmp_ohlcv_db, fake_provider, monkeypatch):
+        """Simulate a legacy DB: ohlcv has bars 0..9 but symbol_earliest says earliest=5.
+        Running the v2 migration must repair earliest to 0, so subsequent range queries
+        return all 10 bars."""
+        monkeypatch.setattr(md, "last_closed_bar_time", lambda tf, now=None: 9 * 3600_000)
+        bars = [make_bar("BTCUSDT", "1h", t * 3600_000) for t in range(10)]
+        _storage.upsert_many(bars)
+        _storage.set_first_bar_ms("BTCUSDT", "1h", 5 * 3600_000)  # stale — mimic legacy state
+        assert _storage.first_bar_ms("BTCUSDT", "1h") == 5 * 3600_000  # confirm stale
+        fake_provider.calls.clear()
+
+        _storage._migrate_repair_symbol_earliest(_storage._conn())
+
+        assert _storage.first_bar_ms("BTCUSDT", "1h") == 0, "migration should have repaired"
+        df = md.get_klines_range(
+            "BTCUSDT", "1h",
+            datetime(1970, 1, 1, 0, 0, tzinfo=timezone.utc),
+            datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(hours=9),
+        )
+        assert len(df) == 10
+        assert fake_provider.calls == [], "warm cache should not re-fetch after repair"
+
+    def test_upsert_updates_earliest_when_bars_are_older(self, tmp_ohlcv_db):
+        """Upserting bars older than current symbol_earliest must revise earliest down."""
+        # Seed: earliest = 5 (stale)
+        _storage.set_first_bar_ms("BTCUSDT", "1h", 5 * 3600_000)
+        # Upsert older bars (t=0..4)
+        older_bars = [make_bar("BTCUSDT", "1h", t * 3600_000) for t in range(5)]
+        _storage.upsert_many(older_bars)
+        # earliest should now be 0
+        assert _storage.first_bar_ms("BTCUSDT", "1h") == 0
+
+    def test_upsert_does_not_regress_earliest(self, tmp_ohlcv_db):
+        """Upserting newer bars does not push earliest forward — earliest stays at min."""
+        _storage.set_first_bar_ms("BTCUSDT", "1h", 0)
+        newer_bars = [make_bar("BTCUSDT", "1h", (10 + t) * 3600_000) for t in range(5)]
+        _storage.upsert_many(newer_bars)
+        assert _storage.first_bar_ms("BTCUSDT", "1h") == 0
+
+    def test_empty_provider_response_does_not_corrupt_earliest_when_older_bars_cached(
+        self, tmp_ohlcv_db, fake_provider, monkeypatch
+    ):
+        """If _backfill_range fetches and the provider returns empty for a chunk,
+        it must NOT push first_bar_ms forward past cached bars. Otherwise a
+        transient mid-history gap silently collapses the symbol's known history."""
+        monkeypatch.setattr(md, "last_closed_bar_time", lambda tf, now=None: 100 * 3600_000)
+        monkeypatch.setattr(_fetcher, "last_closed_bar_time", lambda tf, now=None: 100 * 3600_000)
+        # Cache has bars 0..50 already (older history)
+        old_bars = [make_bar("BTCUSDT", "1h", t * 3600_000) for t in range(51)]
+        _storage.upsert_many(old_bars)
+        # Provider has no new data for the 60..80 range we're about to ask for
+        fake_provider.set_bars("BTCUSDT", "1h", [])
+
+        _fetcher._backfill_range("BTCUSDT", "1h", 60 * 3600_000, 80 * 3600_000)
+
+        # first_bar_ms must still reflect the older cached min (0), not the
+        # provider-empty marker (which would be 81 * 3600_000 = ahead of all cached data)
+        earliest = _storage.first_bar_ms("BTCUSDT", "1h")
+        assert earliest is None or earliest <= 0, (
+            f"empty-response pushed first_bar_ms to {earliest} despite cached bars from 0")
+
+
+class TestGetCachedDataNoRedundantBackfill:
+    """Regression for the 'backtest.get_cached_data calls md.backfill on every call' bug.
+    When the DB already has the full requested range, no HTTP fetch should happen."""
+
+    def test_warm_cache_triggers_no_fetch(self, tmp_ohlcv_db, fake_provider, monkeypatch):
+        import backtest
+        monkeypatch.setattr(md, "last_closed_bar_time", lambda tf, now=None: 9 * 3600_000)
+        monkeypatch.setattr(_fetcher, "last_closed_bar_time", lambda tf, now=None: 9 * 3600_000)
+        # Mock "now" so get_cached_data's `datetime.now(tz=utc)` end falls in range
+        class _FixedNow:
+            @staticmethod
+            def now(tz=None):
+                return datetime(1970, 1, 1, 10, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(backtest, "datetime", _FixedNow)
+
+        bars = [make_bar("BTCUSDT", "1h", t * 3600_000) for t in range(10)]
+        _storage.upsert_many(bars)
+        fake_provider.calls.clear()
+
+        df = backtest.get_cached_data(
+            "BTCUSDT", "1h",
+            start_date=datetime(1970, 1, 1, 0, 0, tzinfo=timezone.utc),
+        )
+        assert len(df) == 10
+        assert fake_provider.calls == [], (
+            f"warm cache should not re-fetch; got {len(fake_provider.calls)} provider calls")
