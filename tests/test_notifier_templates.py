@@ -52,3 +52,31 @@ def test_unknown_template_raises():
                      entry=1.0, sl=1.0, tp=1.0)
     with pytest.raises(FileNotFoundError):
         render(ev, channel="sms")  # no template for sms
+
+
+def test_infra_message_escapes_backticks():
+    """Free-form message wrapped in backticks must survive a value with
+    backticks (e.g. traceback snippets) without breaking Telegram Markdown v1."""
+    from notifier._templates import render
+    from notifier import InfraEvent
+    ev = InfraEvent(component="scanner", severity="critical",
+                    message="boom in `scan()` at line 42")
+    msg = render(ev, channel="telegram")
+    # The inner backticks must be replaced; outer wrapping backticks preserved.
+    assert "`scan()`" not in msg, "inner backticks would break code span"
+    assert "scan()" in msg
+
+
+def test_health_metrics_backtick_in_value_does_not_break_span():
+    """JSON of metrics dict should not contain raw backticks that close the span."""
+    from notifier._templates import render
+    from notifier import HealthEvent
+    ev = HealthEvent(symbol="BTC", from_state="NORMAL", to_state="ALERT",
+                      reason="wr_below_threshold",
+                      metrics={"note": "watch `DOGE` next"})
+    msg = render(ev, channel="telegram")
+    # inside the metrics line, backticks from the value must have been escaped
+    metrics_line = [ln for ln in msg.splitlines() if ln.startswith("Metrics:")][0]
+    # metrics_line should look like: Metrics: `{"note": "watch 'DOGE' next"}`
+    # i.e. exactly 2 backticks (the outer code-span delimiters)
+    assert metrics_line.count("`") == 2, f"expected 2 backticks, got: {metrics_line!r}"
