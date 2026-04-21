@@ -107,6 +107,217 @@ def annualized_vol_yang_zhang(df_daily: pd.DataFrame) -> float:
     return float(np.sqrt(var_daily * 365))
 
 
+def _compute_price_score(df_daily: pd.DataFrame) -> int:
+    """Score 0-100 bearish-to-bullish sobre daily bars. Pure function.
+
+    Empieza en 100, resta por condiciones bajistas:
+      - Death Cross (SMA50 < SMA200): -40
+      - Precio debajo de SMA200: -30
+      - Retorno 30d < -10%: -20 ; retorno 30d < 0 pero > -10%: -10
+
+    Returns int clamped to [0, 100]. Devuelve 100 (bullish assumption) si df_daily
+    tiene menos de 200 bars (insufficient data para SMA200).
+
+    Spec: docs/superpowers/specs/es/2026-04-20-per-symbol-regime-design.md §5
+    """
+    if df_daily is None or df_daily.empty or len(df_daily) < 200:
+        return 100
+    try:
+        sma50 = df_daily["close"].rolling(50).mean().iloc[-1]
+        sma200 = df_daily["close"].rolling(200).mean().iloc[-1]
+        if pd.isna(sma50) or pd.isna(sma200):
+            return 100
+        price = float(df_daily["close"].iloc[-1])
+        score = 100
+        if sma50 < sma200:
+            score -= 40
+        if price < sma200:
+            score -= 30
+        if len(df_daily) >= 30:
+            ret30 = df_daily["close"].iloc[-1] / df_daily["close"].iloc[-30] - 1
+            if ret30 < -0.10:
+                score -= 20
+            elif ret30 < 0:
+                score -= 10
+        return max(0, min(100, int(score)))
+    except Exception:
+        return 100
+
+
+def _compute_fng_score(fng_value: int) -> int:
+    """F&G ya es 0-100. Pass-through con clamp."""
+    return max(0, min(100, int(fng_value)))
+
+
+def _compute_funding_score(rate: float) -> int:
+    """Rate típicamente entre -0.01 y +0.01.
+    Mapping: -0.01 → 0, 0 → 50, +0.01 → 100. Clamp [0,100]."""
+    return max(0, min(100, int(50 + rate * 5000)))
+
+
+def _compute_rsi_score(rsi_1d_last: float) -> int:
+    """RSI 0-100. Invertido vs. momentum tradicional porque nuestra estrategia
+    es mean-reversion. Oversold (RSI bajo) → bullish. Overbought (RSI alto) → bearish.
+    Mapping: RSI=30 → 70, RSI=50 → 50, RSI=70 → 30. Returns 100 - rsi (clamped)."""
+    return max(0, min(100, int(100 - rsi_1d_last)))
+
+
+def _compute_adx_score(adx_1d_last: float) -> int:
+    """ADX mide fuerza de trend. Alto ADX = trending = mean-reversion falla.
+    Score alto = ranging = strategy-friendly.
+    Mapping: ADX<20 → 75 (ranging); ADX 20-30 → 50; ADX ≥30 → 25 (strong trend)."""
+    if adx_1d_last < 20:
+        return 75
+    if adx_1d_last < 30:
+        return 50
+    return 25
+
+
+def _regime_cache_key(symbol: str | None, mode: str) -> str:
+    """Return cache key: 'global' for legacy mode, '{mode}:{symbol}' otherwise."""
+    if mode == "global":
+        return "global"
+    return f"{mode}:{symbol}"
+
+
+def _compute_local_regime(
+    symbol: str | None,
+    mode: str,
+    df_daily_sym: pd.DataFrame,
+    fng_score: int,
+    funding_score: int,
+    rsi_score: int = 50,
+    adx_score: int = 50,
+) -> dict:
+    """Compose final regime score per mode. Returns {ts, regime, score, mode, symbol, components}.
+
+    Weights:
+      mode='global':           40% price + 30% F&G + 30% funding
+      mode='hybrid':           50% price + 25% F&G + 25% funding
+      mode='hybrid_momentum':  30% price + 15% RSI + 20% ADX + 20% F&G + 15% funding
+
+    Thresholds: score > 60 = BULL; score < 40 = BEAR; else NEUTRAL.
+    """
+    price_score = _compute_price_score(df_daily_sym)
+
+    if mode == "global":
+        composite = price_score * 0.40 + fng_score * 0.30 + funding_score * 0.30
+        components = {"price": price_score, "fng": fng_score, "funding": funding_score}
+    elif mode == "hybrid":
+        composite = price_score * 0.50 + fng_score * 0.25 + funding_score * 0.25
+        components = {"price": price_score, "fng": fng_score, "funding": funding_score}
+    elif mode == "hybrid_momentum":
+        composite = (price_score * 0.30 + rsi_score * 0.15 + adx_score * 0.20
+                     + fng_score * 0.20 + funding_score * 0.15)
+        components = {
+            "price": price_score, "rsi": rsi_score, "adx": adx_score,
+            "fng": fng_score, "funding": funding_score,
+        }
+    else:
+        raise ValueError(f"Unknown regime mode: {mode}")
+
+    if composite > 60:
+        regime = "BULL"
+    elif composite < 40:
+        regime = "BEAR"
+    else:
+        regime = "NEUTRAL"
+
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "regime": regime,
+        "score": round(composite, 2),
+        "mode": mode,
+        "symbol": symbol,
+        "components": components,
+    }
+
+
+def detect_regime_for_symbol(symbol: str | None, mode: str = "global") -> dict:
+    """Public entry. Dispatches by mode; 24h TTL cache.
+
+    mode='global' delegates to get_cached_regime() (legacy path).
+    Invalid mode → warning + fallback to 'global'.
+    """
+    VALID_MODES = {"global", "hybrid", "hybrid_momentum"}
+    if mode not in VALID_MODES:
+        log.warning(f"Invalid regime mode '{mode}'; falling back to 'global'")
+        mode = "global"
+
+    if mode == "global":
+        return get_cached_regime()
+
+    # Per-symbol path for hybrid / hybrid_momentum
+    key = _regime_cache_key(symbol, mode)
+    global _regime_cache
+    cached = _regime_cache.get(key)
+    if cached and cached.get("ts"):
+        try:
+            age = (datetime.now(timezone.utc) -
+                   datetime.fromisoformat(cached["ts"])).total_seconds()
+            if age < 86400:  # 24h TTL
+                return cached
+        except Exception:
+            pass
+
+    # Cache miss — compute
+    df_daily = None
+    try:
+        df_daily = md.get_klines(symbol, "1d", limit=250) if symbol else None
+    except Exception as e:
+        log.warning(f"detect_regime_for_symbol: md.get_klines failed for {symbol}: {e}")
+
+    fng_score = 50
+    funding_score = 50
+    rsi_score = 50
+    adx_score = 50
+
+    # Fetch F&G and funding via shared HTTP calls (acceptable duplication of detect_regime).
+    try:
+        import requests as _req
+        r = _req.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        if r.ok:
+            fng_value = int(r.json()["data"][0]["value"])
+            fng_score = _compute_fng_score(fng_value)
+    except Exception:
+        pass
+
+    try:
+        import requests as _req
+        r = _req.get(
+            "https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1",
+            timeout=10,
+        )
+        if r.ok and r.json():
+            rate = float(r.json()[0]["fundingRate"])
+            funding_score = _compute_funding_score(rate)
+    except Exception:
+        pass
+
+    if mode == "hybrid_momentum" and df_daily is not None and len(df_daily) >= 20:
+        try:
+            rsi_val = calc_rsi(df_daily["close"], 14).iloc[-1]
+            if not pd.isna(rsi_val):
+                rsi_score = _compute_rsi_score(rsi_val)
+        except Exception:
+            pass
+        try:
+            adx_val = calc_adx(df_daily, 14).iloc[-1]
+            if not pd.isna(adx_val):
+                adx_score = _compute_adx_score(adx_val)
+        except Exception:
+            pass
+
+    result = _compute_local_regime(
+        symbol, mode, df_daily,
+        fng_score, funding_score, rsi_score, adx_score,
+    )
+
+    _regime_cache[key] = result
+    _save_regime_cache(_regime_cache)
+    return result
+
+
 def _classify_tune_result(count: int, profit_factor: float | None) -> str:
     """Classify a (symbol, direction) tuning result into one of three tiers.
 
@@ -601,21 +812,29 @@ def check_trigger_5m_short(df5: pd.DataFrame):
 # ─────────────────────────────────────────────────────────────────────────────
 
 _REGIME_CACHE_FILE = os.path.join(SCRIPT_DIR, "data", "regime_cache.json")
+_REGIME_CACHE_PATH = _REGIME_CACHE_FILE  # canonical name used by new code (monkeypatchable)
 _REGIME_TTL_SEC = 86400  # 24 hours
 
 
 def _load_regime_cache() -> dict:
-    """Load regime cache from disk. Returns default if missing/corrupt."""
-    default = {"regime": "BULL", "score": 100, "details": {}, "ts": None}
+    """Load regime cache from JSON with soft migration.
+
+    Legacy shape: {"ts": ..., "regime": ..., "score": ...}  (pre-#152)
+    New shape:    {"global": {...}, "hybrid:BTCUSDT": {...}, ...}
+
+    Legacy auto-wraps into {"global": legacy}. Returns {} if file missing or malformed.
+    """
+    if not os.path.exists(_REGIME_CACHE_PATH):
+        return {}
     try:
-        if os.path.exists(_REGIME_CACHE_FILE):
-            with open(_REGIME_CACHE_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-            if "regime" in data and "ts" in data:
-                return data
+        with open(_REGIME_CACHE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
     except Exception:
-        pass
-    return default
+        return {}
+    if isinstance(data, dict) and "ts" in data and "regime" in data:
+        # Legacy format — wrap into new structure
+        return {"global": data}
+    return data if isinstance(data, dict) else {}
 
 
 def _save_regime_cache(data: dict):
@@ -746,8 +965,8 @@ def detect_regime() -> dict:
 
     # Update cache (RAM + disk)
     global _regime_cache
-    _regime_cache = result
-    _save_regime_cache(result)
+    _regime_cache["global"] = result
+    _save_regime_cache(_regime_cache)
     log.info(f"Regime Detection: {regime} (score={composite}) "
              f"[price={price_score} fng={fng_score} funding={funding_score}]")
 
@@ -755,14 +974,19 @@ def detect_regime() -> dict:
 
 
 def get_cached_regime() -> dict:
-    """Return cached regime, refreshing if older than TTL."""
-    if _regime_cache["ts"] is None:
+    """Return cached regime, refreshing if older than TTL.
+
+    _regime_cache is now a composite dict keyed by cache keys.
+    The legacy 'global' regime lives at _regime_cache['global'].
+    """
+    global_entry = _regime_cache.get("global", {})
+    if not global_entry or global_entry.get("ts") is None:
         return detect_regime()
     cache_age = (datetime.now(timezone.utc) -
-                 datetime.fromisoformat(_regime_cache["ts"])).total_seconds()
+                 datetime.fromisoformat(global_entry["ts"])).total_seconds()
     if cache_age > _REGIME_TTL_SEC:
         return detect_regime()
-    return _regime_cache
+    return global_entry
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -790,8 +1014,27 @@ def scan(symbol: str = None):
     df4h = md.get_klines(symbol, "4h",  limit=150)   # contexto macro
     price = df1h["close"].iloc[-1]   # precio de cierre de la última vela 1H
 
+    # ── Load config (reused for regime_mode + symbol_overrides) ─────────────
+    _cfg_path = os.path.join(SCRIPT_DIR, "config.json")
+    _cfg = {}
+    if os.path.exists(_cfg_path):
+        try:
+            with open(_cfg_path) as _f:
+                _cfg = json.load(_f)
+        except Exception:
+            pass
+
     # ── Régimen de mercado (compuesto, cacheado por detect_regime()) ──────────
-    regime_data = get_cached_regime()
+    _regime_mode = _cfg.get("regime_mode", "global")
+    if _regime_mode not in ("global", "hybrid", "hybrid_momentum"):
+        log.warning(f"Invalid regime_mode='{_regime_mode}' in config; falling back to 'global'")
+        _regime_mode = "global"
+
+    if _regime_mode == "global":
+        regime_data = get_cached_regime()
+    else:
+        regime_data = detect_regime_for_symbol(symbol, _regime_mode)
+
     regime = regime_data.get("regime", "BULL")
     regime = "LONG" if regime == "BULL" else "SHORT" if regime == "BEAR" else "LONG"
 
@@ -952,15 +1195,8 @@ def scan(symbol: str = None):
     capital    = 1000.0
     risk_usd   = capital * 0.01
 
-    # Per-symbol ATR overrides from config
-    _cfg_path = os.path.join(SCRIPT_DIR, "config.json")
-    _sym_overrides = {}
-    if os.path.exists(_cfg_path):
-        try:
-            with open(_cfg_path) as _f:
-                _sym_overrides = json.load(_f).get("symbol_overrides", {})
-        except Exception:
-            pass
+    # Per-symbol ATR overrides from config (reuse _cfg loaded above)
+    _sym_overrides = _cfg.get("symbol_overrides", {})
     _so = _sym_overrides.get(symbol, {})
     if _so is False:
         # Symbol disabled — no signal
