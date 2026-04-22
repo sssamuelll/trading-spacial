@@ -310,6 +310,11 @@ def evaluate_all_symbols(cfg: dict[str, Any], now: datetime | None = None) -> di
     """Evaluate every symbol in btc_scanner.DEFAULT_SYMBOLS. Returns {symbol: state}.
 
     If kill_switch.enabled is False, returns {} without touching the DB.
+
+    Fail-fast semantics: if any per-symbol evaluation raises (e.g. a DB lock),
+    the exception propagates and later symbols are NOT evaluated. Callers that
+    want best-effort behavior (e.g. the daily cron in Task 6) should wrap this
+    in try/except and log partial-failure explicitly.
     """
     ks_cfg = (cfg.get("kill_switch") or {})
     if not ks_cfg.get("enabled", True):
