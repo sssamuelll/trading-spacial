@@ -348,6 +348,31 @@ def evaluate_all_symbols(cfg: dict[str, Any], now: datetime | None = None) -> di
     return {sym: evaluate_and_record(sym, cfg, now=now) for sym in DEFAULT_SYMBOLS}
 
 
+def apply_reduce_factor(size: float, symbol: str, cfg: dict[str, Any]) -> float:
+    """Return `size` scaled by `reduce_size_factor` if the symbol is in REDUCED state.
+
+    Returns `size` unchanged for NORMAL/ALERT/PAUSED states, or if kill_switch is
+    disabled. Callers should use this at position-open time (btc_scanner.scan)
+    or at backtest-sim time (backtest.simulate_strategy) to halve risk on
+    symbols that have recent losses.
+
+    Safe on any failure: swallows exceptions (returns original size). The
+    kill-switch must never block a trade by raising in this hot path.
+    """
+    ks_cfg = (cfg.get("kill_switch") or {})
+    if not ks_cfg.get("enabled", True):
+        return size
+    try:
+        state = get_symbol_state(symbol)
+    except Exception as e:  # noqa: BLE001
+        log.warning("apply_reduce_factor: state lookup failed for %s: %s", symbol, e)
+        return size
+    if state == "REDUCED":
+        factor = float(ks_cfg.get("reduce_size_factor", 0.5))
+        return size * factor
+    return size
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  TRIGGER + DAILY LOOP
 # ─────────────────────────────────────────────────────────────────────────────
