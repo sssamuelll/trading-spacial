@@ -638,7 +638,7 @@ class TestExecuteScanForSymbol:
             "confirmations": {},
         }
         monkeypatch.setattr(btc_api, "scan", lambda sym: fake_report)
-        monkeypatch.setattr(btc_api, "push_telegram_direct", lambda r, c: None)
+        monkeypatch.setattr(btc_api, "notify", lambda event, cfg: [])
 
         cfg = btc_api.load_config()
         result = btc_api.execute_scan_for_symbol("BTCUSDT", cfg)
@@ -655,7 +655,7 @@ class TestExecuteScanForSymbol:
             "macro_4h": {}, "lrc_1h": {}, "sizing_1h": {}, "confirmations": {},
         }
         monkeypatch.setattr(btc_api, "scan", lambda sym: fake_report)
-        monkeypatch.setattr(btc_api, "push_telegram_direct", lambda r, c: None)
+        monkeypatch.setattr(btc_api, "notify", lambda event, cfg: [])
 
         cfg = btc_api.load_config()
         btc_api.execute_scan_for_symbol("ETHUSDT", cfg)
@@ -673,7 +673,7 @@ class TestExecuteScanForSymbol:
             "macro_4h": {}, "lrc_1h": {}, "sizing_1h": {}, "confirmations": {},
         }
         monkeypatch.setattr(btc_api, "scan", lambda sym: fake_report)
-        monkeypatch.setattr(btc_api, "push_telegram_direct", lambda r, c: None)
+        monkeypatch.setattr(btc_api, "notify", lambda event, cfg: [])
         initial_count = btc_api._scanner_state["scans_total"]
 
         cfg = btc_api.load_config()
@@ -694,8 +694,8 @@ class TestExecuteScanForSymbol:
             "confirmations": {},
         }
         monkeypatch.setattr(btc_api, "scan", lambda sym: fake_report)
-        monkeypatch.setattr(btc_api, "push_telegram_direct",
-                            lambda r, c: notified.append(r["symbol"]))
+        monkeypatch.setattr(btc_api, "notify",
+                            lambda event, cfg: notified.append(event.symbol) or [])
 
         cfg = btc_api.load_config()
         cfg["signal_filters"]["min_score"] = 4
@@ -714,8 +714,8 @@ class TestExecuteScanForSymbol:
             "confirmations": {},
         }
         monkeypatch.setattr(btc_api, "scan", lambda sym: fake_report)
-        monkeypatch.setattr(btc_api, "push_telegram_direct",
-                            lambda r, c: notified.append(True))
+        monkeypatch.setattr(btc_api, "notify",
+                            lambda event, cfg: notified.append(True) or [])
 
         cfg = btc_api.load_config()
         cfg["signal_filters"]["min_score"] = 4
@@ -745,7 +745,7 @@ class TestExecuteScanForSymbol:
             "macro_4h": {}, "lrc_1h": {}, "sizing_1h": {}, "confirmations": {},
         }
         monkeypatch.setattr(btc_api, "scan", lambda sym: fake_report)
-        monkeypatch.setattr(btc_api, "push_telegram_direct", lambda r, c: None)
+        monkeypatch.setattr(btc_api, "notify", lambda event, cfg: [])
 
         initial = btc_api._scanner_state["signals_total"]
         cfg = btc_api.load_config()

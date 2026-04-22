@@ -1186,10 +1186,13 @@ _TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 # transition. Once all callers patch notifier.notify instead, delete this function.
 # trading_webhook.py and legacy paths that consume 'telegram_message' payload key are
 # unaffected — they use build_telegram_message() which is unchanged.
-def push_telegram_direct(rep: dict, cfg: dict, max_retries: int = 3):
+def push_telegram_direct(rep: dict, cfg: dict):
     """Envía señal directo a Telegram con retry y backoff exponencial.
 
     DEPRECATED (#162): delegates to notifier.notify(SignalEvent(...)).
+    Retry count is controlled by TelegramChannel (default 3). The previous
+    `max_retries` kwarg on this shim was dead — it was never forwarded to
+    notify() and no caller passed a non-default value. Dropped in #175.
     """
     # Kill switch #138 PR 2: stamp symbol health state so ALERT symbols get
     # a warning prefix in the Telegram message.
