@@ -97,3 +97,53 @@ def compute_rolling_metrics(symbol: str, conn, now: datetime | None = None) -> d
         "pnl_by_month": pnl_by_month,
         "months_negative_consecutive": _months_negative_consecutive(pnl_by_month, now),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STATE MACHINE (pure)
+# ─────────────────────────────────────────────────────────────────────────────
+
+VALID_STATES = ("NORMAL", "ALERT", "REDUCED", "PAUSED")
+
+
+def evaluate_state(
+    metrics: dict[str, Any],
+    current_state: str,
+    manual_override: bool,
+    config: dict[str, Any],
+) -> tuple[str, str]:
+    """Return (new_state, reason) given metrics + current state + manual override.
+
+    Rule precedence (most severe wins):
+      1. insufficient_data → hold current state
+      2. months_negative_consecutive >= pause_months_consecutive → PAUSED
+      3. pnl_30d < 0 → REDUCED
+      4. win_rate_20_trades < alert_win_rate_threshold → ALERT
+      5. else → NORMAL (auto-recovery; if auto_recovery_enabled=False and
+         current != NORMAL, hold current state with reason='auto_recovery_disabled')
+
+    manual_override is informational: a PAUSED→NORMAL reactivation sets override=True,
+    but a SUBSEQUENT severe rule (rule 2) still transitions to PAUSED.
+    """
+    min_trades = int(config.get("min_trades_for_eval", 20))
+    if metrics.get("trades_count_total", 0) < min_trades:
+        return current_state, "insufficient_data"
+
+    pause_threshold = int(config.get("pause_months_consecutive", 3))
+    if metrics.get("months_negative_consecutive", 0) >= pause_threshold:
+        return "PAUSED", "3mo_consec_neg"
+
+    if metrics.get("pnl_30d", 0.0) < 0:
+        return "REDUCED", "pnl_neg_30d"
+
+    wr_threshold = float(config.get("alert_win_rate_threshold", 0.15))
+    if metrics.get("win_rate_20_trades", 0.0) < wr_threshold:
+        return "ALERT", "wr_below_threshold"
+
+    # Healthy path
+    if current_state == "NORMAL":
+        return "NORMAL", "healthy"
+
+    if config.get("auto_recovery_enabled", True):
+        return "NORMAL", "auto_recovery"
+    return current_state, "auto_recovery_disabled"
