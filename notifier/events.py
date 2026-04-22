@@ -100,4 +100,28 @@ class SystemEvent(_BaseEvent):
         return f"system:{self.kind}"
 
 
-Event = SignalEvent | HealthEvent | InfraEvent | SystemEvent
+@dataclass
+class PositionExitEvent(_BaseEvent):
+    """Emitted when a position closes (TP/SL/manual). Replaces the legacy
+    _send_telegram_raw TP/SL notification in btc_api.py (#138 PR 4 TODO, #162 PR B)."""
+    symbol: str = ""
+    direction: str = "LONG"
+    exit_reason: str = ""     # 'TP' | 'SL' | 'BE' | 'MANUAL'
+    entry_price: float = 0.0
+    exit_price: float = 0.0
+    pnl_usd: float = 0.0
+    pnl_pct: float = 0.0
+
+    def __post_init__(self):
+        self.event_type = "position_exit"
+        # Losers are warning; winners are info. Operator can tune via config later.
+        self.priority = "info" if self.pnl_usd >= 0 else "warning"
+
+    @property
+    def dedupe_key(self) -> str:
+        # Include exit_price + reason so two consecutive closures of the same
+        # symbol don't collide in the dedupe window.
+        return f"position_exit:{self.symbol}:{self.exit_reason}:{self.exit_price}"
+
+
+Event = SignalEvent | HealthEvent | InfraEvent | SystemEvent | PositionExitEvent
