@@ -539,7 +539,14 @@ def db_close_position(pos_id: int, exit_price: float, exit_reason: str) -> Optio
     con.commit()
     row = con.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
     con.close()
-    return dict(row)
+    closed = dict(row)
+    # Kill switch #138: trigger health evaluation for this symbol.
+    try:
+        from health import trigger_health_evaluation
+        trigger_health_evaluation(pos["symbol"], load_config())
+    except Exception as e:
+        log.warning("health trigger skipped for position close: %s", e)
+    return closed
 
 
 def db_update_position(pos_id: int, data: dict) -> Optional[dict]:
@@ -1424,6 +1431,16 @@ def scanner_loop():
 def start_scanner_thread():
     t = threading.Thread(target=scanner_loop, daemon=True, name="crypto-scanner")
     t.start()
+    # Kill switch daily sweep (#138)
+    from health import health_monitor_loop
+    health_thread = threading.Thread(
+        target=health_monitor_loop,
+        args=(lambda: load_config(),),
+        daemon=True,
+        name="health-monitor",
+    )
+    health_thread.start()
+    log.info("Health monitor thread started (daily @ 00:00 UTC)")
     return t
 
 

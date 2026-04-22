@@ -321,3 +321,53 @@ def evaluate_all_symbols(cfg: dict[str, Any], now: datetime | None = None) -> di
         return {}
     from btc_scanner import DEFAULT_SYMBOLS
     return {sym: evaluate_and_record(sym, cfg, now=now) for sym in DEFAULT_SYMBOLS}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TRIGGER + DAILY LOOP
+# ─────────────────────────────────────────────────────────────────────────────
+
+import logging as _logging
+import threading as _threading
+
+log = _logging.getLogger("health")
+
+
+def trigger_health_evaluation(symbol: str, cfg: dict[str, Any]) -> None:
+    """Fire-and-forget health evaluation for a single symbol.
+    Swallows exceptions so callers (e.g. db_close_position) never crash."""
+    ks_cfg = (cfg.get("kill_switch") or {})
+    if not ks_cfg.get("enabled", True):
+        return
+    try:
+        evaluate_and_record(symbol, cfg)
+    except Exception as e:  # noqa: BLE001
+        log.error("health trigger failed for %s: %s", symbol, e, exc_info=True)
+
+
+def _seconds_until_next_midnight_utc(now: datetime) -> float:
+    tomorrow = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+    return (tomorrow - now).total_seconds()
+
+
+def health_monitor_loop(cfg_fn, stop_event=None) -> None:
+    """Daily cron @ 00:00 UTC: run evaluate_all_symbols with fresh cfg.
+
+    `cfg_fn` is a callable returning the current config dict (re-read each
+    day in case user edits config.json). `stop_event` is an optional
+    threading.Event for graceful shutdown; if None, loops until killed.
+    """
+    if stop_event is None:
+        stop_event = _threading.Event()
+    while not stop_event.is_set():
+        sleep_s = _seconds_until_next_midnight_utc(datetime.now(timezone.utc))
+        if stop_event.wait(timeout=sleep_s):
+            return
+        try:
+            cfg = cfg_fn()
+            evaluate_all_symbols(cfg)
+            log.info("health_monitor_loop: daily sweep complete")
+        except Exception as e:  # noqa: BLE001
+            log.error("health_monitor_loop sweep failed: %s", e, exc_info=True)
