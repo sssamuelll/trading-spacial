@@ -174,16 +174,29 @@ def load_config() -> dict:
             "notify_setup":    False,  # enviar también setups sin gatillo
             "dedup_window_minutes": 30, # ventana de deduplicación (minutos)
         },
+        "kill_switch": {
+            "enabled": True,
+            "min_trades_for_eval": 20,
+            "alert_win_rate_threshold": 0.15,
+            "reduce_pnl_window_days": 30,
+            "reduce_size_factor": 0.5,
+            "pause_months_consecutive": 3,
+            "auto_recovery_enabled": True,
+        },
     }
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, encoding="utf-8") as f:
             stored = json.load(f)
         # merge signal_filters en lugar de reemplazarlo
         sf_defaults = defaults["signal_filters"].copy()
+        ks_defaults = defaults["kill_switch"].copy()
         defaults.update(stored)
         if "signal_filters" in stored:
             sf_defaults.update(stored["signal_filters"])
         defaults["signal_filters"] = sf_defaults
+        if "kill_switch" in stored:
+            ks_defaults.update(stored["kill_switch"])
+        defaults["kill_switch"] = ks_defaults
 
     # ENV var overrides (for Docker/container deployments)
     cfg = defaults
@@ -271,6 +284,11 @@ def save_config(updates: dict) -> dict:
         sf = cfg.get("signal_filters", {}).copy()
         sf.update(updates.pop("signal_filters"))
         cfg["signal_filters"] = sf
+    # kill_switch se fusiona, no reemplaza (mismo patrón que signal_filters)
+    if "kill_switch" in updates:
+        ks = cfg.get("kill_switch", {}).copy()
+        ks.update(updates.pop("kill_switch"))
+        cfg["kill_switch"] = ks
     cfg.update(updates)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -521,7 +539,14 @@ def db_close_position(pos_id: int, exit_price: float, exit_reason: str) -> Optio
     con.commit()
     row = con.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
     con.close()
-    return dict(row)
+    closed = dict(row)
+    # Kill switch #138: trigger health evaluation for this symbol.
+    try:
+        from health import trigger_health_evaluation
+        trigger_health_evaluation(pos["symbol"], load_config())
+    except Exception as e:
+        log.warning("health trigger skipped for position close: %s", e)
+    return closed
 
 
 def db_update_position(pos_id: int, data: dict) -> Optional[dict]:
@@ -775,9 +800,33 @@ def backup_db():
         log.warning(f"DB backup failed: {e}")
 
 
+class _DictRow(tuple):
+    """Row factory that behaves as a plain tuple (supports == comparison) while
+    also supporting dict-style access via row["column"] and row.get("column").
+    This makes health persistence tests work cleanly without sqlite3.Row quirks."""
+
+    def __new__(cls, cursor, row):
+        instance = super().__new__(cls, row)
+        instance._mapping = {
+            desc[0]: val for desc, val in zip(cursor.description, row)
+        }
+        return instance
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self._mapping[key]
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        return self._mapping.get(key, default)
+
+    def keys(self):
+        return self._mapping.keys()
+
+
 def get_db():
     con = sqlite3.connect(DB_FILE)
-    con.row_factory = sqlite3.Row
+    con.row_factory = _DictRow
     return con
 
 
@@ -893,6 +942,31 @@ def init_db():
     con.execute("""
         CREATE INDEX IF NOT EXISTS idx_notif_sent_unread
             ON notifications_sent(sent_at DESC) WHERE read_at IS NULL
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS symbol_health (
+            symbol              TEXT PRIMARY KEY,
+            state               TEXT NOT NULL DEFAULT 'NORMAL',
+            state_since         TEXT NOT NULL,
+            last_evaluated_at   TEXT NOT NULL,
+            last_metrics_json   TEXT,
+            manual_override     INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS symbol_health_events (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol          TEXT NOT NULL,
+            from_state      TEXT NOT NULL,
+            to_state        TEXT NOT NULL,
+            trigger_reason  TEXT NOT NULL,
+            metrics_json    TEXT NOT NULL,
+            ts              TEXT NOT NULL
+        )
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_health_events_symbol
+            ON symbol_health_events(symbol, ts DESC)
     """)
     con.commit()
     con.close()
@@ -1357,6 +1431,16 @@ def scanner_loop():
 def start_scanner_thread():
     t = threading.Thread(target=scanner_loop, daemon=True, name="crypto-scanner")
     t.start()
+    # Kill switch daily sweep (#138)
+    from health import health_monitor_loop
+    health_thread = threading.Thread(
+        target=health_monitor_loop,
+        args=(lambda: load_config(),),
+        daemon=True,
+        name="health-monitor",
+    )
+    health_thread.start()
+    log.info("Health monitor thread started (daily @ 00:00 UTC)")
     return t
 
 
@@ -1893,6 +1977,69 @@ def tune_reject():
     con.commit()
     con.close()
     return {"ok": True}
+
+
+# ── Kill switch / health endpoints (#138) ─────────────────────────────
+
+
+class ReactivateRequest(BaseModel):
+    reason: str = "manual"
+
+
+@app.get("/health/symbols", dependencies=[Depends(verify_api_key)])
+def get_health_symbols():
+    """List current health state per symbol."""
+    con = get_db()
+    try:
+        rows = con.execute(
+            """SELECT symbol, state, state_since, last_evaluated_at,
+                      last_metrics_json, manual_override
+               FROM symbol_health
+               ORDER BY symbol"""
+        ).fetchall()
+    finally:
+        con.close()
+    cols = ("symbol", "state", "state_since", "last_evaluated_at",
+            "last_metrics_json", "manual_override")
+    return {"symbols": [dict(zip(cols, r)) for r in rows]}
+
+
+@app.get("/health/events", dependencies=[Depends(verify_api_key)])
+def get_health_events(
+    symbol: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=500, description="Max rows to return (capped to prevent unbounded scans)"),
+):
+    """Transition history. Optionally filter by symbol."""
+    con = get_db()
+    try:
+        if symbol:
+            rows = con.execute(
+                """SELECT id, symbol, from_state, to_state, trigger_reason,
+                          metrics_json, ts
+                   FROM symbol_health_events WHERE symbol=?
+                   ORDER BY ts DESC LIMIT ?""",
+                (symbol, limit),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                """SELECT id, symbol, from_state, to_state, trigger_reason,
+                          metrics_json, ts
+                   FROM symbol_health_events ORDER BY ts DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+    finally:
+        con.close()
+    cols = ("id", "symbol", "from_state", "to_state", "trigger_reason",
+            "metrics_json", "ts")
+    return {"events": [dict(zip(cols, r)) for r in rows]}
+
+
+@app.post("/health/reactivate/{symbol}", dependencies=[Depends(verify_api_key)])
+def post_health_reactivate(symbol: str, body: ReactivateRequest):
+    """Manually reset a symbol to NORMAL with manual_override=1."""
+    from health import reactivate_symbol, get_symbol_state
+    reactivate_symbol(symbol.upper(), reason=body.reason)
+    return {"ok": True, "symbol": symbol.upper(), "state": get_symbol_state(symbol.upper())}
 
 
 @app.get("/health", summary="Health check for monitoring and Docker")
