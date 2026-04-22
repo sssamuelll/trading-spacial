@@ -10,15 +10,15 @@ from notifier._templates import render
 from notifier.channels.base import DeliveryReceipt
 from notifier.channels.telegram import TelegramChannel
 from notifier.events import (
-    SignalEvent, HealthEvent, InfraEvent, SystemEvent,
+    SignalEvent, HealthEvent, InfraEvent, SystemEvent, PositionExitEvent,
     Event,
 )
 
 
 __all__ = [
     "notify",
-    "SignalEvent", "HealthEvent", "InfraEvent", "SystemEvent", "Event",
-    "DeliveryReceipt",
+    "SignalEvent", "HealthEvent", "InfraEvent", "SystemEvent", "PositionExitEvent",
+    "Event", "DeliveryReceipt",
 ]
 
 
