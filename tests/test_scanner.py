@@ -681,6 +681,34 @@ class TestScan:
         from btc_scanner import ATR_SL_MULT
         assert abs(sl_dist - sz["atr_1h"] * ATR_SL_MULT) < 1.0
 
+    @patch("btc_scanner.md.get_klines")
+    def test_scan_halves_risk_for_reduced_symbol(self, mock_klines):
+        """Kill switch #138 PR 3: REDUCED symbols use risk × reduce_size_factor (0.5)."""
+        df1h, df4h, df5m = self._make_scan_mock()
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h]
+
+        # Baseline: NORMAL symbol → risk_usd = 10.0 (1% of capital=1000)
+        with patch("health.apply_reduce_factor", side_effect=lambda size, sym, cfg: size):
+            rep_normal = scanner.scan("BTCUSDT")
+        assert rep_normal["sizing_1h"]["riesgo_usd"] == pytest.approx(10.0, abs=0.01)
+
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h]
+        # REDUCED: risk halved
+        with patch("health.apply_reduce_factor", side_effect=lambda size, sym, cfg: size * 0.5):
+            rep_reduced = scanner.scan("BTCUSDT")
+        assert rep_reduced["sizing_1h"]["riesgo_usd"] == pytest.approx(5.0, abs=0.01)
+
+    @patch("btc_scanner.md.get_klines")
+    def test_scan_survives_health_lookup_failure(self, mock_klines):
+        """If health module raises, scan must continue with full risk (fail-open)."""
+        df1h, df4h, df5m = self._make_scan_mock()
+        mock_klines.side_effect = [df5m, df1h, df4h, df1h]
+
+        with patch("health.apply_reduce_factor", side_effect=RuntimeError("boom")):
+            rep = scanner.scan("BTCUSDT")
+        # Scan produced a valid report with full risk despite the health error
+        assert rep["sizing_1h"]["riesgo_usd"] == pytest.approx(10.0, abs=0.01)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TESTS — _load_proxy

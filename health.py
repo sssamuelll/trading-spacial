@@ -315,9 +315,10 @@ def evaluate_and_record(symbol: str, cfg: dict[str, Any], now: datetime | None =
     if new_state != current:
         apply_transition(symbol, new_state=new_state, reason=reason,
                          metrics=metrics, from_state=current)
-        # PR 2 (#138): one-shot notify only on transitions into ALERT.
-        # PRs 3/4 will extend this to REDUCED and PAUSED.
-        if new_state == "ALERT" and notify is not None and HealthEvent is not None:
+        # One-shot notify on transitions into tiered states.
+        # PR 2 (#138): ALERT; PR 3 (#138): REDUCED; PR 4 will add PAUSED.
+        notify_on_states = {"ALERT", "REDUCED"}
+        if new_state in notify_on_states and notify is not None and HealthEvent is not None:
             try:
                 notify(
                     HealthEvent(symbol=symbol, from_state=current,
@@ -325,7 +326,7 @@ def evaluate_and_record(symbol: str, cfg: dict[str, Any], now: datetime | None =
                     cfg=cfg,
                 )
             except Exception as e:  # noqa: BLE001
-                log.warning("health: ALERT notify failed for %s: %s", symbol, e)
+                log.warning("health: %s notify failed for %s: %s", new_state, symbol, e)
     else:
         _record_evaluation(symbol, metrics, new_state)
     return new_state
@@ -346,6 +347,31 @@ def evaluate_all_symbols(cfg: dict[str, Any], now: datetime | None = None) -> di
         return {}
     from btc_scanner import DEFAULT_SYMBOLS
     return {sym: evaluate_and_record(sym, cfg, now=now) for sym in DEFAULT_SYMBOLS}
+
+
+def apply_reduce_factor(size: float, symbol: str, cfg: dict[str, Any]) -> float:
+    """Return `size` scaled by `reduce_size_factor` if the symbol is in REDUCED state.
+
+    Returns `size` unchanged for NORMAL/ALERT/PAUSED states, or if kill_switch is
+    disabled. Callers should use this at position-open time (btc_scanner.scan)
+    or at backtest-sim time (backtest.simulate_strategy) to halve risk on
+    symbols that have recent losses.
+
+    Safe on any failure: swallows exceptions (returns original size). The
+    kill-switch must never block a trade by raising in this hot path.
+    """
+    ks_cfg = (cfg.get("kill_switch") or {})
+    if not ks_cfg.get("enabled", True):
+        return size
+    try:
+        state = get_symbol_state(symbol)
+    except Exception as e:  # noqa: BLE001
+        log.warning("apply_reduce_factor: state lookup failed for %s: %s", symbol, e)
+        return size
+    if state == "REDUCED":
+        factor = float(ks_cfg.get("reduce_size_factor", 0.5))
+        return size * factor
+    return size
 
 
 # ─────────────────────────────────────────────────────────────────────────────

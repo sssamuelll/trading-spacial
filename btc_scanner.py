@@ -1194,6 +1194,12 @@ def scan(symbol: str = None):
     atr_val    = float(calc_atr(df1h, ATR_PERIOD).iloc[-1])
     capital    = 1000.0
     risk_usd   = capital * 0.01
+    # Kill switch #138 PR 3: halve risk for REDUCED symbols.
+    try:
+        from health import apply_reduce_factor
+        risk_usd = apply_reduce_factor(risk_usd, symbol, _cfg)
+    except Exception as e:
+        log.warning("scan: reduce-factor lookup failed for %s: %s", symbol, e)
 
     # Per-symbol ATR overrides from config (reuse _cfg loaded above)
     _sym_overrides = _cfg.get("symbol_overrides", {})
