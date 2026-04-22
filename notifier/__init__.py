@@ -10,6 +10,7 @@ from notifier._templates import render
 from notifier.channels.base import DeliveryReceipt
 from notifier.channels.telegram import TelegramChannel
 from notifier.channels.webhook import WebhookChannel
+from notifier.channels.email import EmailChannel
 from notifier.events import (
     SignalEvent, HealthEvent, InfraEvent, SystemEvent, PositionExitEvent,
     Event,
@@ -94,9 +95,10 @@ def notify(event: Event, cfg: dict) -> list[DeliveryReceipt]:
             channel = TelegramChannel(cfg)
         elif channel_name == "webhook":
             channel = WebhookChannel(cfg)
+        elif channel_name == "email":
+            channel = EmailChannel(cfg)
         else:
-            log.warning("notify: unsupported channel %r (email lands in a future PR)",
-                         channel_name)
+            log.warning("notify: unsupported channel %r", channel_name)
             receipts.append(DeliveryReceipt(channel=channel_name, status="failed",
                                               error=f"unsupported channel: {channel_name}"))
             continue
@@ -122,10 +124,14 @@ def notify(event: Event, cfg: dict) -> list[DeliveryReceipt]:
             channels_sent.append(channel_name)
             continue
 
-        # WebhookChannel takes event_type as an extra arg so it can route to
-        # endpoint subscribers. Other channels ignore the kwarg.
+        # WebhookChannel + EmailChannel take extra kwargs for routing / subject.
+        # Telegram ignores them.
         if channel_name == "webhook":
             receipt = channel.send(message, event_type=event.event_type)
+        elif channel_name == "email":
+            receipt = channel.send(message,
+                                    event_type=event.event_type,
+                                    event_key=event.dedupe_key)
         else:
             receipt = channel.send(message)
         receipts.append(receipt)
