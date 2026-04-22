@@ -120,12 +120,12 @@ def test_notify_render_failure_produces_failed_receipt(tmp_db_and_reset):
 
 def test_notify_unsupported_channel_logs_warning(tmp_db_and_reset, caplog):
     """Unknown channel name must log a warning (so operator notices config drift).
-    Uses 'email' since webhook is now a supported channel in #162 PR B."""
+    telegram/webhook/email are all supported now; pick an unused name like 'sms'."""
     import logging
     from notifier import notify, SignalEvent
 
     cfg = _cfg()
-    cfg["notifier"]["channels_by_event_type"] = {"signal": ["email"]}
+    cfg["notifier"]["channels_by_event_type"] = {"signal": ["sms"]}
 
     ev = SignalEvent(symbol="BTC", score=5, direction="LONG",
                      entry=1, sl=1, tp=1)

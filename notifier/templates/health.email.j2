@@ -1,0 +1,11 @@
+Health transition: {{ symbol }}
+
+{{ from_state }} -> {{ to_state }}
+Reason: {{ reason }}
+
+{% if metrics -%}
+Metrics:
+{% for key, value in metrics.items() -%}
+  {{ key }}: {{ value }}
+{% endfor %}
+{%- endif %}
