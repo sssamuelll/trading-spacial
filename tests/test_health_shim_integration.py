@@ -69,5 +69,6 @@ def test_shim_unknown_symbol_defaults_to_normal(tmp_db):
     with patch("notifier.channels.telegram.requests.post", return_value=fake_resp) as mock_post:
         btc_api.push_telegram_direct(rep, _cfg())
 
+    assert mock_post.call_count == 1, "no signal sent — later assertion would be misleading"
     sent_text = mock_post.call_args.kwargs["json"]["text"]
     assert not sent_text.startswith("⚠️"), f"unexpected prefix: {sent_text!r}"
