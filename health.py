@@ -6,6 +6,7 @@ lands in PRs 2-4.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -150,3 +151,107 @@ def evaluate_state(
     if config.get("auto_recovery_enabled", True):
         return "NORMAL", "auto_recovery"
     return current_state, "auto_recovery_disabled"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PERSISTENCE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _conn():
+    import btc_api
+    return btc_api.get_db()
+
+
+def get_symbol_state(symbol: str) -> str:
+    """Return the current state of a symbol, or 'NORMAL' if it has no row."""
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT state FROM symbol_health WHERE symbol=?",
+            (symbol,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else "NORMAL"
+
+
+def _record_evaluation(symbol: str, metrics: dict[str, Any], new_state: str) -> None:
+    """Update last_evaluated_at + last_metrics_json without changing state.
+    Creates the row if it doesn't exist. No event is emitted."""
+    conn = _conn()
+    now = _now_iso()
+    try:
+        conn.execute(
+            """INSERT INTO symbol_health (symbol, state, state_since, last_evaluated_at, last_metrics_json)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(symbol) DO UPDATE SET
+                 last_evaluated_at = excluded.last_evaluated_at,
+                 last_metrics_json = excluded.last_metrics_json""",
+            (symbol, new_state, now, now, json.dumps(metrics, default=str)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def apply_transition(
+    symbol: str,
+    new_state: str,
+    reason: str,
+    metrics: dict[str, Any],
+    from_state: str,
+    manual_override: int | None = None,
+) -> None:
+    """Write the new state to symbol_health AND append a row to symbol_health_events.
+
+    If new_state == from_state this is a bug — callers should prefer `_record_evaluation`
+    for same-state updates. We still handle it gracefully by skipping the event insert.
+    """
+    if new_state not in VALID_STATES:
+        raise ValueError(f"invalid state: {new_state!r}")
+    now = _now_iso()
+    metrics_json = json.dumps(metrics, default=str)
+
+    conn = _conn()
+    try:
+        extra_sets = ""
+        if manual_override is not None:
+            extra_sets = ", manual_override = excluded.manual_override"
+        conn.execute(
+            f"""INSERT INTO symbol_health
+                (symbol, state, state_since, last_evaluated_at, last_metrics_json, manual_override)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                  state = excluded.state,
+                  state_since = excluded.state_since,
+                  last_evaluated_at = excluded.last_evaluated_at,
+                  last_metrics_json = excluded.last_metrics_json
+                  {extra_sets}""",
+            (symbol, new_state, now, now, metrics_json,
+             int(manual_override) if manual_override is not None else 0),
+        )
+
+        if from_state != new_state:
+            conn.execute(
+                """INSERT INTO symbol_health_events
+                   (symbol, from_state, to_state, trigger_reason, metrics_json, ts)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (symbol, from_state, new_state, reason, metrics_json, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def reactivate_symbol(symbol: str, reason: str = "manual") -> None:
+    """Manually reset a symbol to NORMAL with manual_override=1."""
+    current = get_symbol_state(symbol)
+    metrics = {"reactivation_reason": reason}
+    apply_transition(
+        symbol, new_state="NORMAL", reason="manual_override",
+        metrics=metrics, from_state=current, manual_override=1,
+    )

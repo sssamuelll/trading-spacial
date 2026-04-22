@@ -793,9 +793,33 @@ def backup_db():
         log.warning(f"DB backup failed: {e}")
 
 
+class _DictRow(tuple):
+    """Row factory that behaves as a plain tuple (supports == comparison) while
+    also supporting dict-style access via row["column"] and row.get("column").
+    This makes health persistence tests work cleanly without sqlite3.Row quirks."""
+
+    def __new__(cls, cursor, row):
+        instance = super().__new__(cls, row)
+        instance._mapping = {
+            desc[0]: val for desc, val in zip(cursor.description, row)
+        }
+        return instance
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return self._mapping[key]
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        return self._mapping.get(key, default)
+
+    def keys(self):
+        return self._mapping.keys()
+
+
 def get_db():
     con = sqlite3.connect(DB_FILE)
-    con.row_factory = sqlite3.Row
+    con.row_factory = _DictRow
     return con
 
 

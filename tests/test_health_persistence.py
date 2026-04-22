@@ -77,3 +77,95 @@ def test_kill_switch_config_partial_override_preserves_defaults(tmp_path, monkey
                       "pause_months_consecutive", "auto_recovery_enabled"):
         assert required in ks, f"deep-merge dropped kill_switch.{required}"
     assert ks["min_trades_for_eval"] == 20  # default preserved
+
+
+from datetime import datetime, timezone
+
+
+def test_apply_transition_writes_row_and_event(tmp_db):
+    from health import apply_transition
+    import btc_api
+    metrics = {
+        "trades_count_total": 50, "win_rate_20_trades": 0.5,
+        "pnl_30d": 100.0, "pnl_by_month": {},
+        "months_negative_consecutive": 0,
+    }
+    apply_transition("BTCUSDT", new_state="ALERT", reason="wr_below_threshold",
+                     metrics=metrics, from_state="NORMAL")
+    conn = btc_api.get_db()
+    try:
+        row = conn.execute(
+            "SELECT state, state_since, manual_override FROM symbol_health WHERE symbol=?",
+            ("BTCUSDT",),
+        ).fetchone()
+        event = conn.execute(
+            """SELECT from_state, to_state, trigger_reason FROM symbol_health_events
+               WHERE symbol=? ORDER BY ts DESC LIMIT 1""",
+            ("BTCUSDT",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row[0] == "ALERT"
+    assert row[2] == 0  # manual_override default 0
+    assert event == ("NORMAL", "ALERT", "wr_below_threshold")
+
+
+def test_get_symbol_state_returns_normal_for_unknown(tmp_db):
+    """A symbol with no row is treated as NORMAL by default."""
+    from health import get_symbol_state
+    assert get_symbol_state("UNSEEN") == "NORMAL"
+
+
+def test_get_symbol_state_returns_persisted(tmp_db):
+    from health import apply_transition, get_symbol_state
+    metrics = {"trades_count_total": 50, "win_rate_20_trades": 0.5,
+                "pnl_30d": 0.0, "pnl_by_month": {},
+                "months_negative_consecutive": 0}
+    apply_transition("JUPUSDT", new_state="PAUSED", reason="3mo_consec_neg",
+                      metrics=metrics, from_state="REDUCED")
+    assert get_symbol_state("JUPUSDT") == "PAUSED"
+
+
+def test_apply_transition_same_state_is_idempotent(tmp_db):
+    """If new_state == current, update last_evaluated_at but do NOT insert event row."""
+    from health import apply_transition, _record_evaluation
+    import btc_api
+    metrics = {"trades_count_total": 50, "win_rate_20_trades": 0.5,
+                "pnl_30d": 0.0, "pnl_by_month": {},
+                "months_negative_consecutive": 0}
+    apply_transition("BTC", new_state="ALERT", reason="wr_below_threshold",
+                      metrics=metrics, from_state="NORMAL")
+    _record_evaluation("BTC", metrics, new_state="ALERT")  # idempotent no-op transition
+    conn = btc_api.get_db()
+    try:
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM symbol_health_events WHERE symbol='BTC'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert event_count == 1  # initial transition, not a second event
+
+
+def test_reactivate_sets_manual_override(tmp_db):
+    """reactivate_symbol flips manual_override to 1 and emits event."""
+    from health import apply_transition, reactivate_symbol
+    metrics = {"trades_count_total": 50, "win_rate_20_trades": 0.5,
+                "pnl_30d": 0.0, "pnl_by_month": {},
+                "months_negative_consecutive": 0}
+    apply_transition("DOGE", new_state="PAUSED", reason="3mo_consec_neg",
+                      metrics=metrics, from_state="REDUCED")
+    reactivate_symbol("DOGE", reason="backtest_validated")
+    import btc_api
+    conn = btc_api.get_db()
+    try:
+        row = conn.execute(
+            "SELECT state, manual_override FROM symbol_health WHERE symbol='DOGE'"
+        ).fetchone()
+        last_event = conn.execute(
+            "SELECT trigger_reason FROM symbol_health_events WHERE symbol='DOGE' "
+            "ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == ("NORMAL", 1)
+    assert last_event[0] == "manual_override"
