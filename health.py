@@ -7,8 +7,22 @@ lands in PRs 2-4.
 from __future__ import annotations
 
 import json
+import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+
+log = logging.getLogger("health")
+
+# Lazy re-export so tests can patch health.notify without reaching into notifier.
+# Using a try/except because notifier is a sibling package (not a stdlib) and
+# we want health.py to remain importable even if notifier fails to import.
+try:
+    from notifier import notify, HealthEvent  # noqa: F401
+except ImportError:
+    notify = None  # type: ignore
+    HealthEvent = None  # type: ignore
 
 
 def _month_key(dt: datetime) -> str:
@@ -301,6 +315,17 @@ def evaluate_and_record(symbol: str, cfg: dict[str, Any], now: datetime | None =
     if new_state != current:
         apply_transition(symbol, new_state=new_state, reason=reason,
                          metrics=metrics, from_state=current)
+        # PR 2 (#138): one-shot notify only on transitions into ALERT.
+        # PRs 3/4 will extend this to REDUCED and PAUSED.
+        if new_state == "ALERT" and notify is not None and HealthEvent is not None:
+            try:
+                notify(
+                    HealthEvent(symbol=symbol, from_state=current,
+                                to_state=new_state, reason=reason, metrics=metrics),
+                    cfg=cfg,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("health: ALERT notify failed for %s: %s", symbol, e)
     else:
         _record_evaluation(symbol, metrics, new_state)
     return new_state
@@ -326,11 +351,6 @@ def evaluate_all_symbols(cfg: dict[str, Any], now: datetime | None = None) -> di
 # ─────────────────────────────────────────────────────────────────────────────
 #  TRIGGER + DAILY LOOP
 # ─────────────────────────────────────────────────────────────────────────────
-
-import logging as _logging
-import threading as _threading
-
-log = _logging.getLogger("health")
 
 
 def trigger_health_evaluation(symbol: str, cfg: dict[str, Any]) -> None:
@@ -360,7 +380,7 @@ def health_monitor_loop(cfg_fn, stop_event=None) -> None:
     threading.Event for graceful shutdown; if None, loops until killed.
     """
     if stop_event is None:
-        stop_event = _threading.Event()
+        stop_event = threading.Event()
     while not stop_event.is_set():
         sleep_s = _seconds_until_next_midnight_utc(datetime.now(timezone.utc))
         if stop_event.wait(timeout=sleep_s):

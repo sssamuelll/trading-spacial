@@ -1193,14 +1193,25 @@ def push_telegram_direct(rep: dict, cfg: dict, max_retries: int = 3):
 
     DEPRECATED (#162): delegates to notifier.notify(SignalEvent(...)).
     """
+    # Kill switch #138 PR 2: stamp symbol health state so ALERT symbols get
+    # a warning prefix in the Telegram message.
+    symbol = rep.get("symbol", "")
+    try:
+        from health import get_symbol_state
+        health_state = get_symbol_state(symbol) if symbol else "NORMAL"
+    except Exception as e:
+        log.warning("push_telegram_direct: health lookup failed for %s: %s", symbol, e)
+        health_state = "NORMAL"
+
     receipts = notify(
         SignalEvent(
-            symbol=rep.get("symbol", ""),
+            symbol=symbol,
             score=int(rep.get("score", 0) or 0),
             direction=rep.get("direction", "LONG"),
             entry=float(rep.get("price") or 0.0),
             sl=float((rep.get("sizing_1h") or {}).get("sl_precio") or 0.0),
             tp=float((rep.get("sizing_1h") or {}).get("tp_precio") or 0.0),
+            health_state=health_state,
         ),
         cfg=cfg,
     )

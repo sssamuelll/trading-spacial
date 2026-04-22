@@ -80,3 +80,31 @@ def test_health_metrics_backtick_in_value_does_not_break_span():
     # metrics_line should look like: Metrics: `{"note": "watch 'DOGE' next"}`
     # i.e. exactly 2 backticks (the outer code-span delimiters)
     assert metrics_line.count("`") == 2, f"expected 2 backticks, got: {metrics_line!r}"
+
+
+def test_signal_telegram_prepends_alert_warning():
+    """ALERT symbols get a '⚠️ *ALERT*' prefix on its own line before *Signal*."""
+    from notifier._templates import render
+    from notifier import SignalEvent
+    ev = SignalEvent(symbol="BTCUSDT", score=6, direction="LONG",
+                     entry=50_000.0, sl=49_000.0, tp=55_000.0,
+                     health_state="ALERT")
+    msg = render(ev, channel="telegram")
+    # Exact prefix: emoji, space, *ALERT*, newline (no trailing space before the newline).
+    assert msg.startswith("⚠️ *ALERT*\n"), f"unexpected prefix: {msg!r}"
+    assert "BTCUSDT" in msg
+
+
+def test_signal_telegram_no_prefix_for_normal():
+    """NORMAL symbols render byte-identical to pre-PR (no prefix, no extra newlines)."""
+    from notifier._templates import render
+    from notifier import SignalEvent
+    ev = SignalEvent(symbol="BTCUSDT", score=6, direction="LONG",
+                     entry=50_000.0, sl=49_000.0, tp=55_000.0)
+    msg = render(ev, channel="telegram")
+    expected = (
+        "*Signal* `BTCUSDT`\n"
+        "Score: *6* (LONG)\n"
+        "Entry: `50000.00` | SL: `49000.00` | TP: `55000.00`"
+    )
+    assert msg == expected, f"parity broken: {msg!r}"
