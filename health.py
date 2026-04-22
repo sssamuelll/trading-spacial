@@ -261,3 +261,58 @@ def reactivate_symbol(symbol: str, reason: str = "manual") -> None:
         symbol, new_state="NORMAL", reason="manual_override",
         metrics=metrics, from_state=current, manual_override=1,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ORCHESTRATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_manual_override(symbol: str) -> bool:
+    conn = _conn()
+    try:
+        row = conn.execute(
+            "SELECT manual_override FROM symbol_health WHERE symbol=?",
+            (symbol,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return bool(row[0]) if row else False
+
+
+def evaluate_and_record(symbol: str, cfg: dict[str, Any], now: datetime | None = None) -> str:
+    """Compute metrics + evaluate state + persist. Returns the resulting state."""
+    ks_cfg = (cfg.get("kill_switch") or {})
+    if not ks_cfg.get("enabled", True):
+        return "NORMAL"
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    conn = _conn()
+    try:
+        metrics = compute_rolling_metrics(symbol, conn, now=now)
+    finally:
+        conn.close()
+
+    current = get_symbol_state(symbol)
+    override = _get_manual_override(symbol)
+    new_state, reason = evaluate_state(metrics, current, override, ks_cfg)
+
+    if new_state != current:
+        apply_transition(symbol, new_state=new_state, reason=reason,
+                         metrics=metrics, from_state=current)
+    else:
+        _record_evaluation(symbol, metrics, new_state)
+    return new_state
+
+
+def evaluate_all_symbols(cfg: dict[str, Any], now: datetime | None = None) -> dict[str, str]:
+    """Evaluate every symbol in btc_scanner.DEFAULT_SYMBOLS. Returns {symbol: state}.
+
+    If kill_switch.enabled is False, returns {} without touching the DB.
+    """
+    ks_cfg = (cfg.get("kill_switch") or {})
+    if not ks_cfg.get("enabled", True):
+        return {}
+    from btc_scanner import DEFAULT_SYMBOLS
+    return {sym: evaluate_and_record(sym, cfg, now=now) for sym in DEFAULT_SYMBOLS}
