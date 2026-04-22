@@ -7,8 +7,13 @@ lands in PRs 2-4.
 from __future__ import annotations
 
 import json
+import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+
+log = logging.getLogger("health")
 
 # Lazy re-export so tests can patch health.notify without reaching into notifier.
 # Using a try/except because notifier is a sibling package (not a stdlib) and
@@ -347,11 +352,6 @@ def evaluate_all_symbols(cfg: dict[str, Any], now: datetime | None = None) -> di
 #  TRIGGER + DAILY LOOP
 # ─────────────────────────────────────────────────────────────────────────────
 
-import logging as _logging
-import threading as _threading
-
-log = _logging.getLogger("health")
-
 
 def trigger_health_evaluation(symbol: str, cfg: dict[str, Any]) -> None:
     """Fire-and-forget health evaluation for a single symbol.
@@ -380,7 +380,7 @@ def health_monitor_loop(cfg_fn, stop_event=None) -> None:
     threading.Event for graceful shutdown; if None, loops until killed.
     """
     if stop_event is None:
-        stop_event = _threading.Event()
+        stop_event = threading.Event()
     while not stop_event.is_set():
         sleep_s = _seconds_until_next_midnight_utc(datetime.now(timezone.utc))
         if stop_event.wait(timeout=sleep_s):

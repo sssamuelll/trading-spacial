@@ -41,8 +41,10 @@ NOW = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
 
 
 def _seed_for_alert(conn):
-    """25 closed trades: 24 tiny losses, 1 big win → wr=1/25=0.04 (< 0.15) but
-    aggregate pnl positive (so REDUCED rule doesn't fire first)."""
+    """25 closed trades: 24 tiny losses, 1 big win.
+    compute_rolling_metrics uses LIMIT 20 for win_rate, so only the most recent
+    20 trades (i=5..24) count → wr = 1/20 = 0.05 (< 0.15 threshold).
+    Aggregate pnl over 30d is positive (≈$976) so REDUCED doesn't fire first."""
     for i in range(25):
         pnl = 1000.0 if i == 24 else -1.0  # single big winner dominates → agg positive
         _insert_closed(conn, "BTC", pnl, (NOW - timedelta(days=25 - i)).isoformat())
