@@ -1778,3 +1778,39 @@ class TestKillSwitchDecisionsEndpoint:
     def test_rejects_limit_over_max(self, client, tmp_db):
         r = client.get("/kill_switch/decisions?limit=500")
         assert r.status_code == 422  # pydantic Query validation
+
+
+class TestKillSwitchCurrentStateEndpoint:
+    @pytest.fixture(autouse=True)
+    def setup_db(self, tmp_db, monkeypatch):
+        import btc_api
+        monkeypatch.setattr(btc_api, "DB_FILE", tmp_db)
+        btc_api.init_db()
+        yield
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        import btc_api
+        return TestClient(btc_api.app)
+
+    def test_returns_empty_state(self, client, tmp_db):
+        r = client.get("/kill_switch/current_state")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["symbols"] == {}
+        assert body["portfolio"]["tier"] == "NORMAL"
+        assert body["portfolio"]["concurrent_failures"] == 0
+
+    def test_returns_latest_per_symbol(self, client, tmp_db):
+        import observability
+        observability.record_decision(
+            symbol="BTCUSDT", engine="v1",
+            per_symbol_tier="ALERT", portfolio_tier="NORMAL",
+            size_factor=1.0, skip=False, reasons={},
+            scan_id=None, slider_value=None, velocity_active=False,
+        )
+        r = client.get("/kill_switch/current_state")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["symbols"]["BTCUSDT"]["per_symbol_tier"] == "ALERT"

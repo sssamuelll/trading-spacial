@@ -119,3 +119,49 @@ def compute_portfolio_aggregate(
     )
     tier = "WARNED" if failures >= concurrent_alert_threshold else "NORMAL"
     return {"tier": tier, "concurrent_failures": failures}
+
+
+def get_current_state(
+    engine: str = "v1",
+    concurrent_alert_threshold: int = 3,
+) -> dict[str, Any]:
+    """Return current per-symbol state + portfolio aggregate.
+
+    Takes the latest decision per symbol from the log (filtered to the
+    given engine) and computes portfolio aggregate.
+    """
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            """SELECT d.symbol, d.per_symbol_tier, d.portfolio_tier, d.size_factor,
+                      d.skip, d.velocity_active, d.ts, d.reasons_json
+               FROM kill_switch_decisions d
+               INNER JOIN (
+                   SELECT symbol, MAX(ts) AS max_ts
+                   FROM kill_switch_decisions
+                   WHERE engine = ?
+                   GROUP BY symbol
+               ) latest
+                 ON d.symbol = latest.symbol AND d.ts = latest.max_ts
+               WHERE d.engine = ?""",
+            (engine, engine),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    cols = ["symbol", "per_symbol_tier", "portfolio_tier", "size_factor",
+            "skip", "velocity_active", "ts", "reasons_json"]
+    symbols: dict[str, dict[str, Any]] = {}
+    per_symbol_tiers: dict[str, str] = {}
+    for r in rows:
+        d = dict(zip(cols, r))
+        d["skip"] = bool(d["skip"])
+        d["velocity_active"] = bool(d["velocity_active"])
+        symbols[d["symbol"]] = d
+        per_symbol_tiers[d["symbol"]] = d["per_symbol_tier"]
+
+    portfolio = compute_portfolio_aggregate(
+        per_symbol_tiers,
+        concurrent_alert_threshold=concurrent_alert_threshold,
+    )
+    return {"symbols": symbols, "portfolio": portfolio}

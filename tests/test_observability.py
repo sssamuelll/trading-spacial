@@ -137,3 +137,47 @@ def test_compute_portfolio_aggregate_empty_input():
     result = compute_portfolio_aggregate({}, concurrent_alert_threshold=3)
     assert result["tier"] == "NORMAL"
     assert result["concurrent_failures"] == 0
+
+
+def test_get_current_state_returns_latest_per_symbol(tmp_db):
+    from observability import record_decision, get_current_state
+    # Record two decisions for the same symbol; newer should win
+    record_decision(symbol="BTCUSDT", engine="v1", per_symbol_tier="NORMAL",
+                    portfolio_tier="NORMAL", size_factor=1.0, skip=False,
+                    reasons={}, scan_id=None, slider_value=None, velocity_active=False)
+    record_decision(symbol="BTCUSDT", engine="v1", per_symbol_tier="ALERT",
+                    portfolio_tier="NORMAL", size_factor=1.0, skip=False,
+                    reasons={}, scan_id=None, slider_value=None, velocity_active=False)
+    record_decision(symbol="ETHUSDT", engine="v1", per_symbol_tier="REDUCED",
+                    portfolio_tier="NORMAL", size_factor=0.5, skip=False,
+                    reasons={}, scan_id=None, slider_value=None, velocity_active=False)
+
+    state = get_current_state()
+    assert state["symbols"]["BTCUSDT"]["per_symbol_tier"] == "ALERT"
+    assert state["symbols"]["ETHUSDT"]["per_symbol_tier"] == "REDUCED"
+    assert state["portfolio"]["tier"] == "NORMAL"
+    # ALERT + REDUCED = 2 concurrent failures (< default threshold of 3)
+    assert state["portfolio"]["concurrent_failures"] == 2
+
+
+def test_get_current_state_empty_db(tmp_db):
+    from observability import get_current_state
+    state = get_current_state()
+    assert state["symbols"] == {}
+    assert state["portfolio"]["tier"] == "NORMAL"
+    assert state["portfolio"]["concurrent_failures"] == 0
+
+
+def test_get_current_state_filters_by_engine(tmp_db):
+    from observability import record_decision, get_current_state
+    record_decision(symbol="BTCUSDT", engine="v1", per_symbol_tier="NORMAL",
+                    portfolio_tier="NORMAL", size_factor=1.0, skip=False,
+                    reasons={}, scan_id=None, slider_value=None, velocity_active=False)
+    record_decision(symbol="BTCUSDT", engine="v2_shadow", per_symbol_tier="ALERT",
+                    portfolio_tier="NORMAL", size_factor=1.0, skip=False,
+                    reasons={}, scan_id=None, slider_value=None, velocity_active=False)
+
+    state_v1 = get_current_state(engine="v1")
+    state_v2 = get_current_state(engine="v2_shadow")
+    assert state_v1["symbols"]["BTCUSDT"]["per_symbol_tier"] == "NORMAL"
+    assert state_v2["symbols"]["BTCUSDT"]["per_symbol_tier"] == "ALERT"

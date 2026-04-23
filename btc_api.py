@@ -2167,6 +2167,13 @@ def get_kill_switch_decisions(
     return {"decisions": rows}
 
 
+@app.get("/kill_switch/current_state", dependencies=[Depends(verify_api_key)])
+def get_kill_switch_current_state(engine: str = "v1"):
+    """Current tier state per symbol + portfolio aggregate (#187 phase 1)."""
+    import observability
+    return observability.get_current_state(engine=engine)
+
+
 @app.post("/health/reactivate/{symbol}", dependencies=[Depends(verify_api_key)])
 def post_health_reactivate(symbol: str, body: ReactivateRequest):
     """Manually reset a symbol to NORMAL with manual_override=1."""
