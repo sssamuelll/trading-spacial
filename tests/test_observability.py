@@ -103,3 +103,37 @@ def test_query_filters_by_since(tmp_db):
     rows = query_decisions(since=cutoff)
     assert len(rows) == 1
     assert rows[0]["symbol"] == "NEW"
+
+
+def test_compute_portfolio_aggregate_all_normal():
+    from observability import compute_portfolio_aggregate
+    per_symbol_tiers = {"BTCUSDT": "NORMAL", "ETHUSDT": "NORMAL", "ADAUSDT": "NORMAL"}
+    result = compute_portfolio_aggregate(per_symbol_tiers, concurrent_alert_threshold=3)
+    assert result["tier"] == "NORMAL"
+    assert result["concurrent_failures"] == 0
+
+
+def test_compute_portfolio_aggregate_warned_at_threshold():
+    from observability import compute_portfolio_aggregate
+    per_symbol_tiers = {
+        "BTCUSDT": "ALERT", "ETHUSDT": "REDUCED",
+        "ADAUSDT": "PAUSED", "XLMUSDT": "NORMAL",
+    }
+    result = compute_portfolio_aggregate(per_symbol_tiers, concurrent_alert_threshold=3)
+    assert result["tier"] == "WARNED"
+    assert result["concurrent_failures"] == 3
+
+
+def test_compute_portfolio_aggregate_below_threshold():
+    from observability import compute_portfolio_aggregate
+    per_symbol_tiers = {"BTCUSDT": "ALERT", "ETHUSDT": "NORMAL", "ADAUSDT": "NORMAL"}
+    result = compute_portfolio_aggregate(per_symbol_tiers, concurrent_alert_threshold=3)
+    assert result["tier"] == "NORMAL"
+    assert result["concurrent_failures"] == 1
+
+
+def test_compute_portfolio_aggregate_empty_input():
+    from observability import compute_portfolio_aggregate
+    result = compute_portfolio_aggregate({}, concurrent_alert_threshold=3)
+    assert result["tier"] == "NORMAL"
+    assert result["concurrent_failures"] == 0

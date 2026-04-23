@@ -14,6 +14,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+PORTFOLIO_FAILURE_TIERS = {"ALERT", "REDUCED", "PAUSED", "PROBATION"}
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -97,3 +100,22 @@ def query_decisions(
         return result
     finally:
         conn.close()
+
+
+def compute_portfolio_aggregate(
+    per_symbol_tiers: dict[str, str],
+    concurrent_alert_threshold: int = 3,
+) -> dict[str, Any]:
+    """Compute the portfolio-level aggregate state from per-symbol tiers.
+
+    Phase 1 scope: concurrent-failure-count only. Real aggregate DD
+    computation (REDUCED/FROZEN thresholds) lands with B2 (portfolio
+    circuit breaker) in epic #187.
+
+    Returns {"tier": "NORMAL" | "WARNED", "concurrent_failures": int}.
+    """
+    failures = sum(
+        1 for t in per_symbol_tiers.values() if t in PORTFOLIO_FAILURE_TIERS
+    )
+    tier = "WARNED" if failures >= concurrent_alert_threshold else "NORMAL"
+    return {"tier": tier, "concurrent_failures": failures}
