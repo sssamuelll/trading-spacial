@@ -994,6 +994,30 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_health_events_symbol
             ON symbol_health_events(symbol, ts DESC)
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS kill_switch_decisions (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts              TEXT NOT NULL,
+            scan_id         INTEGER,
+            symbol          TEXT NOT NULL,
+            engine          TEXT NOT NULL,
+            per_symbol_tier TEXT NOT NULL,
+            portfolio_tier  TEXT NOT NULL,
+            velocity_active INTEGER DEFAULT 0,
+            size_factor     REAL NOT NULL,
+            skip            INTEGER NOT NULL,
+            reasons_json    TEXT,
+            slider_value    REAL
+        )
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ks_decisions_ts
+            ON kill_switch_decisions(ts)
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ks_decisions_symbol_ts
+            ON kill_switch_decisions(symbol, ts)
+    """)
     con.commit()
     con.close()
     log.info(f"DB inicializada: {DB_FILE}")
@@ -2122,6 +2146,32 @@ def post_notifications_read_all():
     from notifier._storage import mark_all_read
     n = mark_all_read()
     return {"ok": True, "marked": n}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  KILL SWITCH OBSERVABILITY ENDPOINTS (#187 phase 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/kill_switch/decisions", dependencies=[Depends(verify_api_key)])
+def get_kill_switch_decisions(
+    symbol: Optional[str] = None,
+    engine: Optional[str] = None,
+    since: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Kill switch decision log (#187 phase 1). Filter by symbol/engine/since ts."""
+    import observability
+    rows = observability.query_decisions(
+        symbol=symbol, engine=engine, since=since, limit=limit,
+    )
+    return {"decisions": rows}
+
+
+@app.get("/kill_switch/current_state", dependencies=[Depends(verify_api_key)])
+def get_kill_switch_current_state(engine: str = "v1"):
+    """Current tier state per symbol + portfolio aggregate (#187 phase 1)."""
+    import observability
+    return observability.get_current_state(engine=engine)
 
 
 @app.post("/health/reactivate/{symbol}", dependencies=[Depends(verify_api_key)])
