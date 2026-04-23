@@ -994,6 +994,30 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_health_events_symbol
             ON symbol_health_events(symbol, ts DESC)
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS kill_switch_decisions (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts              TEXT NOT NULL,
+            scan_id         INTEGER,
+            symbol          TEXT NOT NULL,
+            engine          TEXT NOT NULL,
+            per_symbol_tier TEXT NOT NULL,
+            portfolio_tier  TEXT NOT NULL,
+            velocity_active INTEGER DEFAULT 0,
+            size_factor     REAL NOT NULL,
+            skip            INTEGER NOT NULL,
+            reasons_json    TEXT,
+            slider_value    REAL
+        )
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ks_decisions_ts
+            ON kill_switch_decisions(ts)
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ks_decisions_symbol_ts
+            ON kill_switch_decisions(symbol, ts)
+    """)
     con.commit()
     con.close()
     log.info(f"DB inicializada: {DB_FILE}")
