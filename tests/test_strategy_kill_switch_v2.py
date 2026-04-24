@@ -488,3 +488,777 @@ def test_emit_shadow_warning_includes_traceback(tmp_path, monkeypatch, caplog, _
 
     # At least one record has exc_info (traceback) attached
     assert any(rec.exc_info is not None for rec in caplog.records)
+
+
+# ── B1: schema smoke test ───────────────────────────────────────────────────
+
+
+def test_init_db_creates_kill_switch_v2_state_table(tmp_path, monkeypatch):
+    """init_db must create kill_switch_v2_state with the expected columns."""
+    import btc_api
+    db_path = str(tmp_path / "signals.db")
+    monkeypatch.setattr(btc_api, "DB_FILE", db_path)
+    if hasattr(btc_api, "_db_conn"):
+        delattr(btc_api, "_db_conn")
+    btc_api.init_db()
+
+    conn = btc_api.get_db()
+    try:
+        cols = [r[1] for r in conn.execute(
+            "PRAGMA table_info(kill_switch_v2_state)"
+        ).fetchall()]
+    finally:
+        conn.close()
+
+    assert "symbol" in cols
+    assert "velocity_cooldown_until" in cols
+    assert "velocity_last_trigger_ts" in cols
+    assert "updated_at" in cols
+
+
+# ── B1: get_velocity_thresholds ─────────────────────────────────────────────
+
+
+def test_get_velocity_thresholds_slider_0_laxo():
+    from strategy.kill_switch_v2 import get_velocity_thresholds
+    cfg = {"kill_switch": {"v2": {
+        "aggressiveness": 0,
+        "thresholds": {
+            "velocity_sl_count":     {"min": 10, "max": 3},
+            "velocity_window_hours": {"min": 24, "max": 6},
+        },
+        "velocity_cooldown_hours": 4,
+    }}}
+    thr = get_velocity_thresholds(cfg)
+    assert thr["sl_count"] == 10
+    assert thr["window_hours"] == pytest.approx(24.0)
+    assert thr["cooldown_hours"] == pytest.approx(4.0)
+
+
+def test_get_velocity_thresholds_slider_100_paranoid():
+    from strategy.kill_switch_v2 import get_velocity_thresholds
+    cfg = {"kill_switch": {"v2": {
+        "aggressiveness": 100,
+        "thresholds": {
+            "velocity_sl_count":     {"min": 10, "max": 3},
+            "velocity_window_hours": {"min": 24, "max": 6},
+        },
+        "velocity_cooldown_hours": 4,
+    }}}
+    thr = get_velocity_thresholds(cfg)
+    assert thr["sl_count"] == 3
+    assert thr["window_hours"] == pytest.approx(6.0)
+
+
+def test_get_velocity_thresholds_slider_50_midpoint_rounds_sl_count():
+    from strategy.kill_switch_v2 import get_velocity_thresholds
+    cfg = {"kill_switch": {"v2": {
+        "aggressiveness": 50,
+        "thresholds": {
+            "velocity_sl_count":     {"min": 10, "max": 3},
+            "velocity_window_hours": {"min": 24, "max": 6},
+        },
+        "velocity_cooldown_hours": 4,
+    }}}
+    thr = get_velocity_thresholds(cfg)
+    # 10 + 0.5*(3-10) = 6.5 → round to 7 (round-half-to-even or plain round; pick one)
+    assert thr["sl_count"] == 7
+    assert thr["window_hours"] == pytest.approx(15.0)
+
+
+def test_get_velocity_thresholds_missing_config_uses_defaults():
+    from strategy.kill_switch_v2 import get_velocity_thresholds
+    thr = get_velocity_thresholds({})
+    # Defaults (slider=50, sl_count range 10→3, window 24→6, cooldown=4)
+    assert thr["sl_count"] == 7
+    assert thr["window_hours"] == pytest.approx(15.0)
+    assert thr["cooldown_hours"] == pytest.approx(4.0)
+
+
+# ── B1: detect_velocity_trigger ─────────────────────────────────────────────
+
+
+def test_detect_velocity_trigger_zero_sls_no_trigger():
+    from strategy.kill_switch_v2 import detect_velocity_trigger
+    from datetime import datetime, timezone
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    assert detect_velocity_trigger([], now, sl_count=3, window_hours=6.0) is False
+
+
+def test_detect_velocity_trigger_just_below_threshold():
+    from strategy.kill_switch_v2 import detect_velocity_trigger
+    from datetime import datetime, timezone, timedelta
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    sls = [
+        (now - timedelta(hours=1)).isoformat(),
+        (now - timedelta(hours=2)).isoformat(),
+    ]
+    assert detect_velocity_trigger(sls, now, sl_count=3, window_hours=6.0) is False
+
+
+def test_detect_velocity_trigger_at_threshold_fires():
+    from strategy.kill_switch_v2 import detect_velocity_trigger
+    from datetime import datetime, timezone, timedelta
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    sls = [
+        (now - timedelta(hours=1)).isoformat(),
+        (now - timedelta(hours=2)).isoformat(),
+        (now - timedelta(hours=3)).isoformat(),
+    ]
+    assert detect_velocity_trigger(sls, now, sl_count=3, window_hours=6.0) is True
+
+
+def test_detect_velocity_trigger_old_sls_outside_window_ignored():
+    from strategy.kill_switch_v2 import detect_velocity_trigger
+    from datetime import datetime, timezone, timedelta
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    sls = [
+        (now - timedelta(hours=10)).isoformat(),
+        (now - timedelta(hours=1)).isoformat(),
+        (now - timedelta(hours=2)).isoformat(),
+    ]
+    assert detect_velocity_trigger(sls, now, sl_count=3, window_hours=6.0) is False
+
+
+def test_detect_velocity_trigger_sl_at_exact_window_boundary_counts():
+    from strategy.kill_switch_v2 import detect_velocity_trigger
+    from datetime import datetime, timezone, timedelta
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    sls = [
+        (now - timedelta(hours=6)).isoformat(),
+        (now - timedelta(hours=1)).isoformat(),
+        (now - timedelta(hours=2)).isoformat(),
+    ]
+    assert detect_velocity_trigger(sls, now, sl_count=3, window_hours=6.0) is True
+
+
+def test_detect_velocity_trigger_handles_malformed_timestamps_gracefully():
+    from strategy.kill_switch_v2 import detect_velocity_trigger
+    from datetime import datetime, timezone, timedelta
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    sls = [
+        "not-a-timestamp",
+        (now - timedelta(hours=1)).isoformat(),
+        (now - timedelta(hours=2)).isoformat(),
+        (now - timedelta(hours=3)).isoformat(),
+    ]
+    assert detect_velocity_trigger(sls, now, sl_count=3, window_hours=6.0) is True
+
+
+# ── B1: compute_velocity_state ──────────────────────────────────────────────
+
+
+def test_compute_velocity_state_no_trigger_no_change():
+    from strategy.kill_switch_v2 import compute_velocity_state
+    from datetime import datetime, timezone
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    current = {"velocity_cooldown_until": None, "velocity_last_trigger_ts": None}
+    new = compute_velocity_state(current, triggered=False, now=now, cooldown_hours=4.0)
+    assert new == current
+
+
+def test_compute_velocity_state_first_trigger_sets_cooldown():
+    from strategy.kill_switch_v2 import compute_velocity_state
+    from datetime import datetime, timezone, timedelta
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    current = {"velocity_cooldown_until": None, "velocity_last_trigger_ts": None}
+    new = compute_velocity_state(current, triggered=True, now=now, cooldown_hours=4.0)
+    expected_until = (now + timedelta(hours=4)).isoformat()
+    assert new["velocity_cooldown_until"] == expected_until
+    assert new["velocity_last_trigger_ts"] == now.isoformat()
+
+
+def test_compute_velocity_state_retrigger_during_active_cooldown_no_extend():
+    """While cooldown is still active, re-trigger does NOT extend it (avoid flapping)."""
+    from strategy.kill_switch_v2 import compute_velocity_state
+    from datetime import datetime, timezone, timedelta
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    active_until = (now + timedelta(hours=2)).isoformat()
+    prior_trigger = (now - timedelta(hours=2)).isoformat()
+    current = {
+        "velocity_cooldown_until": active_until,
+        "velocity_last_trigger_ts": prior_trigger,
+    }
+    new = compute_velocity_state(current, triggered=True, now=now, cooldown_hours=4.0)
+    assert new == current
+
+
+def test_compute_velocity_state_retrigger_after_cooldown_resets():
+    """After cooldown_until has passed, a new trigger sets a fresh cooldown."""
+    from strategy.kill_switch_v2 import compute_velocity_state
+    from datetime import datetime, timezone, timedelta
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    expired_until = (now - timedelta(hours=1)).isoformat()
+    prior_trigger = (now - timedelta(hours=5)).isoformat()
+    current = {
+        "velocity_cooldown_until": expired_until,
+        "velocity_last_trigger_ts": prior_trigger,
+    }
+    new = compute_velocity_state(current, triggered=True, now=now, cooldown_hours=4.0)
+    expected_until = (now + timedelta(hours=4)).isoformat()
+    assert new["velocity_cooldown_until"] == expected_until
+    assert new["velocity_last_trigger_ts"] == now.isoformat()
+
+
+def test_compute_velocity_state_handles_malformed_cooldown_as_expired():
+    """If velocity_cooldown_until is a malformed string, treat as expired."""
+    from strategy.kill_switch_v2 import compute_velocity_state
+    from datetime import datetime, timezone, timedelta
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    current = {
+        "velocity_cooldown_until": "garbage",
+        "velocity_last_trigger_ts": None,
+    }
+    new = compute_velocity_state(current, triggered=True, now=now, cooldown_hours=4.0)
+    expected_until = (now + timedelta(hours=4)).isoformat()
+    assert new["velocity_cooldown_until"] == expected_until
+
+
+# ── B1: shadow DB glue ──────────────────────────────────────────────────────
+
+
+def test_load_recent_sl_timestamps_filters_by_symbol_and_reason(tmp_path, monkeypatch):
+    """Only closed positions with exit_reason='SL' for the target symbol within window."""
+    import btc_api
+    from strategy.kill_switch_v2_shadow import _load_recent_sl_timestamps
+    from datetime import datetime, timezone, timedelta
+
+    db_path = str(tmp_path / "signals.db")
+    monkeypatch.setattr(btc_api, "DB_FILE", db_path)
+    if hasattr(btc_api, "_db_conn"):
+        delattr(btc_api, "_db_conn")
+    btc_api.init_db()
+
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    inside1 = (now - timedelta(hours=1)).isoformat()
+    inside2 = (now - timedelta(hours=3)).isoformat()
+    outside = (now - timedelta(hours=10)).isoformat()
+
+    conn = btc_api.get_db()
+    try:
+        # BTC SL inside window — should count
+        conn.execute(
+            "INSERT INTO positions(symbol, direction, entry_price, qty, status, "
+            "entry_ts, exit_ts, exit_reason, pnl_usd) VALUES "
+            "('BTCUSDT', 'LONG', 50000, 0.01, 'closed', ?, ?, 'SL', -10.0)",
+            (inside1, inside1),
+        )
+        conn.execute(
+            "INSERT INTO positions(symbol, direction, entry_price, qty, status, "
+            "entry_ts, exit_ts, exit_reason, pnl_usd) VALUES "
+            "('BTCUSDT', 'LONG', 50000, 0.01, 'closed', ?, ?, 'SL', -10.0)",
+            (inside2, inside2),
+        )
+        # BTC SL outside window — skip
+        conn.execute(
+            "INSERT INTO positions(symbol, direction, entry_price, qty, status, "
+            "entry_ts, exit_ts, exit_reason, pnl_usd) VALUES "
+            "('BTCUSDT', 'LONG', 50000, 0.01, 'closed', ?, ?, 'SL', -10.0)",
+            (outside, outside),
+        )
+        # BTC TP inside window — skip (wrong exit_reason)
+        conn.execute(
+            "INSERT INTO positions(symbol, direction, entry_price, qty, status, "
+            "entry_ts, exit_ts, exit_reason, pnl_usd) VALUES "
+            "('BTCUSDT', 'LONG', 50000, 0.01, 'closed', ?, ?, 'TP', 30.0)",
+            (inside1, inside1),
+        )
+        # ETH SL inside window — skip (wrong symbol)
+        conn.execute(
+            "INSERT INTO positions(symbol, direction, entry_price, qty, status, "
+            "entry_ts, exit_ts, exit_reason, pnl_usd) VALUES "
+            "('ETHUSDT', 'LONG', 3000, 1.0, 'closed', ?, ?, 'SL', -20.0)",
+            (inside1, inside1),
+        )
+        # BTC still-open — skip (status != closed)
+        conn.execute(
+            "INSERT INTO positions(symbol, direction, entry_price, qty, status, "
+            "entry_ts) VALUES ('BTCUSDT', 'LONG', 50000, 0.01, 'open', ?)",
+            (inside1,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = _load_recent_sl_timestamps("BTCUSDT", now=now, window_hours=6.0)
+    assert len(result) == 2
+    assert set(result) == {inside1, inside2}
+
+
+def test_load_and_upsert_v2_state_roundtrip(tmp_path, monkeypatch):
+    import btc_api
+    from strategy.kill_switch_v2_shadow import _load_v2_state, _upsert_v2_state
+    from datetime import datetime, timezone
+
+    db_path = str(tmp_path / "signals.db")
+    monkeypatch.setattr(btc_api, "DB_FILE", db_path)
+    if hasattr(btc_api, "_db_conn"):
+        delattr(btc_api, "_db_conn")
+    btc_api.init_db()
+
+    assert _load_v2_state("BTCUSDT") == {
+        "velocity_cooldown_until": None,
+        "velocity_last_trigger_ts": None,
+    }
+
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    _upsert_v2_state("BTCUSDT", {
+        "velocity_cooldown_until": "2026-04-24T16:00:00+00:00",
+        "velocity_last_trigger_ts": "2026-04-24T12:00:00+00:00",
+    }, now=now)
+
+    reloaded = _load_v2_state("BTCUSDT")
+    assert reloaded["velocity_cooldown_until"] == "2026-04-24T16:00:00+00:00"
+    assert reloaded["velocity_last_trigger_ts"] == "2026-04-24T12:00:00+00:00"
+
+    _upsert_v2_state("BTCUSDT", {
+        "velocity_cooldown_until": "2026-04-24T20:00:00+00:00",
+        "velocity_last_trigger_ts": "2026-04-24T16:00:00+00:00",
+    }, now=now)
+
+    reloaded2 = _load_v2_state("BTCUSDT")
+    assert reloaded2["velocity_cooldown_until"] == "2026-04-24T20:00:00+00:00"
+
+
+# ── B1: emit_shadow_decision with velocity_active ───────────────────────────
+
+
+def test_emit_shadow_writes_velocity_active_true_on_trigger(
+    tmp_path, monkeypatch, _clean_shadow_cache,
+):
+    """3 BTC SLs in 6h with slider=100 (N=3) → velocity_active=1 in decision log."""
+    import btc_api, observability
+    from strategy.kill_switch_v2_shadow import emit_shadow_decision
+    from datetime import datetime, timezone, timedelta
+
+    db_path = str(tmp_path / "signals.db")
+    monkeypatch.setattr(btc_api, "DB_FILE", db_path)
+    if hasattr(btc_api, "_db_conn"):
+        delattr(btc_api, "_db_conn")
+    btc_api.init_db()
+
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    import strategy.kill_switch_v2_shadow as sh
+    monkeypatch.setattr(sh, "_now", lambda: now)
+
+    conn = btc_api.get_db()
+    try:
+        for i in range(3):
+            ts = (now - timedelta(hours=i + 1)).isoformat()
+            conn.execute(
+                "INSERT INTO positions(symbol, direction, entry_price, qty, status, "
+                "entry_ts, exit_ts, exit_reason, pnl_usd) VALUES "
+                "('BTCUSDT', 'LONG', 50000, 0.01, 'closed', ?, ?, 'SL', -10.0)",
+                (ts, ts),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    cfg = {"kill_switch": {"v2": {
+        "aggressiveness": 100,
+        "thresholds": {
+            "velocity_sl_count":     {"min": 10, "max": 3},
+            "velocity_window_hours": {"min": 24, "max": 6},
+            "portfolio_dd_reduced":  {"min": -0.08, "max": -0.03},
+            "portfolio_dd_frozen":   {"min": -0.15, "max": -0.06},
+        },
+        "velocity_cooldown_hours": 4,
+    }}}
+    emit_shadow_decision(symbol="BTCUSDT", cfg=cfg)
+
+    rows = observability.query_decisions(symbol="BTCUSDT", engine="v2_shadow")
+    assert len(rows) == 1
+    assert rows[0]["velocity_active"] is True
+
+    conn = btc_api.get_db()
+    try:
+        state_row = conn.execute(
+            "SELECT velocity_cooldown_until, velocity_last_trigger_ts "
+            "FROM kill_switch_v2_state WHERE symbol='BTCUSDT'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert state_row is not None
+    # cooldown_until == now + 4h exactly (guards against bugs that store a
+    # different field into the cooldown column)
+    from datetime import timedelta
+    assert state_row[0] == (now + timedelta(hours=4)).isoformat()
+    assert state_row[1] == now.isoformat()
+
+
+def test_emit_shadow_writes_velocity_active_false_when_below_threshold(
+    tmp_path, monkeypatch, _clean_shadow_cache,
+):
+    """2 BTC SLs with N=3 → no trigger, velocity_active=0, no state row."""
+    import btc_api, observability
+    from strategy.kill_switch_v2_shadow import emit_shadow_decision
+    from datetime import datetime, timezone, timedelta
+
+    db_path = str(tmp_path / "signals.db")
+    monkeypatch.setattr(btc_api, "DB_FILE", db_path)
+    if hasattr(btc_api, "_db_conn"):
+        delattr(btc_api, "_db_conn")
+    btc_api.init_db()
+
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    import strategy.kill_switch_v2_shadow as sh
+    monkeypatch.setattr(sh, "_now", lambda: now)
+
+    conn = btc_api.get_db()
+    try:
+        for i in range(2):
+            ts = (now - timedelta(hours=i + 1)).isoformat()
+            conn.execute(
+                "INSERT INTO positions(symbol, direction, entry_price, qty, status, "
+                "entry_ts, exit_ts, exit_reason, pnl_usd) VALUES "
+                "('BTCUSDT', 'LONG', 50000, 0.01, 'closed', ?, ?, 'SL', -10.0)",
+                (ts, ts),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    cfg = {"kill_switch": {"v2": {
+        "aggressiveness": 100,
+        "thresholds": {
+            "velocity_sl_count":     {"min": 10, "max": 3},
+            "velocity_window_hours": {"min": 24, "max": 6},
+        },
+        "velocity_cooldown_hours": 4,
+    }}}
+    emit_shadow_decision(symbol="BTCUSDT", cfg=cfg)
+
+    rows = observability.query_decisions(symbol="BTCUSDT", engine="v2_shadow")
+    assert rows[0]["velocity_active"] is False
+
+    conn = btc_api.get_db()
+    try:
+        state_row = conn.execute(
+            "SELECT * FROM kill_switch_v2_state WHERE symbol='BTCUSDT'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert state_row is None
+
+
+def test_emit_shadow_velocity_active_decays_after_cooldown_expires(
+    tmp_path, monkeypatch, _clean_shadow_cache,
+):
+    """Trigger → later scan after cooldown expires with no new SLs → velocity_active=False."""
+    import btc_api, observability
+    from strategy.kill_switch_v2_shadow import emit_shadow_decision
+    from datetime import datetime, timezone, timedelta
+
+    db_path = str(tmp_path / "signals.db")
+    monkeypatch.setattr(btc_api, "DB_FILE", db_path)
+    if hasattr(btc_api, "_db_conn"):
+        delattr(btc_api, "_db_conn")
+    btc_api.init_db()
+
+    cfg = {"kill_switch": {"v2": {
+        "aggressiveness": 100,
+        "thresholds": {
+            "velocity_sl_count":     {"min": 10, "max": 3},
+            "velocity_window_hours": {"min": 24, "max": 6},
+        },
+        "velocity_cooldown_hours": 4,
+    }}}
+
+    import strategy.kill_switch_v2_shadow as sh
+
+    t0 = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(sh, "_now", lambda: t0)
+    conn = btc_api.get_db()
+    try:
+        for i in range(3):
+            ts = (t0 - timedelta(hours=i + 1)).isoformat()
+            conn.execute(
+                "INSERT INTO positions(symbol, direction, entry_price, qty, status, "
+                "entry_ts, exit_ts, exit_reason, pnl_usd) VALUES "
+                "('BTCUSDT', 'LONG', 50000, 0.01, 'closed', ?, ?, 'SL', -10.0)",
+                (ts, ts),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    emit_shadow_decision(symbol="BTCUSDT", cfg=cfg)
+
+    t1 = t0 + timedelta(hours=10)
+    monkeypatch.setattr(sh, "_now", lambda: t1)
+    emit_shadow_decision(symbol="BTCUSDT", cfg=cfg)
+
+    rows = observability.query_decisions(symbol="BTCUSDT", engine="v2_shadow")
+    assert len(rows) == 2
+    # Rows ordered by ts DESC — latest first
+    assert rows[0]["velocity_active"] is False  # T1 scan
+    assert rows[1]["velocity_active"] is True   # T0 scan
+
+
+def test_emit_shadow_velocity_fail_open_on_internal_error(
+    tmp_path, monkeypatch, caplog, _clean_shadow_cache,
+):
+    """If velocity path raises, emit still writes the row with velocity_active=False."""
+    import btc_api, observability
+    from strategy.kill_switch_v2_shadow import emit_shadow_decision
+    import strategy.kill_switch_v2_shadow as sh
+
+    db_path = str(tmp_path / "signals.db")
+    monkeypatch.setattr(btc_api, "DB_FILE", db_path)
+    if hasattr(btc_api, "_db_conn"):
+        delattr(btc_api, "_db_conn")
+    btc_api.init_db()
+
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated velocity eval failure")
+
+    monkeypatch.setattr(sh, "_evaluate_velocity", _boom)
+
+    import logging
+    with caplog.at_level(logging.WARNING, logger="kill_switch_v2_shadow"):
+        emit_shadow_decision(symbol="BTCUSDT", cfg={})
+
+    rows = observability.query_decisions(symbol="BTCUSDT", engine="v2_shadow")
+    assert len(rows) == 1
+    assert rows[0]["velocity_active"] is False
+    assert any(
+        "B1 velocity eval failed" in rec.getMessage() for rec in caplog.records
+    )
+
+
+# ── B1: review follow-ups — hardening tests ─────────────────────────────────
+
+
+def test_emit_shadow_cooldown_boundary_at_exact_equality_is_expired(
+    tmp_path, monkeypatch, _clean_shadow_cache,
+):
+    """Policy: at now == cooldown_until, cooldown is expired (parsed > now is exclusive)."""
+    import btc_api, observability
+    from strategy.kill_switch_v2_shadow import (
+        emit_shadow_decision, _upsert_v2_state,
+    )
+    from datetime import datetime, timezone, timedelta
+
+    db_path = str(tmp_path / "signals.db")
+    monkeypatch.setattr(btc_api, "DB_FILE", db_path)
+    if hasattr(btc_api, "_db_conn"):
+        delattr(btc_api, "_db_conn")
+    btc_api.init_db()
+
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    import strategy.kill_switch_v2_shadow as sh
+    monkeypatch.setattr(sh, "_now", lambda: now)
+
+    # Seed a state row whose cooldown expires EXACTLY at `now`.
+    _upsert_v2_state("BTCUSDT", {
+        "velocity_cooldown_until": now.isoformat(),
+        "velocity_last_trigger_ts": (now - timedelta(hours=4)).isoformat(),
+    }, now=now)
+
+    # No new SLs → detector returns False → compute_velocity_state leaves state
+    # unchanged → _evaluate_velocity returns parsed > now → False.
+    emit_shadow_decision(symbol="BTCUSDT", cfg={})
+
+    rows = observability.query_decisions(symbol="BTCUSDT", engine="v2_shadow")
+    assert rows[0]["velocity_active"] is False
+
+
+def test_emit_shadow_does_not_touch_v1_decisions(
+    tmp_path, monkeypatch, _clean_shadow_cache,
+):
+    """Shadow mode invariant: emitting v2_shadow must not mutate any v1 row."""
+    import btc_api, observability
+    from strategy.kill_switch_v2_shadow import emit_shadow_decision
+    from datetime import datetime, timezone, timedelta
+
+    db_path = str(tmp_path / "signals.db")
+    monkeypatch.setattr(btc_api, "DB_FILE", db_path)
+    if hasattr(btc_api, "_db_conn"):
+        delattr(btc_api, "_db_conn")
+    btc_api.init_db()
+
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    import strategy.kill_switch_v2_shadow as sh
+    monkeypatch.setattr(sh, "_now", lambda: now)
+
+    # Seed one v1 decision row
+    observability.record_decision(
+        symbol="BTCUSDT", engine="v1",
+        per_symbol_tier="NORMAL", portfolio_tier="NORMAL",
+        size_factor=1.0, skip=False, reasons={"health_state": "NORMAL"},
+        scan_id=None, slider_value=None, velocity_active=False,
+    )
+
+    # Snapshot v1 rows BEFORE shadow emission
+    v1_before = observability.query_decisions(symbol="BTCUSDT", engine="v1")
+    assert len(v1_before) == 1
+
+    # Seed 3 BTC SLs so velocity triggers in shadow
+    conn = btc_api.get_db()
+    try:
+        for i in range(3):
+            ts = (now - timedelta(hours=i + 1)).isoformat()
+            conn.execute(
+                "INSERT INTO positions(symbol, direction, entry_price, qty, "
+                "status, entry_ts, exit_ts, exit_reason, pnl_usd) VALUES "
+                "('BTCUSDT', 'LONG', 50000, 0.01, 'closed', ?, ?, 'SL', -10.0)",
+                (ts, ts),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    cfg = {"kill_switch": {"v2": {
+        "aggressiveness": 100,
+        "thresholds": {
+            "velocity_sl_count":     {"min": 10, "max": 3},
+            "velocity_window_hours": {"min": 24, "max": 6},
+        },
+        "velocity_cooldown_hours": 4,
+    }}}
+    emit_shadow_decision(symbol="BTCUSDT", cfg=cfg)
+
+    # Assert v1 rows unchanged
+    v1_after = observability.query_decisions(symbol="BTCUSDT", engine="v1")
+    assert v1_after == v1_before, "v2_shadow must not mutate v1 decision rows"
+
+
+def test_emit_shadow_multi_symbol_state_is_independent(
+    tmp_path, monkeypatch, _clean_shadow_cache,
+):
+    """BTC in cooldown must not leak into ETH's evaluation."""
+    import btc_api, observability
+    from strategy.kill_switch_v2_shadow import emit_shadow_decision, _upsert_v2_state
+    from datetime import datetime, timezone, timedelta
+
+    db_path = str(tmp_path / "signals.db")
+    monkeypatch.setattr(btc_api, "DB_FILE", db_path)
+    if hasattr(btc_api, "_db_conn"):
+        delattr(btc_api, "_db_conn")
+    btc_api.init_db()
+
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    import strategy.kill_switch_v2_shadow as sh
+    monkeypatch.setattr(sh, "_now", lambda: now)
+
+    # Seed BTC in active cooldown (no ETH state)
+    _upsert_v2_state("BTCUSDT", {
+        "velocity_cooldown_until": (now + timedelta(hours=2)).isoformat(),
+        "velocity_last_trigger_ts": (now - timedelta(hours=2)).isoformat(),
+    }, now=now)
+
+    # ETH has no SLs, no state → eval should see clean slate
+    cfg = {"kill_switch": {"v2": {
+        "aggressiveness": 100,
+        "thresholds": {
+            "velocity_sl_count":     {"min": 10, "max": 3},
+            "velocity_window_hours": {"min": 24, "max": 6},
+        },
+        "velocity_cooldown_hours": 4,
+    }}}
+    emit_shadow_decision(symbol="ETHUSDT", cfg=cfg)
+
+    rows = observability.query_decisions(symbol="ETHUSDT", engine="v2_shadow")
+    assert rows[0]["velocity_active"] is False
+
+    # ETH state row should NOT exist (no trigger, nothing written)
+    conn = btc_api.get_db()
+    try:
+        eth_row = conn.execute(
+            "SELECT * FROM kill_switch_v2_state WHERE symbol='ETHUSDT'"
+        ).fetchone()
+        # BTC row should still be intact
+        btc_row = conn.execute(
+            "SELECT velocity_cooldown_until FROM kill_switch_v2_state "
+            "WHERE symbol='BTCUSDT'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert eth_row is None, "ETH eval must not create a state row when nothing triggers"
+    assert btc_row[0] == (now + timedelta(hours=2)).isoformat(), \
+        "BTC state must be untouched by ETH evaluation"
+
+
+def test_emit_shadow_partial_write_state_persists_when_record_decision_fails(
+    tmp_path, monkeypatch, _clean_shadow_cache, caplog,
+):
+    """If record_decision raises AFTER state upsert, state persists but no decision row.
+
+    Documents the current 'more conservative than the log' semantics: next
+    scan re-reads the persisted cooldown and still reports velocity_active=True.
+    This is acceptable for shadow mode (never-trigger is worse than over-trigger).
+    """
+    import btc_api, observability
+    from strategy.kill_switch_v2_shadow import emit_shadow_decision
+    from datetime import datetime, timezone, timedelta
+
+    db_path = str(tmp_path / "signals.db")
+    monkeypatch.setattr(btc_api, "DB_FILE", db_path)
+    if hasattr(btc_api, "_db_conn"):
+        delattr(btc_api, "_db_conn")
+    btc_api.init_db()
+
+    now = datetime(2026, 4, 24, 12, 0, tzinfo=timezone.utc)
+    import strategy.kill_switch_v2_shadow as sh
+    monkeypatch.setattr(sh, "_now", lambda: now)
+
+    # Seed 3 BTC SLs → velocity eval will trigger and upsert state
+    conn = btc_api.get_db()
+    try:
+        for i in range(3):
+            ts = (now - timedelta(hours=i + 1)).isoformat()
+            conn.execute(
+                "INSERT INTO positions(symbol, direction, entry_price, qty, "
+                "status, entry_ts, exit_ts, exit_reason, pnl_usd) VALUES "
+                "('BTCUSDT', 'LONG', 50000, 0.01, 'closed', ?, ?, 'SL', -10.0)",
+                (ts, ts),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Make record_decision raise (simulates a downstream failure after state
+    # has already been upserted)
+    import observability as obs_mod
+    original = obs_mod.record_decision
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated record_decision failure")
+    monkeypatch.setattr(obs_mod, "record_decision", _boom)
+
+    cfg = {"kill_switch": {"v2": {
+        "aggressiveness": 100,
+        "thresholds": {
+            "velocity_sl_count":     {"min": 10, "max": 3},
+            "velocity_window_hours": {"min": 24, "max": 6},
+        },
+        "velocity_cooldown_hours": 4,
+    }}}
+
+    import logging
+    with caplog.at_level(logging.WARNING, logger="kill_switch_v2_shadow"):
+        emit_shadow_decision(symbol="BTCUSDT", cfg=cfg)
+
+    # No decision row (record_decision failed)
+    monkeypatch.setattr(obs_mod, "record_decision", original)
+    rows = observability.query_decisions(symbol="BTCUSDT", engine="v2_shadow")
+    assert len(rows) == 0, "record_decision failure must not leave a v2_shadow row"
+
+    # But state IS persisted (upsert happened before record_decision)
+    conn = btc_api.get_db()
+    try:
+        state_row = conn.execute(
+            "SELECT velocity_cooldown_until "
+            "FROM kill_switch_v2_state WHERE symbol='BTCUSDT'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert state_row is not None, (
+        "State upsert commits before record_decision; this is expected and "
+        "documented (shadow is more conservative than the log — next scan "
+        "reconciles by reading the persisted cooldown)"
+    )
+    # Outer try/except in emit_shadow_decision swallowed the RuntimeError
+    assert any(
+        "emit_shadow_decision failed" in rec.getMessage()
+        for rec in caplog.records
+    )

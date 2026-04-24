@@ -11,13 +11,19 @@ under kill_switch.v2.thresholds.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+log = logging.getLogger("kill_switch_v2")
 
 
 # Defaults (match config.defaults.json). Used as fallback when config is incomplete.
 _DEFAULT_AGGRESSIVENESS = 50.0
 _DEFAULT_DD_REDUCED = {"min": -0.08, "max": -0.03}
 _DEFAULT_DD_FROZEN = {"min": -0.15, "max": -0.06}
+_DEFAULT_VELOCITY_SL_COUNT = {"min": 10, "max": 3}
+_DEFAULT_VELOCITY_WINDOW_HOURS = {"min": 24, "max": 6}
+_DEFAULT_VELOCITY_COOLDOWN_HOURS = 4.0
 
 
 def interpolate_threshold(slider: float, t_min: float, t_max: float) -> float:
@@ -53,6 +59,41 @@ def get_portfolio_thresholds(cfg: dict[str, Any]) -> dict[str, float]:
         "frozen_dd": interpolate_threshold(
             slider, frozen_range["min"], frozen_range["max"]
         ),
+    }
+
+
+def get_velocity_thresholds(cfg: dict[str, Any]) -> dict[str, float]:
+    """Extract slider-adjusted velocity trigger thresholds.
+
+    Returns:
+        {"sl_count": int, "window_hours": float, "cooldown_hours": float}
+
+    sl_count is rounded to nearest int (half-up); window_hours stays float for
+    granularity. cooldown_hours is a fixed value (not interpolated).
+    """
+    import math
+    v2_cfg = (cfg.get("kill_switch", {}) or {}).get("v2", {}) or {}
+    slider = v2_cfg.get("aggressiveness", _DEFAULT_AGGRESSIVENESS)
+    thresholds_cfg = v2_cfg.get("thresholds", {}) or {}
+
+    sl_count_range = thresholds_cfg.get("velocity_sl_count") or _DEFAULT_VELOCITY_SL_COUNT
+    window_range = thresholds_cfg.get("velocity_window_hours") or _DEFAULT_VELOCITY_WINDOW_HOURS
+    cooldown_hours = float(
+        v2_cfg.get("velocity_cooldown_hours", _DEFAULT_VELOCITY_COOLDOWN_HOURS)
+    )
+
+    sl_count_raw = interpolate_threshold(
+        slider, sl_count_range["min"], sl_count_range["max"],
+    )
+    # Half-up rounding so slider=50 on (10→3) → 6.5 → 7 (not 6 via banker's rounding)
+    sl_count = int(math.floor(sl_count_raw + 0.5))
+
+    return {
+        "sl_count": sl_count,
+        "window_hours": float(
+            interpolate_threshold(slider, window_range["min"], window_range["max"])
+        ),
+        "cooldown_hours": cooldown_hours,
     }
 
 
@@ -165,4 +206,89 @@ def evaluate_portfolio_tier(
         "concurrent_failures": concurrent_failures,
         "reduced_threshold": thresholds["reduced_dd"],
         "frozen_threshold": thresholds["frozen_dd"],
+    }
+
+
+def detect_velocity_trigger(
+    sl_timestamps: list[str],
+    now: "datetime",
+    sl_count: int,
+    window_hours: float,
+) -> bool:
+    """True if at least `sl_count` SLs fall within `window_hours` before `now`.
+
+    Malformed timestamps (not ISO-parseable) are skipped; a single aggregated
+    warning is logged per call if any were skipped. The window boundary is
+    inclusive: an SL exactly `window_hours` ago counts.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    if sl_count <= 0:
+        return False
+    cutoff = now - timedelta(hours=float(window_hours))
+    count = 0
+    skipped = 0
+    for ts in sl_timestamps:
+        try:
+            parsed = datetime.fromisoformat(ts)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            skipped += 1
+            continue
+        if cutoff <= parsed <= now:
+            count += 1
+            if count >= sl_count:
+                break
+    if skipped:
+        log.warning(
+            "detect_velocity_trigger skipped %d malformed timestamp(s) "
+            "during the velocity check", skipped,
+        )
+    return count >= sl_count
+
+
+def compute_velocity_state(
+    current_state: dict[str, Any],
+    triggered: bool,
+    now: "datetime",
+    cooldown_hours: float,
+) -> dict[str, Any]:
+    """Decide the new velocity state given current state + trigger outcome.
+
+    Rules:
+    - If triggered AND cooldown expired/absent → set fresh cooldown & last_trigger.
+    - If triggered AND cooldown still active → leave unchanged (avoid flapping).
+    - If not triggered → leave unchanged.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    cur_until = current_state.get("velocity_cooldown_until")
+    cur_last = current_state.get("velocity_last_trigger_ts")
+
+    if not triggered:
+        return {"velocity_cooldown_until": cur_until, "velocity_last_trigger_ts": cur_last}
+
+    cooldown_active = False
+    if cur_until:
+        try:
+            parsed = datetime.fromisoformat(cur_until)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            cooldown_active = parsed > now
+        except (TypeError, ValueError):
+            log.warning(
+                "compute_velocity_state: malformed velocity_cooldown_until=%r "
+                "(last_trigger=%r); treating as expired and resetting",
+                cur_until, cur_last,
+            )
+            cooldown_active = False
+
+    if cooldown_active:
+        return {"velocity_cooldown_until": cur_until, "velocity_last_trigger_ts": cur_last}
+
+    new_until = (now + timedelta(hours=float(cooldown_hours))).isoformat()
+    return {
+        "velocity_cooldown_until": new_until,
+        "velocity_last_trigger_ts": now.isoformat(),
     }

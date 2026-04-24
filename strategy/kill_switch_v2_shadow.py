@@ -25,6 +25,12 @@ _DEFAULT_CAPITAL_USD = 1000.0
 _PRICE_CACHE: dict[str, float] = {}
 
 
+def _now():
+    """Indirection seam so tests can monkeypatch the current time."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)
+
+
 def update_price(symbol: str, price: float) -> None:
     """Record the latest scanned price so MTM can see every open symbol."""
     _PRICE_CACHE[symbol] = float(price)
@@ -84,6 +90,124 @@ def _count_concurrent_failures() -> int:
     return int(portfolio.get("concurrent_failures", 0))
 
 
+def _load_recent_sl_timestamps(
+    symbol: str, now, window_hours: float
+) -> list[str]:
+    """Load exit_ts of closed positions with exit_reason='SL' for a symbol within window."""
+    from datetime import timedelta
+    import btc_api
+    cutoff = (now - timedelta(hours=float(window_hours))).isoformat()
+    conn = btc_api.get_db()
+    try:
+        rows = conn.execute(
+            """SELECT exit_ts
+               FROM positions
+               WHERE symbol = ?
+                 AND status = 'closed'
+                 AND exit_reason = 'SL'
+                 AND exit_ts IS NOT NULL
+                 AND exit_ts >= ?""",
+            (symbol, cutoff),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [r[0] for r in rows if r[0]]
+
+
+def _load_v2_state(symbol: str) -> dict[str, Any]:
+    """Load per-symbol v2 state. Returns keys with None defaults if row missing."""
+    import btc_api
+    conn = btc_api.get_db()
+    try:
+        row = conn.execute(
+            """SELECT velocity_cooldown_until, velocity_last_trigger_ts
+               FROM kill_switch_v2_state
+               WHERE symbol = ?""",
+            (symbol,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return {
+            "velocity_cooldown_until": None,
+            "velocity_last_trigger_ts": None,
+        }
+    return {
+        "velocity_cooldown_until": row[0],
+        "velocity_last_trigger_ts": row[1],
+    }
+
+
+def _upsert_v2_state(symbol: str, state: dict[str, Any], now) -> None:
+    """Upsert v2 state for a symbol. updated_at is set to now.isoformat()."""
+    import btc_api
+    conn = btc_api.get_db()
+    try:
+        conn.execute(
+            """INSERT INTO kill_switch_v2_state
+                 (symbol, velocity_cooldown_until, velocity_last_trigger_ts, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(symbol) DO UPDATE SET
+                 velocity_cooldown_until = excluded.velocity_cooldown_until,
+                 velocity_last_trigger_ts = excluded.velocity_last_trigger_ts,
+                 updated_at = excluded.updated_at""",
+            (
+                symbol,
+                state.get("velocity_cooldown_until"),
+                state.get("velocity_last_trigger_ts"),
+                now.isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _evaluate_velocity(symbol: str, cfg: dict[str, Any]) -> bool:
+    """Evaluate B1 velocity triggers for a symbol.
+
+    Loads recent SLs, reads/updates v2 state, returns whether the cooldown
+    is currently active. Caller is responsible for fail-open wrapping; this
+    function may raise.
+    """
+    from strategy.kill_switch_v2 import (
+        get_velocity_thresholds,
+        detect_velocity_trigger,
+        compute_velocity_state,
+    )
+    from datetime import datetime, timezone
+
+    now = _now()
+    thresholds = get_velocity_thresholds(cfg)
+
+    sl_timestamps = _load_recent_sl_timestamps(
+        symbol, now=now, window_hours=thresholds["window_hours"],
+    )
+    current_state = _load_v2_state(symbol)
+    triggered = detect_velocity_trigger(
+        sl_timestamps, now,
+        sl_count=thresholds["sl_count"],
+        window_hours=thresholds["window_hours"],
+    )
+    new_state = compute_velocity_state(
+        current_state, triggered=triggered, now=now,
+        cooldown_hours=thresholds["cooldown_hours"],
+    )
+    if new_state != current_state:
+        _upsert_v2_state(symbol, new_state, now=now)
+
+    cooldown = new_state.get("velocity_cooldown_until")
+    if not cooldown:
+        return False
+    try:
+        parsed = datetime.fromisoformat(cooldown)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed > now
+    except (TypeError, ValueError):
+        return False
+
+
 def emit_shadow_decision(
     symbol: str,
     cfg: dict[str, Any],
@@ -128,6 +252,15 @@ def emit_shadow_decision(
         v2_cfg = (cfg.get("kill_switch", {}) or {}).get("v2", {}) or {}
         slider = float(v2_cfg.get("aggressiveness", 50.0))
 
+        # B1 velocity triggers — fail-open; defaults to False if anything raises.
+        try:
+            velocity_active = _evaluate_velocity(symbol, cfg)
+        except Exception as _ve:
+            log.warning(
+                "B1 velocity eval failed for %s: %s", symbol, _ve, exc_info=True,
+            )
+            velocity_active = False
+
         observability.record_decision(
             symbol=symbol,
             engine="v2_shadow",
@@ -143,7 +276,7 @@ def emit_shadow_decision(
             },
             scan_id=None,
             slider_value=slider,
-            velocity_active=False,
+            velocity_active=velocity_active,
         )
     except Exception as e:
         log.warning(
