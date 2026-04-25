@@ -27,6 +27,9 @@ _DEFAULT_VELOCITY_COOLDOWN_HOURS = 4.0
 _DEFAULT_REGIME_BULL_BONUS = 10.0
 _DEFAULT_REGIME_BEAR_PENALTY = 10.0
 _DEFAULT_REGIME_ADJUSTMENT_ENABLED = True
+_DEFAULT_BASELINE_SIGMA_MULTIPLIER = {"min": 3.0, "max": 1.0}
+_DEFAULT_BASELINE_MIN_TRADES = 100
+_DEFAULT_BASELINE_STALE_DAYS = 7
 
 
 def interpolate_threshold(slider: float, t_min: float, t_max: float) -> float:
@@ -356,3 +359,90 @@ def apply_regime_adjustment(
 
     v2["aggressiveness"] = max(0.0, min(100.0, new_slider))
     return cfg_eff
+
+
+def compute_baseline_metrics(closed_trades: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute per-symbol baseline metrics from a list of closed trades.
+
+    Args:
+        closed_trades: list of dicts with key `pnl_usd`. Other keys ignored.
+                       Trades with `pnl_usd is None` are skipped.
+
+    Returns:
+        {"wr": float, "sigma": float, "count": int}
+        - wr = wins / count where win = pnl_usd > 0 (breakeven 0.0 is a loss)
+        - sigma = sqrt(wr * (1 - wr)) — Bernoulli per-trade std dev
+        - count = number of trades with non-None pnl_usd
+
+    Empty input or all-None pnl → {"wr": 0.0, "sigma": 0.0, "count": 0}.
+    """
+    import math
+
+    valid = [t for t in closed_trades if t.get("pnl_usd") is not None]
+    count = len(valid)
+    if count == 0:
+        return {"wr": 0.0, "sigma": 0.0, "count": 0}
+
+    wins = sum(1 for t in valid if t["pnl_usd"] > 0)
+    wr = wins / count
+    sigma = math.sqrt(wr * (1.0 - wr))
+    return {"wr": wr, "sigma": sigma, "count": count}
+
+
+def get_baseline_sigma_multiplier(cfg: dict[str, Any]) -> float:
+    """Slider-derived sigma multiplier (N) for ALERT threshold.
+
+    Reuses interpolate_threshold; range default {min: 3.0, max: 1.0}.
+    slider=0   → 3.0 (laxo, only extreme events trigger ALERT).
+    slider=50  → 2.0 (default 2-sigma, 95% CI).
+    slider=100 → 1.0 (paranoid, mild deviation triggers).
+    """
+    v2_cfg = (cfg.get("kill_switch", {}) or {}).get("v2", {}) or {}
+    slider = v2_cfg.get("aggressiveness", _DEFAULT_AGGRESSIVENESS)
+    thresholds_cfg = v2_cfg.get("thresholds", {}) or {}
+    sigma_range = (
+        thresholds_cfg.get("baseline_sigma_multiplier")
+        or _DEFAULT_BASELINE_SIGMA_MULTIPLIER
+    )
+    return interpolate_threshold(slider, sigma_range["min"], sigma_range["max"])
+
+
+def evaluate_per_symbol_tier(
+    rolling_wr_20: float | None,
+    baseline: dict[str, Any],
+    sigma_multiplier: float,
+    trades_count: int,
+    min_trades: int,
+) -> str:
+    """Decide per-symbol tier from baseline + recent performance.
+
+    Returns "NORMAL" or "ALERT".
+
+    Rules (in priority order):
+    1. trades_count < min_trades → "NORMAL" (insufficient evidence to calibrate).
+    2. rolling_wr_20 is None → "NORMAL" (no recent activity).
+    3. rolling_wr_20 < baseline.wr - sigma_multiplier * (baseline.sigma / sqrt(20))
+       → "ALERT".
+    4. else → "NORMAL".
+
+    The denominator sqrt(20) converts per-trade σ to the std dev of a
+    20-trade rolling-mean estimator (central limit theorem).
+
+    Boundary semantics: rolling_wr exactly equal to the threshold is NORMAL
+    (strict `<` triggers ALERT).
+    """
+    import math
+
+    if trades_count < min_trades:
+        return "NORMAL"
+    if rolling_wr_20 is None:
+        return "NORMAL"
+
+    baseline_wr = float(baseline.get("wr", 0.0))
+    baseline_sigma = float(baseline.get("sigma", 0.0))
+    window_sigma = baseline_sigma / math.sqrt(20)
+    threshold = baseline_wr - float(sigma_multiplier) * window_sigma
+
+    if rolling_wr_20 < threshold:
+        return "ALERT"
+    return "NORMAL"

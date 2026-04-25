@@ -208,6 +208,185 @@ def _evaluate_velocity(symbol: str, cfg: dict[str, Any]) -> bool:
         return False
 
 
+def _load_closed_trades_for_symbol(symbol: str) -> list[dict[str, Any]]:
+    """Load closed positions for a symbol with non-NULL exit_ts."""
+    import btc_api
+    conn = btc_api.get_db()
+    try:
+        rows = conn.execute(
+            """SELECT exit_ts, pnl_usd
+               FROM positions
+               WHERE symbol = ?
+                 AND status = 'closed'
+                 AND exit_ts IS NOT NULL
+               ORDER BY exit_ts""",
+            (symbol,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [{"exit_ts": r[0], "pnl_usd": r[1]} for r in rows]
+
+
+def _load_baseline(symbol: str) -> dict[str, Any] | None:
+    """Load per-symbol baseline. Returns None if no row exists."""
+    import btc_api
+    conn = btc_api.get_db()
+    try:
+        row = conn.execute(
+            """SELECT baseline_wr, baseline_sigma, trades_count, computed_at
+               FROM kill_switch_v2_baseline
+               WHERE symbol = ?""",
+            (symbol,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return {
+        "wr": row[0],
+        "sigma": row[1],
+        "count": row[2],
+        "computed_at": row[3],
+    }
+
+
+def _upsert_baseline(symbol: str, baseline: dict[str, Any], now) -> None:
+    """Upsert per-symbol baseline. computed_at is set to now.isoformat().
+
+    Validates that baseline has the three required keys; raises KeyError on
+    missing keys instead of silently coercing to 0.0 (which would mask an
+    upstream bug producing an empty baseline dict).
+    """
+    import btc_api
+
+    missing = [k for k in ("wr", "sigma", "count") if k not in baseline]
+    if missing:
+        raise KeyError(
+            f"_upsert_baseline: baseline dict missing required keys: {missing}"
+        )
+
+    conn = btc_api.get_db()
+    try:
+        conn.execute(
+            """INSERT INTO kill_switch_v2_baseline
+                 (symbol, baseline_wr, baseline_sigma, trades_count, computed_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(symbol) DO UPDATE SET
+                 baseline_wr = excluded.baseline_wr,
+                 baseline_sigma = excluded.baseline_sigma,
+                 trades_count = excluded.trades_count,
+                 computed_at = excluded.computed_at""",
+            (
+                symbol,
+                float(baseline["wr"]),
+                float(baseline["sigma"]),
+                int(baseline["count"]),
+                now.isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _is_baseline_stale(
+    computed_at: str | None, stale_days: float, now,
+) -> bool:
+    """Return True if the baseline is missing, malformed, in the future, or
+    older than stale_days.
+
+    A future timestamp (parsed > now) is treated as stale to guard against
+    clock skew or a buggy writer; otherwise the bogus future timestamp would
+    suppress recompute indefinitely.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    if not computed_at:
+        return True
+    try:
+        parsed = datetime.fromisoformat(computed_at)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return True
+    if parsed > now:
+        return True
+    return (now - parsed) > timedelta(days=float(stale_days))
+
+
+def _evaluate_per_symbol_tier_with_telemetry(
+    symbol: str, cfg: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Evaluate B4a per-symbol tier (NORMAL or ALERT) with full telemetry.
+
+    Lazy-refresh logic: if the cached baseline is missing or older than
+    `baseline_stale_days`, recompute from positions and upsert. If fresh,
+    reuse cached.
+
+    Returns:
+        (tier, telemetry) where telemetry contains the inputs the dashboard
+        needs to explain the decision (baseline_wr, sigma, rolling_wr,
+        sigma_multiplier, trades_count, baseline_stale, status="ok").
+
+    This function may raise on DB errors / malformed data — caller is
+    responsible for fail-open wrapping.
+    """
+    from strategy.kill_switch_v2 import (
+        compute_baseline_metrics,
+        evaluate_per_symbol_tier,
+        get_baseline_sigma_multiplier,
+    )
+    from health import compute_rolling_metrics_from_trades
+
+    now = _now()
+
+    v2_cfg = (cfg.get("kill_switch", {}) or {}).get("v2", {}) or {}
+    min_trades = int(v2_cfg.get("baseline_min_trades", 100))
+    stale_days = float(v2_cfg.get("baseline_stale_days", 7))
+
+    closed_trades = _load_closed_trades_for_symbol(symbol)
+
+    cached = _load_baseline(symbol)
+    baseline_was_stale = cached is None or _is_baseline_stale(
+        cached.get("computed_at") if cached else None, stale_days, now,
+    )
+
+    if baseline_was_stale:
+        baseline = compute_baseline_metrics(closed_trades)
+        _upsert_baseline(symbol, baseline, now=now)
+    else:
+        baseline = {
+            "wr": cached["wr"],
+            "sigma": cached["sigma"],
+            "count": cached["count"],
+        }
+
+    rolling = compute_rolling_metrics_from_trades(closed_trades, now=now)
+    rolling_wr_20 = rolling.get("win_rate_20_trades")
+
+    sigma_multiplier = get_baseline_sigma_multiplier(cfg)
+
+    tier = evaluate_per_symbol_tier(
+        rolling_wr_20=rolling_wr_20,
+        baseline=baseline,
+        sigma_multiplier=sigma_multiplier,
+        trades_count=baseline["count"],
+        min_trades=min_trades,
+    )
+
+    telemetry = {
+        "tier": tier,
+        "status": "ok",
+        "baseline_wr": baseline["wr"],
+        "baseline_sigma": baseline["sigma"],
+        "rolling_wr_20": rolling_wr_20,
+        "sigma_multiplier": sigma_multiplier,
+        "trades_count": baseline["count"],
+        "baseline_stale": baseline_was_stale,
+    }
+    return tier, telemetry
+
+
 def emit_shadow_decision(
     symbol: str,
     cfg: dict[str, Any],
@@ -292,10 +471,32 @@ def emit_shadow_decision(
             )
             velocity_active = False
 
+        # B4a per-symbol tier — fail-open; defaults to NORMAL with status=failed.
+        try:
+            per_symbol_tier, per_symbol_telemetry = (
+                _evaluate_per_symbol_tier_with_telemetry(symbol, cfg_eff)
+            )
+        except Exception as _pe:
+            log.warning(
+                "B4a per-symbol tier eval failed for %s: %s",
+                symbol, _pe, exc_info=True,
+            )
+            per_symbol_tier = "NORMAL"
+            per_symbol_telemetry = {
+                "tier": "NORMAL",
+                "status": "failed",
+                "baseline_wr": None,
+                "baseline_sigma": None,
+                "rolling_wr_20": None,
+                "sigma_multiplier": None,
+                "trades_count": 0,
+                "baseline_stale": None,
+            }
+
         observability.record_decision(
             symbol=symbol,
             engine="v2_shadow",
-            per_symbol_tier="NORMAL",
+            per_symbol_tier=per_symbol_tier,
             portfolio_tier=portfolio["tier"],
             size_factor=1.0,
             skip=False,
@@ -313,6 +514,7 @@ def emit_shadow_decision(
                     "enabled": regime_enabled,
                     "adjustment_status": _regime_adjustment_status,
                 },
+                "per_symbol": per_symbol_telemetry,
             },
             scan_id=None,
             slider_value=slider_effective,
