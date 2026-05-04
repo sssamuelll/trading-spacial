@@ -145,6 +145,21 @@ The repo contains a **locked holdout dataset** at `data/holdout/` that must NOT 
 ### Caveats heredados — A.4 (#250) MUST honor
 
 1. **Re-tune required.** The current `atr_sl_mult/tp/be` were tuned over the full history including the holdout range. A.4 must re-tune over `[earliest, holdout_start - 1 bar]` BEFORE evaluating against the holdout (else: leakage).
+
+   **Audit of leakage scope** (verified 5 mayo 2026 in spec D9 §2.9 amendment review):
+
+   | Param | Source | Window | Leaked into holdout? |
+   |-------|--------|--------|----------------------|
+   | ATR multipliers (10 × {sl, tp, be} = 30 values) | Iterative tuning pre-A.4 (#121 + iterations) | Full history (incl. holdout range) | **YES** — being fixed by A.4-1 |
+   | Time-limits per-symbol (10) | #281 diagnostic, "winner-median holding" + research §5 | `[2023-10-29, 2025-04-29]` (sim_end un día antes del corte locked) | NO |
+   | Max participation rate per-symbol (10) | Almgren-Chriss + Donier-Bonart academic anchors | N/A (no data fit) | NO |
+   | Cooldown per-symbol (10) | Rule: `max(time_limit, NW=4, floor=6)` | Transitive of TL (not leaked) | NO |
+   | Tier mapping (cost-based per-symbol cap assignment) | #281 cost spectrum | `[2023-10-29, 2025-04-29]` | NO |
+   | Score tiers `{0.5, 1.0, 1.5}` (operator partition with arithmetic sizing convention; values + thresholds `SCORE_PREMIUM=4`/`SCORE_STANDARD=2` stable from inception per `git log -p` depth-2) | Hardcoded constants — depth-2 verified | N/A | NO |
+   | RISK_PER_TRADE = 0.01 (Van Tharp / standard finance convention; stable from inception per depth-2) | Hardcoded constant — depth-2 verified | N/A | NO |
+   | Regime thresholds `{>60, <40}` (`strategy/regime.py:372-377`, `backtest.py:404-409`) | **Optimized via backtest** in commit `bf581f1` (2026-04-18) over 4 documented configs `{(60,40), (70,30), (80,20), no detector}`. Window de optimización: undocumented en commit/changelog/script. Inferred to include data through ~2026-04-18 based on commit timestamp and absence of cutoff specification. If the inferred window is incorrect, the leakage analysis may differ — but absence of documentation is itself the methodological problem we're correcting. | Inferred `[..., 2026-04-18]` (overlaps holdout `[2025-04-30, 2026-04-30]`) | **YES** — re-tune required pre-Phase-3 (issue separado A.4-1.5; spec D9 §2.10) |
+
+   Hardcoded constants en estas filas son rule/principle-derived (operator-chosen partitions, convention-derived risk percentages), no data-derived-then-frozen — verified pre-Phase-3 via depth-2 archaeology (`git log -p` con value-change filter sobre cada constant). Excepción detectada en archaeology depth-2: regime thresholds `>60/<40` fueron data-derived; escape clause activada → issue separado A.4-1.5 abierto, mini-harness paralelo a A.4-1, gating Phase 3. Si en el futuro se descubre otra constante data-derived-then-frozen no listada arriba, abrir issue separado siguiendo el mismo patrón.
 2. **Regime composition not guaranteed.** The 12-month window may not cover all regimes. A.4 must report bull/bear/neutral mix and call out gaps.
 3. **Drift not auto-detectable.** F&G and funding rate hashes freeze the snapshot at fetch time. A.4 must re-fetch + diff against source APIs to detect provider revisions.
 
