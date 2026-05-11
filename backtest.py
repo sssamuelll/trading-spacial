@@ -87,6 +87,18 @@ RISK_PER_TRADE = 0.01  # 1% of capital per trade
 # portfolio aggregation gap; single-trade overshoot via amplification).
 MAX_OVERSHOOT_RATIO: Final[float] = 10.0
 
+# Per-symbol bankruptcy threshold (#280). Rule-derived 90%-drawdown convention
+# from the issue body: once simulated capital falls below 10% of INITIAL_CAPITAL,
+# any real account would be force-liquidated and the kill switch would have
+# fired in production. In simulation, the existing effective_capital = max(0,
+# capital) floor (A.0.2 / #277) prevented NaN math but kept the bar loop
+# running — those subsequent zero-risk_amount trades distort aggregate metrics
+# (Bankruptcy Bias, demonstrated in data/retune/2026-05-06-pre-holdout
+# regime_report.md). This constant + the _bankrupt sticky flag wired below
+# halt new entries for the affected symbol. Portfolio-level bankruptcy is
+# deferred to its own epic when a portfolio-level simulator lands.
+BANKRUPTCY_THRESHOLD: Final[float] = 0.1 * INITIAL_CAPITAL  # $1000 at INITIAL_CAPITAL=10_000
+
 
 from strategy._validators import (
     validated_time_limit_hours as _shared_validated_tl_hours,
@@ -332,6 +344,38 @@ def _ensure_tz_aware(ts) -> datetime:
     if getattr(ts, "tzinfo", None) is None:
         return ts.replace(tzinfo=timezone.utc)
     return ts
+
+
+def _emit_bankrupt_if_breached(capital: float, bar_time) -> dict | None:
+    """Return a synthetic BANKRUPT trade record when `capital` falls below
+    BANKRUPTCY_THRESHOLD; None otherwise. Stateless — callers own the
+    sticky flag that prevents re-emission.
+
+    The record carries a zero pnl payload (the event is a marker, not a
+    trade) plus `breach_capital` for forensic visibility. exit_time and
+    entry_time both point at the breach bar; duration is zero by design
+    (this is an event, not a held position).
+    """
+    if capital >= BANKRUPTCY_THRESHOLD:
+        return None
+    return {
+        "entry_time": bar_time,
+        "exit_time": bar_time,
+        "entry_price": 0.0,
+        "exit_price": 0.0,
+        "exit_reason": "BANKRUPT",
+        "direction": "NONE",
+        "pnl_pct": 0.0,
+        "pnl_usd": 0.0,
+        "overshoot_clamped": False,
+        "score": 0,
+        "size_mult": 0.0,
+        "duration_hours": 0.0,
+        "atr_sl_mult_used": None,
+        "atr_tp_mult_used": None,
+        "atr_be_mult_used": None,
+        "breach_capital": round(float(capital), 2),
+    }
 
 
 def _close_position(position: dict, exit_price: float, exit_time, exit_reason: str,
@@ -617,6 +661,7 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
     position = None  # {entry_price, entry_time, score, sl, tp, size_mult}
     last_exit_time = None
     capital = INITIAL_CAPITAL
+    _bankrupt = False  # #280: sticky flag — once True, no further entries open
     equity_curve = []
 
     # Resolve ATR multipliers
@@ -726,6 +771,13 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
                     )
                 trades.append(trade)
                 capital += trade["pnl_usd"]
+                # #280: per-symbol bankruptcy halt. Detect breach + emit
+                # synthetic BANKRUPT record exactly once; entry gate below
+                # then short-circuits further entries.
+                _bk_rec = _emit_bankrupt_if_breached(capital, bar_time)
+                if _bk_rec is not None and not _bankrupt:
+                    trades.append(_bk_rec)
+                    _bankrupt = True
                 position = None
                 last_exit_time = bar_time
                 # #186 A6: feed the simulator so tier can evolve mid-backtest.
@@ -753,6 +805,13 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
 
         # ── Skip if already in a position ─────────────────────────────────
         if position is not None:
+            continue
+
+        # #280: per-symbol bankruptcy halt — no new entries past the
+        # BANKRUPTCY_THRESHOLD breach. Existing open positions are not
+        # affected (they close naturally on SL/TP/TIME_LIMIT via the
+        # branch above).
+        if _bankrupt:
             continue
 
         # ── Skip if before simulation start (warmup period) ──────────────
@@ -1017,6 +1076,13 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
             )
         trades.append(trade)
         capital += trade["pnl_usd"]
+        # #280: tail-close path — detect bankruptcy on the final-bar close
+        # as well. The sticky flag prevents double-emission if the bar-loop
+        # site already fired during the run.
+        _bk_rec = _emit_bankrupt_if_breached(capital, trade["exit_time"])
+        if _bk_rec is not None and not _bankrupt:
+            trades.append(_bk_rec)
+            _bankrupt = True
 
     return trades, equity_curve
 
@@ -1028,12 +1094,23 @@ def simulate_strategy(df1h: pd.DataFrame, df4h: pd.DataFrame, df5m: pd.DataFrame
 def calculate_metrics(trades: list[dict], equity_curve: list[dict]) -> dict:
     """Calculate comprehensive trading metrics."""
     if not trades:
-        # Empty-trades early return — emit clamped_trade_count: 0 for shape
-        # consistency. CLI consumer below already defaults via .get(..., 0).
-        return {"error": "No trades generated", "clamped_trade_count": 0}
+        # Empty-trades early return — emit clamped_trade_count: 0 and
+        # bankruptcy_count: 0 for shape consistency. CLI consumer below
+        # already defaults via .get(..., 0).
+        return {
+            "error": "No trades generated",
+            "clamped_trade_count": 0,
+            "bankruptcy_count": 0,
+        }
 
     df = pd.DataFrame(trades)
-    closed = df[df["exit_reason"] != "OPEN"]
+    # #280: BANKRUPT records are event markers (capital fell below
+    # BANKRUPTCY_THRESHOLD), not trades. Exclude them from every aggregate
+    # that consumes per-trade pnl — win-rate, PF, Sharpe, Sortino, streaks,
+    # score-tier breakdowns. The equity_curve still reflects the bankruptcy
+    # path so drawdown and total_return_pct are unaffected.
+    closed = df[~df["exit_reason"].isin(["OPEN", "BANKRUPT"])]
+    bankruptcy_count = int((df["exit_reason"] == "BANKRUPT").sum())
 
     wins = closed[closed["pnl_usd"] > 0]
     losses = closed[closed["pnl_usd"] <= 0]
@@ -1154,6 +1231,7 @@ def calculate_metrics(trades: list[dict], equity_curve: list[dict]) -> dict:
         "losses": loss_count,
         "win_rate": round(win_rate * 100, 1),
         "clamped_trade_count": clamped_trade_count,
+        "bankruptcy_count": bankruptcy_count,
         "gross_profit": round(gross_profit, 2),
         "gross_loss": round(gross_loss, 2),
         "net_pnl": round(net_pnl, 2),
