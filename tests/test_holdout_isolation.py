@@ -55,9 +55,14 @@ HOLDOUT_LEGITIMATE_MODULES: set[str] = {
     "scripts/lock_holdout.py",
     # this scanner — contains the patterns it looks for
     "tests/test_holdout_isolation.py",
-    # Reads data/ohlcv.db only — does NOT read data/holdout/. Output dir
-    # name contains the literal '-pre-holdout' suffix which the AST scanner
-    # would otherwise flag.
+    # A.4-1 pre-holdout retune wrapper (#250). Reads data/ohlcv.db only
+    # (NOT data/holdout/) but names its artefact directory with the
+    # '-pre-holdout' suffix for human discoverability. The output path
+    # carries the literal token; no holdout data is consumed.
+    "tools/retune_pre_holdout.py",
+    # A.4-1.5 regime threshold retune wrapper (#305). Same rationale as
+    # above — reads data/ohlcv.db only; artefact dir carries the literal
+    # '-pre-holdout' suffix.
     "tools/regime_retune_pre_holdout.py",
     # A.2 walk-forward harness modules and A.4 evaluation modules will be
     # added here when those tickets land.
