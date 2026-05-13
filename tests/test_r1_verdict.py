@@ -134,6 +134,70 @@ def test_argmax_cell_tiebreak_prefers_lower_lrc_thr_when_sl_and_be_tie():
     assert winner["lrc_thr"] == 35.0
 
 
+def test_argmax_cell_5th_tiebreak_symbol_lex_order_on_full_4tuple_tie():
+    """Closes #332 item 3: 5th tie-break on symbol lex order for fully-tied 4-tuple cells.
+
+    In normal per-symbol use (cells all share same symbol), 5th key is a no-op.
+    Defensive contract: if `_argmax_cell` is ever called with multi-symbol cells
+    (current caller passes per-symbol, but signature doesn't enforce), the 5th
+    tie-break makes ordering deterministic via lex order on symbol.
+
+    Without this 5th key, `max` falls back to Python's insertion-order tie-break,
+    which is contract-fragile against any caller change (e.g., a future
+    multi-symbol caller that batches cells from concurrent workers in
+    non-deterministic order).
+    """
+    cells = [
+        _cell(symbol="BTCUSDT", net_pnl=100.0, sl=1.0, be=2.0, lrc_thr=50.0, n_trades=15),
+        _cell(symbol="ETHUSDT", net_pnl=100.0, sl=1.0, be=2.0, lrc_thr=50.0, n_trades=15),
+    ]
+    # max picks the lex-greater symbol on full 4-tuple tie.
+    # max(("BTCUSDT",), ("ETHUSDT",)) = ("ETHUSDT",) because "ETHUSDT" > "BTCUSDT".
+    out = _argmax_cell(cells)
+    assert out["symbol"] == "ETHUSDT", (
+        "5th tie-break (symbol lex order) must select lex-greater symbol on full 4-tuple tie"
+    )
+
+
+def test_argmax_cell_5th_tiebreak_noop_for_per_symbol_caller():
+    """When all cells share the same symbol (normal caller), 5th key is a no-op.
+
+    Existing 4-tuple tie-break (lower sl wins) still applies; symbol equality
+    means the 5th key collapses and doesn't change selection.
+    """
+    cells = [
+        _cell(symbol="BTCUSDT", net_pnl=100.0, sl=1.0, be=2.0, lrc_thr=50.0, n_trades=15),
+        _cell(symbol="BTCUSDT", net_pnl=100.0, sl=0.5, be=2.0, lrc_thr=50.0, n_trades=15),
+    ]
+    out = _argmax_cell(cells)
+    # 4-tuple tie-break: lower sl (0.5) wins; 5th key (symbol) is identical so no override.
+    assert out["sl"] == 0.5
+
+
+def test_argmax_cell_5th_tiebreak_reverse_input_order_same_winner():
+    """Polish-3: reverse-input deterministic — [ETH, BTC] → ETH (same as [BTC, ETH] → ETH).
+
+    The forward-direction test alone would pass even if the 5th tie-break key
+    accidentally inverted (e.g., a hypothetical change to `-c.get("symbol", "")`
+    couldn't apply since strings aren't negatable, but a buggy `key=...` lambda
+    that swapped the 5th element direction would slip through the
+    forward-only test). Reverse-direction test ensures determinism is
+    independent of input order — the symmetric counterpart to Polish-1's
+    permutation exhaust for the sweep tool.
+
+    Hypothetical regression caught: any 5th key change that makes the winner
+    depend on input order (sign inversion, removal, etc.).
+    """
+    cells_reversed = [
+        _cell(symbol="ETHUSDT", net_pnl=100.0, sl=1.0, be=2.0, lrc_thr=50.0, n_trades=15),
+        _cell(symbol="BTCUSDT", net_pnl=100.0, sl=1.0, be=2.0, lrc_thr=50.0, n_trades=15),
+    ]
+    out = _argmax_cell(cells_reversed)
+    assert out["symbol"] == "ETHUSDT", (
+        "Lex-greater symbol must win regardless of input order"
+    )
+
+
 def test_argmax_cell_tiebreak_deterministic_across_input_orders():
     """Gap #2: tie-break is independent of insertion order — all 6 permutations agree."""
     a = _cell(sl=1.0, be=1.5, lrc_thr=35.0, net_pnl=100.0)
@@ -470,3 +534,67 @@ def test_load_json_parses_existing_file(tmp_path, monkeypatch):
     payload = {"foo": "bar", "n": 42}
     (tmp_path / "test.json").write_text(json.dumps(payload))
     assert r1_verdict._load_json("test.json") == payload
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _extract_halt_from_diagnostic — isinstance validation (issue #332 item 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_extract_halt_from_diagnostic_none_returns_false():
+    """No halt diagnostic file → halt=False (sweep completed normally)."""
+    from tools.r1_verdict import _extract_halt_from_diagnostic
+    assert _extract_halt_from_diagnostic(None) is False
+
+
+def test_extract_halt_from_diagnostic_empty_dict_returns_false():
+    """Empty dict (no 'halt' key) → halt=False, key-missing default."""
+    from tools.r1_verdict import _extract_halt_from_diagnostic
+    assert _extract_halt_from_diagnostic({}) is False
+
+
+def test_extract_halt_from_diagnostic_true_value_returns_true():
+    """{'halt': True} → True (normal halt-after-A fired case)."""
+    from tools.r1_verdict import _extract_halt_from_diagnostic
+    assert _extract_halt_from_diagnostic({"halt": True}) is True
+
+
+def test_extract_halt_from_diagnostic_false_value_returns_false():
+    """{'halt': False} → False (halt diagnostic present but did not fire)."""
+    from tools.r1_verdict import _extract_halt_from_diagnostic
+    assert _extract_halt_from_diagnostic({"halt": False}) is False
+
+
+def test_extract_halt_from_diagnostic_string_value_raises():
+    """{'halt': 'false'} → ValueError (was silently coerced to True under bool())."""
+    from tools.r1_verdict import _extract_halt_from_diagnostic
+    with pytest.raises(ValueError, match=r"halt_diag\['halt'\] must be bool"):
+        _extract_halt_from_diagnostic({"halt": "false"})
+
+
+def test_extract_halt_from_diagnostic_int_zero_raises():
+    """{'halt': 0} → ValueError (was silently coerced to False under bool())."""
+    from tools.r1_verdict import _extract_halt_from_diagnostic
+    with pytest.raises(ValueError, match=r"halt_diag\['halt'\] must be bool"):
+        _extract_halt_from_diagnostic({"halt": 0})
+
+
+def test_extract_halt_from_diagnostic_int_one_raises():
+    """{'halt': 1} → ValueError (no implicit int→bool coercion accepted)."""
+    from tools.r1_verdict import _extract_halt_from_diagnostic
+    with pytest.raises(ValueError, match=r"halt_diag\['halt'\] must be bool"):
+        _extract_halt_from_diagnostic({"halt": 1})
+
+
+def test_extract_halt_from_diagnostic_non_dict_raises():
+    """Non-dict halt_diag → ValueError (defends against JSON parser returning unexpected type)."""
+    from tools.r1_verdict import _extract_halt_from_diagnostic
+    with pytest.raises(ValueError, match=r"halt_diag must be dict or None"):
+        _extract_halt_from_diagnostic("not a dict")
+
+
+def test_extract_halt_from_diagnostic_list_raises():
+    """List halt_diag → ValueError (same: defensive against malformed JSON)."""
+    from tools.r1_verdict import _extract_halt_from_diagnostic
+    with pytest.raises(ValueError, match=r"halt_diag must be dict or None"):
+        _extract_halt_from_diagnostic([{"halt": True}])

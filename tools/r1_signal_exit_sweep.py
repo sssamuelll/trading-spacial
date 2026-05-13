@@ -288,6 +288,15 @@ def _coverage_for_window(window_id: str, app_config_path: str) -> dict[str, int]
 def _argmax_cell_per_symbol(results: list[dict]) -> dict[str, dict | None]:
     """Pre-reg §4.1: argmax(net_pnl) per symbol, subject to n_trades >= N_TRADES_MIN.
 
+    Tie-break: when two cells tie on net_pnl, favor lower `sl`, then lower `be`,
+    then lower `lrc_thr` — i.e., the more conservative parameter combination.
+    Mirrors `tools/r1_verdict.py:_argmax_cell` tie-break (modulo 5th key — see
+    inline comment near the `max` call). Determinism matters because the
+    previous insertion-order tie-break made cell selection fragile to
+    job-execution order across parallel workers, and could cause drift
+    between the sweep tool's halt diagnostic JSON and the verdict tool's
+    §4 classification on the same data.
+
     Returns {symbol -> cell dict or None if no cell satisfies constraint}.
     """
     by_symbol: dict[str, list[dict]] = {}
@@ -302,7 +311,15 @@ def _argmax_cell_per_symbol(results: list[dict]) -> dict[str, dict | None]:
         if not eligible:
             out[sym] = None
         else:
-            out[sym] = max(eligible, key=lambda c: c["net_pnl"])
+            # 5th tie-break field (symbol lex order, per r1_verdict._argmax_cell)
+            # omitted intentionally: per-symbol grouping above (by_symbol bucket)
+            # guarantees all eligible cells share the same symbol, so the 5th
+            # key would be a literal no-op. See r1_verdict._argmax_cell
+            # docstring for full 5-level contract.
+            out[sym] = max(
+                eligible,
+                key=lambda c: (c["net_pnl"], -c["sl"], -c["be"], -c["lrc_thr"]),
+            )
     # Ensure all symbols have an entry
     for sym in CURATED_SYMBOLS:
         out.setdefault(sym, None)
@@ -375,6 +392,21 @@ def _save_json(path: Path, payload):
         json.dump(payload, f, indent=2, sort_keys=True, default=str, allow_nan=False)
 
 
+def _emit_worker_error_summary(results: list[dict]) -> None:
+    """Write `_summarize_worker_errors` output to sys.stderr if non-None.
+
+    Extracted wiring point for #332 item 5 (stderr-integration test). The
+    operator scans stderr at sweep completion for any "[r1_sweep] N workers
+    errored" line; mixing into stdout would obscure the signal among the
+    sweep's normal progress output.
+
+    No-op when results are clean (no `error` fields present).
+    """
+    err_summary = _summarize_worker_errors(results)
+    if err_summary:
+        sys.stderr.write(err_summary + "\n")
+
+
 def _summarize_worker_errors(results: list[dict]) -> str | None:
     """Aggregate the `error` field across sweep results.
 
@@ -382,8 +414,14 @@ def _summarize_worker_errors(results: list[dict]) -> str | None:
     Surfaces multi-worker failure modes that would otherwise be buried in the
     750-cell result list — without this, an operator scanning stderr at the
     end of the sweep has no signal that anything went wrong.
+
+    Filter uses `is not None` rather than truthy semantics so that an explicit
+    empty-string `error` field (intentional flag from producer) is not silently
+    swallowed. Producer `_process_cell` currently only writes the field when
+    non-empty, so the practical behavior is unchanged; this hardens the
+    contract against future producer changes.
     """
-    errors = [r.get("error") for r in results if r.get("error")]
+    errors = [r.get("error") for r in results if r.get("error") is not None]
     if not errors:
         return None
     distinct = sorted(set(errors))
@@ -403,9 +441,7 @@ def _run_jobs_parallel(jobs: list[dict], workers: int, label: str) -> list[dict]
         results = pool.map(_process_cell, jobs)
     elapsed = time.monotonic() - t0
     sys.stderr.write(f"[r1_sweep] {label}: completed in {elapsed:.1f}s\n")
-    err_summary = _summarize_worker_errors(results)
-    if err_summary:
-        sys.stderr.write(err_summary + "\n")
+    _emit_worker_error_summary(results)
     return results
 
 

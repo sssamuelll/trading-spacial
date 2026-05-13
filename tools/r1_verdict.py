@@ -51,20 +51,78 @@ def _load_json(name: str):
         return json.load(f)
 
 
+def _extract_halt_from_diagnostic(halt_diag) -> bool:
+    """Extract halt boolean from diagnostic dict, raising on malformed input.
+
+    Closes #332 item 2. Replaces the previous
+    `bool(halt_diag and halt_diag.get("halt"))` coercion which silently
+    accepted truthy non-bool values (e.g., `{"halt": "false"}` → True via
+    truthy-string coercion, `{"halt": 0}` → False) — both methodologically
+    wrong because a malformed halt diagnostic should be loud, not silent.
+
+    Accepts:
+      - `None` → False (no halt diagnostic file written by sweep)
+      - `{}` (no "halt" key) → False (key-missing default)
+      - `{"halt": True}` → True
+      - `{"halt": False}` → False
+
+    Raises ValueError on:
+      - non-dict (e.g., list, str, int) — JSON parser returned unexpected type
+      - non-bool "halt" value (e.g., string, int) — producer contract violation
+    """
+    if halt_diag is None:
+        return False
+    if not isinstance(halt_diag, dict):
+        raise ValueError(
+            f"halt_diag must be dict or None, got {type(halt_diag).__name__}: {halt_diag!r}"
+        )
+    halt_value = halt_diag.get("halt", False)
+    if not isinstance(halt_value, bool):
+        raise ValueError(
+            f"halt_diag['halt'] must be bool, got {type(halt_value).__name__}: {halt_value!r}"
+        )
+    return halt_value
+
+
 def _argmax_cell(cells: list[dict]) -> dict | None:
     """Pre-reg §4.1: argmax(net_pnl) among cells with n_trades >= N_TRADES_MIN.
 
-    Tie-break: when two cells tie on net_pnl, favor lower `sl`, then lower `be`,
-    then lower `lrc_thr` — i.e., the more conservative parameter combination.
+    Tie-break order (5 levels, all deterministic):
+      1. higher net_pnl wins
+      2. lower `sl` wins (more conservative stop)
+      3. lower `be` wins (more conservative break-even)
+      4. lower `lrc_thr` wins (more aggressive exit threshold)
+      5. lex-greater `symbol` wins (#332 item 3 defensive 5th key)
+
+    Tie-break levels 1-4 are the methodologically-justified contract: among
+    cells with same P&L, prefer more-conservative parameters. Level 5 is
+    purely defensive: in normal per-symbol use (cells all share same symbol)
+    it's a no-op, but it makes the function safe against any future
+    multi-symbol caller — falling back to Python's insertion-order tie-break
+    would be contract-fragile against concurrent-worker batching.
+
     Determinism matters because the previous insertion-order tie-break made
     cell selection fragile to job-execution order across parallel workers.
+
+    Contract: the 4-tuple `(net_pnl, sl, be, lrc_thr)` is expected to uniquely
+    identify a cell in the canonical sweep grid for a single symbol. True
+    duplicates (same 4-tuple within same symbol) indicate upstream bug — the
+    5th key resolves the order silently rather than raising, but the grid
+    constructor in `tools/r1_signal_exit_sweep.py` should be audited if
+    diagnostic output shows duplicate cell counts.
     """
     eligible = [c for c in cells if c.get("n_trades", 0) >= N_TRADES_MIN]
     if not eligible:
         return None
     return max(
         eligible,
-        key=lambda c: (c["net_pnl"], -c["sl"], -c["be"], -c["lrc_thr"]),
+        key=lambda c: (
+            c["net_pnl"],
+            -c["sl"],
+            -c["be"],
+            -c["lrc_thr"],
+            c.get("symbol", ""),  # 5th defensive tie-break: lex order on symbol
+        ),
     )
 
 
@@ -279,7 +337,7 @@ def main() -> int:
     sweep_c = _load_json("sweep_results_C.json")
     baseline = _load_json("baseline_pre_signal_exit.json")
     halt_diag = _load_json("halt_after_a_diagnostic.json")
-    halt = bool(halt_diag and halt_diag.get("halt"))
+    halt = _extract_halt_from_diagnostic(halt_diag)
 
     if baseline is None:
         print("WARNING: baseline_pre_signal_exit.json missing", file=sys.stderr)
