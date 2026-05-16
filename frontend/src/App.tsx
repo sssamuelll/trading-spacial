@@ -1,10 +1,52 @@
 // ============================================================
-// App.tsx — Main application component
+// App.tsx — Main application component (redesigned layout)
+//
+// Layout:
+//   ┌──────────────────────────────────────────────┐
+//   │  Header                                       │
+//   ├──────────────────────────────────────────────┤
+//   │  Ticker tape                                  │
+//   ├──────┬───────────────────────────────────────┤
+//   │      │  Page bar · StatusBar · Focus          │
+//   │ Rail │  Watchlist (Setups · Watching · Quiet) │
+//   │      │  SignalsTable                          │
+//   └──────┴───────────────────────────────────────┘
+//
+// Overlays (top-level, anchored to viewport):
+//   - NotificationBell dropdown
+//   - ConfigPanel slide-out
+//   - UserMenu dropdown
+//   - ChartModal, TuneReportModal (unchanged)
+//
+// On mobile (<768px), the rail collapses to a BottomNav and the
+// header collapses to brand+scan+bell.
 // ============================================================
 
-import React, { useState, useEffect, useCallback } from 'react';
-import { getSymbols, getStatus, getSignals, forceScan, getTuneLatest, applyTune, rejectTune } from './api';
-import type { SymbolStatus, StatusResponse, Signal, TuneResult } from './types';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import {
+  getSymbols,
+  getStatus,
+  getSignals,
+  forceScan,
+  getTuneLatest,
+  applyTune,
+  rejectTune,
+  getPositions,
+} from './api';
+import type {
+  SymbolStatus,
+  StatusResponse,
+  Signal,
+  TuneResult,
+  Position,
+} from './types';
+import type { MainTab, SymbolsFilter } from './types-ui';
+
+import { useAuth } from './auth/useAuth';
+import { useScanCountdown } from './hooks/useScanCountdown';
+import { useIsMobile } from './hooks/useIsMobile';
+import { computeFocus } from './helpers/hierarchy';
+
 import ChartModal from './components/ChartModal';
 import ErrorBoundary from './components/ErrorBoundary';
 import Header from './components/Header';
@@ -17,41 +59,61 @@ import TuneReportModal from './components/TuneReportModal';
 import NotificationToast from './components/NotificationToast';
 import KillSwitchDashboard from './components/KillSwitchDashboard';
 
-type FilterType = 'all' | 'signals';
-type MainTab    = 'mercado' | 'posiciones' | 'kill-switch';
+// New components
+import LeftRail from './components/LeftRail';
+import BottomNav from './components/BottomNav';
+import Ticker from './components/Ticker';
+import FocusPanel from './components/FocusPanel';
+import NotificationBell from './components/NotificationBell';
+import UserMenu from './components/UserMenu';
+
+import appStyles from './App.module.css';
 
 const REFRESH_INTERVAL_MS = 30_000;
 
+type OverlayKind = 'notifs' | 'settings' | 'user' | null;
+
 const App: React.FC = () => {
+  const { user, logout } = useAuth();
+  const mobile = useIsMobile();
+
+  // ── data ───────────────────────────────────────────────
   const [symbols,     setSymbols]     = useState<SymbolStatus[]>([]);
   const [status,      setStatus]      = useState<StatusResponse | null>(null);
   const [signals,     setSignals]     = useState<Signal[]>([]);
+  const [positions,   setPositions]   = useState<Position[]>([]);
   const [scanning,    setScanning]    = useState(false);
   const [loading,     setLoading]     = useState(true);
-  const [filter,      setFilter]      = useState<FilterType>('all');
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [error,       setError]       = useState<string | null>(null);
-  const [configOpen,  setConfigOpen]  = useState(false);
-  const [selectedSymbol, setSelectedSymbol] = useState<SymbolStatus | null>(null);
-  const [mainTab,     setMainTab]     = useState<MainTab>('mercado');
   const [tuneResult,  setTuneResult]  = useState<TuneResult | null>(null);
-  const [tuneModalOpen, setTuneModalOpen] = useState(false);
+
+  // ── ui ─────────────────────────────────────────────────
+  const [filter,         setFilter]         = useState<SymbolsFilter>('all');
+  const [mainTab,        setMainTab]        = useState<MainTab>('mercado');
+  const [tuneModalOpen,  setTuneModalOpen]  = useState(false);
+  const [selectedSymbol, setSelectedSymbol] = useState<SymbolStatus | null>(null);
+  const [openOverlay,    setOpenOverlay]    = useState<OverlayKind>(null);
+  const [unreadCount,    setUnreadCount]    = useState<number>(0);
+
   // Signal to open as position (passed from SignalsTable → PositionsPanel)
   const [signalForPos, setSignalForPos] = useState<Signal | null>(null);
 
-  // Fetch all data in parallel
+  // ── data fetching ──────────────────────────────────────
   const fetchAll = useCallback(async () => {
     try {
-      const [symbolsRes, statusRes, signalsRes, tuneRes] = await Promise.all([
+      const [symbolsRes, statusRes, signalsRes, tuneRes, positionsRes] = await Promise.all([
         getSymbols(),
         getStatus(),
         getSignals({ limit: 20, only_signals: false, since_hours: 24 }),
         getTuneLatest().catch(() => null),
+        getPositions('open').catch(() => ({ total: 0, positions: [] })),
       ]);
       setSymbols(symbolsRes.symbols);
       setStatus(statusRes);
       setSignals(signalsRes.signals);
       setTuneResult(tuneRes);
+      setPositions(positionsRes.positions ?? []);
       setLastRefresh(new Date());
       setError(null);
     } catch (err) {
@@ -62,12 +124,29 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => { fetchAll(); }, [fetchAll]);
-
   useEffect(() => {
     const id = setInterval(fetchAll, REFRESH_INTERVAL_MS);
     return () => clearInterval(id);
   }, [fetchAll]);
 
+  // ── derived state ──────────────────────────────────────
+  const lastRefreshTs = lastRefresh ? lastRefresh.getTime() : null;
+  const { progress, secsLeft } = useScanCountdown(REFRESH_INTERVAL_MS, lastRefreshTs);
+  const focus = useMemo(
+    () => computeFocus(symbols, positions, status, Date.now()),
+    [symbols, positions, status],
+  );
+  const navCounts = useMemo(
+    () => ({
+      market:     symbols.length,
+      positions:  positions.length,
+      killswitch: 0, // wired once KillSwitch dashboard exposes a count
+    }),
+    [symbols.length, positions.length],
+  );
+  const hasPendingTune = tuneResult?.status === 'pending';
+
+  // ── handlers ───────────────────────────────────────────
   const handleRefresh = useCallback(async () => {
     setLoading(true);
     await fetchAll();
@@ -86,41 +165,165 @@ const App: React.FC = () => {
     }
   }, [scanning, fetchAll]);
 
-  // Open position from a signal (switches to posiciones tab)
   const handleOpenFromSignal = useCallback((signal: Signal) => {
     setSignalForPos(signal);
     setMainTab('posiciones');
   }, []);
 
-  const handleTuneApply = useCallback(async () => {
-    await applyTune();
-    await fetchAll();
-  }, [fetchAll]);
+  const handleTuneApply  = useCallback(async () => { await applyTune();  await fetchAll(); }, [fetchAll]);
+  const handleTuneReject = useCallback(async () => { await rejectTune(); await fetchAll(); }, [fetchAll]);
 
-  const handleTuneReject = useCallback(async () => {
-    await rejectTune();
-    await fetchAll();
-  }, [fetchAll]);
+  const handleLogout = async () => {
+    try { await logout(); } catch (err) { console.warn('[app] logout error:', err); }
+  };
 
-  const hasPendingTune = tuneResult?.status === 'pending';
+  const handleNavSelect = (tab: MainTab | 'menu') => {
+    if (tab === 'menu') {
+      setOpenOverlay('user');
+      return;
+    }
+    setMainTab(tab);
+  };
 
-  const scannerRunning = status?.scanner_state?.running ?? false;
+  // Close overlays when the tab changes
+  useEffect(() => { setOpenOverlay(null); }, [mainTab]);
 
   return (
-    <div className="app">
+    <div className={[appStyles.app, mobile ? appStyles.appMobile : appStyles.appDesktop].join(' ')}>
       <NotificationToast />
+
       <Header
-        scannerRunning={scannerRunning}
-        lastRefresh={lastRefresh}
+        status={status}
+        user={user}
         scanning={scanning}
+        lastRefresh={lastRefresh}
+        scanProgress={progress}
+        secsLeft={secsLeft}
+        unreadCount={unreadCount}
+        hasPendingTune={hasPendingTune}
         onRefresh={handleRefresh}
         onScan={handleScan}
-        onConfigOpen={() => setConfigOpen(true)}
-        hasPendingTune={hasPendingTune}
+        onConfigOpen={() => setOpenOverlay(openOverlay === 'settings' ? null : 'settings')}
         onTuneOpen={() => setTuneModalOpen(true)}
+        onBellClick={() => setOpenOverlay(openOverlay === 'notifs' ? null : 'notifs')}
+        onUserClick={() => setOpenOverlay(openOverlay === 'user' ? null : 'user')}
+        notifsOpen={openOverlay === 'notifs'}
+        settingsOpen={openOverlay === 'settings'}
+        userOpen={openOverlay === 'user'}
+        mobile={mobile}
       />
 
-      <ConfigPanel open={configOpen} onClose={() => setConfigOpen(false)} />
+      <Ticker symbols={symbols} />
+
+      <div className={appStyles.body}>
+        {!mobile && (
+          <LeftRail
+            active={mainTab}
+            counts={navCounts}
+            onSelect={(tab) => setMainTab(tab)}
+            onLogout={handleLogout}
+            onTuneOpen={() => setTuneModalOpen(true)}
+            hasPendingTune={hasPendingTune}
+          />
+        )}
+
+        <main className={appStyles.main}>
+          {error && (
+            <div className={appStyles.errorBanner}>
+              <span>⚠</span>
+              <span>Error de conexión: {error}</span>
+              <button onClick={() => setError(null)} aria-label="Cerrar">✕</button>
+            </div>
+          )}
+
+          {/* ── Mercado ────────────────────────────────── */}
+          {mainTab === 'mercado' && (
+            <>
+              <StatusBar status={status} />
+              <FocusPanel
+                items={focus}
+                onAction={(it) => {
+                  if (it.pair) {
+                    const sym = symbols.find((s) => s.symbol === it.pair);
+                    if (sym) setSelectedSymbol(sym);
+                  }
+                  if (it.kind === 'risk-position' || it.kind === 'near-tp') {
+                    setMainTab('posiciones');
+                  }
+                }}
+              />
+
+              <ErrorBoundary fallbackLabel="Error en el grid de símbolos">
+                <SymbolsGrid
+                  symbols={symbols}
+                  loading={loading}
+                  filter={filter}
+                  onFilterChange={setFilter}
+                  onSymbolClick={setSelectedSymbol}
+                />
+              </ErrorBoundary>
+
+              <ErrorBoundary fallbackLabel="Error en la tabla de señales">
+                <SignalsTable
+                  signals={signals}
+                  loading={loading}
+                  onOpenPosition={handleOpenFromSignal}
+                  mobile={mobile}
+                />
+              </ErrorBoundary>
+            </>
+          )}
+
+          {/* ── Posiciones ─────────────────────────────── */}
+          {mainTab === 'posiciones' && (
+            <ErrorBoundary fallbackLabel="Error en el panel de posiciones">
+              <PositionsPanel
+                symbols={symbols}
+                onOpenFromSignal={signalForPos}
+                onSignalConsumed={() => setSignalForPos(null)}
+              />
+            </ErrorBoundary>
+          )}
+
+          {/* ── Kill-switch ───────────────────────────── */}
+          {mainTab === 'kill-switch' && (
+            <ErrorBoundary fallbackLabel="Error en dashboard de kill switch">
+              <KillSwitchDashboard />
+            </ErrorBoundary>
+          )}
+
+          <footer className={appStyles.footer}>
+            <span className="prose">Crypto Scanner V6 · scanner uptime —</span>
+            <span className="prose">3 timeframes · 4H macro → 1H signal → 5M entry · cada {REFRESH_INTERVAL_MS / 1000}s</span>
+          </footer>
+        </main>
+      </div>
+
+      {mobile && (
+        <BottomNav active={mainTab} counts={navCounts} onSelect={handleNavSelect} />
+      )}
+
+      {/* ── Overlays ────────────────────────────────────── */}
+      <NotificationBell
+        open={openOverlay === 'notifs'}
+        onClose={() => setOpenOverlay(null)}
+        onUnreadChange={setUnreadCount}
+      />
+      <ConfigPanel
+        open={openOverlay === 'settings'}
+        onClose={() => setOpenOverlay(null)}
+      />
+      {user && (
+        <UserMenu
+          open={openOverlay === 'user'}
+          user={user}
+          onClose={() => setOpenOverlay(null)}
+          onLogout={() => {
+            setOpenOverlay(null);
+            handleLogout();
+          }}
+        />
+      )}
 
       {tuneModalOpen && tuneResult && (
         <TuneReportModal
@@ -135,88 +338,6 @@ const App: React.FC = () => {
         symbol={selectedSymbol}
         onClose={() => setSelectedSymbol(null)}
       />
-
-      {error && (
-        <div className="error-banner">
-          <span className="error-icon">⚠</span>
-          <span className="error-text">Error de conexión: {error}</span>
-          <button className="error-dismiss" onClick={() => setError(null)}>✕</button>
-        </div>
-      )}
-
-      <main className="app-main">
-        <StatusBar status={status} />
-
-        {/* ── Main tab bar ────────────────────────────────── */}
-        <div className="main-tab-bar">
-          <button
-            className={`main-tab${mainTab === 'mercado' ? ' main-tab--active' : ''}`}
-            onClick={() => setMainTab('mercado')}
-          >
-            Mercado
-          </button>
-          <button
-            className={`main-tab${mainTab === 'posiciones' ? ' main-tab--active' : ''}`}
-            onClick={() => setMainTab('posiciones')}
-          >
-            Posiciones
-          </button>
-          <button
-            className={`main-tab${mainTab === 'kill-switch' ? ' main-tab--active' : ''}`}
-            onClick={() => setMainTab('kill-switch')}
-          >
-            Kill Switch
-          </button>
-        </div>
-
-        {/* ── Mercado tab ──────────────────────────────────── */}
-        {mainTab === 'mercado' && (
-          <>
-            <ErrorBoundary fallbackLabel="Error en el grid de simbolos">
-              <SymbolsGrid
-                symbols={symbols}
-                loading={loading}
-                filter={filter}
-                onFilterChange={setFilter}
-                onSymbolClick={setSelectedSymbol}
-              />
-            </ErrorBoundary>
-            <ErrorBoundary fallbackLabel="Error en la tabla de senales">
-              <SignalsTable
-                signals={signals}
-                loading={loading}
-                onOpenPosition={handleOpenFromSignal}
-              />
-            </ErrorBoundary>
-          </>
-        )}
-
-        {/* ── Posiciones tab ───────────────────────────────── */}
-        {mainTab === 'posiciones' && (
-          <ErrorBoundary fallbackLabel="Error en el panel de posiciones">
-            <PositionsPanel
-              symbols={symbols}
-              onOpenFromSignal={signalForPos}
-              onSignalConsumed={() => setSignalForPos(null)}
-            />
-          </ErrorBoundary>
-        )}
-
-        {/* ── Kill Switch tab ─────────────────────────────────── */}
-        {mainTab === 'kill-switch' && (
-          <ErrorBoundary fallbackLabel="Error en dashboard de kill switch">
-            <KillSwitchDashboard />
-          </ErrorBoundary>
-        )}
-      </main>
-
-      <footer className="app-footer">
-        <span>Crypto Scanner V6</span>
-        <span className="footer-dot">·</span>
-        <span>Top 20 por volumen</span>
-        <span className="footer-dot">·</span>
-        <span>Actualización automática cada 30s</span>
-      </footer>
     </div>
   );
 };

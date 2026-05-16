@@ -1,161 +1,164 @@
 // ============================================================
-// SymbolCard.tsx — Individual symbol card with price, LRC%, score
+// SymbolCard.tsx — featured / standard variants for the bucketed
+// watchlist. Renders price + LRC bar + ScoreGrid + trigger pill.
 // ============================================================
 
 import React from 'react';
+import styles from './SymbolCard.module.css';
 import type { SymbolStatus } from '../types';
-import { timeAgo, formatPrice } from '../utils';
+import { formatPrice, timeAgo } from '../utils';
+import ScoreGrid, { type ScoreVariant } from './atoms/ScoreGrid';
+import LrcBar from './atoms/LrcBar';
+import SideBadge from './atoms/SideBadge';
+import TriggerPill from './atoms/TriggerPill';
+import PriceSpark from './atoms/PriceSpark';
+import { fakeScoreComponents } from '../helpers/hierarchy';
 
 interface SymbolCardProps {
-  symbol: SymbolStatus;
-  onClick?: () => void;
+  symbol:      SymbolStatus;
+  featured?:   boolean;
+  scoreStyle?: ScoreVariant;
+  fresh?:      boolean;
+  onClick?:    () => void;
 }
 
-function splitSymbol(sym: string): { base: string; quote: string } {
-  // Common quote currencies
+function splitPair(sym: string): { base: string; quote: string } {
   const quotes = ['USDT', 'USDC', 'BTC', 'ETH', 'BNB', 'BUSD'];
   for (const q of quotes) {
-    if (sym.endsWith(q)) {
-      return { base: sym.slice(0, -q.length), quote: q };
-    }
+    if (sym.endsWith(q)) return { base: sym.slice(0, -q.length), quote: q };
   }
-  // Fallback: split at 3 chars from end
   return { base: sym.slice(0, -4), quote: sym.slice(-4) };
 }
 
-function getScoreColor(score: number): string {
-  if (score >= 8) return '#22c55e';
-  if (score >= 6) return '#86efac';
-  if (score >= 4) return '#f59e0b';
-  if (score >= 2) return '#fb923c';
-  return '#ef4444';
+function toneOfScore(score: number): 'bull' | 'warn' | 'dim' {
+  if (score >= 5) return 'bull';
+  if (score >= 3) return 'warn';
+  return 'dim';
+}
+function toneOfLrc(lrc: number): 'bull' | 'warn' | 'bear' {
+  if (lrc < 25) return 'bull';
+  if (lrc > 75) return 'bear';
+  return 'warn';
 }
 
-function getLrcColor(lrcPct: number): string {
-  // lrc_pct: distance from LRC — low means price is near bottom (bullish)
-  return lrcPct <= 25 ? '#22c55e' : '#ef4444';
-}
-
-const SymbolCard: React.FC<SymbolCardProps> = ({ symbol, onClick }) => {
-  const { base, quote } = splitSymbol(symbol.symbol);
-  const isSenal = symbol.señal === true;
-  const isSetup = !isSenal && symbol.gatillo === true;
-
-  const lrc    = symbol.lrc_pct ?? 0;
-  const score  = symbol.score   ?? 0;
-  const price  = symbol.live_price ?? symbol.price ?? 0;
-
-  // Clamp lrc_pct to 0–100 for bar display
-  const lrcBarPct   = Math.min(100, Math.max(0, lrc));
-  // Score 0–9 for bar
-  const scoreBarPct = Math.min(100, Math.max(0, (score / 9) * 100));
-
-  let cardClass = 'symbol-card';
-  if (isSenal) cardClass += ' symbol-card--signal';
-  else if (isSetup) cardClass += ' symbol-card--setup';
-
-  const isShort = isSenal && symbol.direction === 'SHORT';
-
-  let badgeClass = 'card-badge';
-  let badgeText = '—';
-  let badgeStyle: React.CSSProperties = {};
-  if (isSenal) {
-    if (isShort) {
-      badgeClass += ' card-badge--short';
-      badgeText = 'SHORT';
-      badgeStyle = {
-        background: 'rgba(239,68,68,0.15)',
-        color: '#ef4444',
-        border: '1px solid rgba(239,68,68,0.3)',
-      };
-    } else {
-      badgeClass += ' card-badge--signal';
-      badgeText = 'LONG';
-      badgeStyle = {
-        background: 'rgba(34,197,94,0.15)',
-        color: '#22c55e',
-        border: '1px solid rgba(34,197,94,0.3)',
-      };
-    }
-  } else if (isSetup) {
-    badgeClass += ' card-badge--setup';
-    badgeText = 'SETUP';
-  }
-
-  const tsFormatted = symbol.ts
-    ? new Date(symbol.ts).toLocaleString('es-ES')
-    : '';
+const SymbolCard: React.FC<SymbolCardProps> = ({
+  symbol, featured = false, scoreStyle = 'grid', fresh = false, onClick,
+}) => {
+  const { base, quote } = splitPair(symbol.symbol);
+  const score = symbol.score   ?? 0;
+  const lrc   = symbol.lrc_pct ?? 0;
+  const tone  = toneOfScore(score);
+  const lrcTone = toneOfLrc(lrc);
+  const components = fakeScoreComponents(score, 9);
+  const side = symbol.direction ?? (symbol.señal ? 'LONG' : 'LONG');
 
   return (
-    <div className={cardClass} onClick={onClick} title="Ver gráfico" style={{ cursor: 'pointer' }}>
-      {/* Top row: symbol + badge */}
-      <div className="card-header">
-        <div className="card-symbol">
-          <span className="card-symbol-base">{base}</span>
-          <span className="card-symbol-quote">/{quote}</span>
+    <article
+      onClick={onClick}
+      className={[
+        styles.sym,
+        featured ? styles.featured : styles.standard,
+        styles[`sym--${tone}`],
+        fresh ? styles.fresh : '',
+        onClick ? styles.clickable : '',
+      ].filter(Boolean).join(' ')}
+      title={onClick ? 'Ver gráfico' : undefined}
+    >
+      {fresh && (
+        <div className={styles.freshFlag}>
+          NUEVO · {symbol.ts ? timeAgo(symbol.ts).replace('hace ', '') : 'ahora'}
         </div>
-        <div className="card-header-right">
-          <span className="card-chart-icon">↗</span>
-          <span className={badgeClass} style={badgeStyle}>
-            {badgeText}
-            {isSenal && !isShort && <span className="badge-dot badge-dot--green" />}
-            {isSenal && isShort && <span className="badge-dot badge-dot--red" />}
-            {isSetup && <span className="badge-dot badge-dot--amber" />}
-          </span>
+      )}
+
+      <header className={styles.header}>
+        <div className={styles.pair}>
+          <span className={styles.pairBase}>{base}</span>
+          <span className={styles.pairQuote}>/{quote}</span>
         </div>
+        <div className={styles.headerRight}>
+          {symbol.señal && <SideBadge side={side} />}
+          {symbol.señal
+            ? <span className={`${styles.setup} ${styles[`setup--${tone}`]}`}>SETUP</span>
+            : symbol.gatillo
+              ? <span className={`${styles.setup} ${styles[`setup--warn`]}`}>SETUP</span>
+              : <span className={`${styles.setup} ${styles[`setup--dim`]}`}>—</span>}
+        </div>
+      </header>
+
+      <div className={styles.priceRow}>
+        <div className={styles.price}>
+          <span className={styles.dollar}>$</span>
+          <span className="num">{formatPrice(symbol.price)}</span>
+        </div>
+        <div className={[
+          styles.change,
+          lrcTone === 'bull' ? styles.changeBull : styles.changeBear,
+        ].join(' ')}>
+          {lrcTone === 'bull' ? '▲' : '▼'}{' '}
+          <span className="num">{lrc.toFixed(1)}%</span>
+        </div>
+        {/* Sparkline is decorative; backend doesn't yet expose tick history.
+            Showing a quiet placeholder shape so layout reads correctly. */}
+        <PriceSpark
+          data={fakePriceSeries(symbol)}
+          width={featured ? 88 : 64}
+          height={featured ? 26 : 20}
+        />
       </div>
 
-      {/* Price */}
-      <div className="card-price">
-        <span className="price-currency">$</span>
-        <span className="price-value">
-          {(symbol.live_price ?? symbol.price) != null ? formatPrice(price) : '—'}
-        </span>
-      </div>
-
-      {/* LRC% bar */}
-      <div className="card-metric">
-        <div className="metric-row">
-          <span className="metric-name">LRC%</span>
-          <span className="metric-val" style={{ color: getLrcColor(lrc) }}>
-            {symbol.lrc_pct != null ? `${lrc.toFixed(1)}%` : '—'}
-          </span>
+      <div className={styles.metrics}>
+        <div className={styles.metric}>
+          <div className={`${styles.metricLabel} label`}>LRC%</div>
+          <div className={`${styles.metricVal} ${styles[`metricVal--${lrcTone}`]}`}>
+            <span className="num">{lrc.toFixed(1)}%</span>
+          </div>
+          <LrcBar value={lrc} />
         </div>
-        <div className="bar-track">
-          <div
-            className="bar-fill"
-            style={{ width: `${lrcBarPct}%`, backgroundColor: getLrcColor(lrc) }}
+
+        <div className={`${styles.metric} ${styles.metricScore}`}>
+          <div className={`${styles.metricLabel} label`}>SCORE</div>
+          <ScoreGrid
+            components={components}
+            score={score}
+            max={9}
+            variant={scoreStyle}
+            size={featured ? 'lg' : 'md'}
           />
         </div>
       </div>
 
-      {/* Score bar */}
-      <div className="card-metric">
-        <div className="metric-row">
-          <span className="metric-name">Score</span>
-          <span className="metric-val" style={{ color: getScoreColor(score) }}>
-            {symbol.score != null ? score.toFixed(0) : '—'}
-          </span>
-        </div>
-        <div className="bar-track">
-          <div
-            className="bar-fill"
-            style={{ width: `${scoreBarPct}%`, backgroundColor: getScoreColor(score) }}
-          />
-        </div>
-      </div>
-
-      {/* Footer: macro + time */}
-      <div className="card-footer">
-        <span className={`macro-badge ${symbol.gatillo ? 'macro-badge--ok' : 'macro-badge--ko'}`}>
-          Trigger {symbol.gatillo ? '✓' : '✗'}
-        </span>
-        <span className="card-time" title={tsFormatted}>
+      <footer className={styles.footer}>
+        <TriggerPill on={symbol.gatillo} />
+        <span className={`${styles.lastUpdated} prose`}>
           {symbol.ts ? timeAgo(symbol.ts) : '—'}
         </span>
-      </div>
-    </div>
+        {featured && onClick && (
+          <button
+            className={`btn btn--primary btn--sm ${styles.cta}`}
+            onClick={(e) => { e.stopPropagation(); onClick(); }}
+          >
+            Abrir posición →
+          </button>
+        )}
+      </footer>
+    </article>
   );
 };
+
+/**
+ * Generate a deterministic fake price series for the sparkline based on
+ * the symbol's identity. When the backend exposes a real recent-tick
+ * series, replace this with the real data.
+ */
+function fakePriceSeries(s: SymbolStatus): number[] {
+  const seed = s.symbol.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0);
+  const base = s.price ?? 100;
+  const drift = (s.lrc_pct ?? 50) <= 25 ? 1 : -1;
+  return Array.from({ length: 15 }, (_, i) => {
+    const noise = Math.sin((seed + i * 7) * 0.7) * 0.4;
+    const trend = (i / 14) * drift * 0.6;
+    return base * (1 + (noise + trend) * 0.01);
+  });
+}
 
 export default SymbolCard;

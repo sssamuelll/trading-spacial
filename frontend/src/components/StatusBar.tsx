@@ -1,61 +1,76 @@
 // ============================================================
-// StatusBar.tsx — 4 metric cards with scanner statistics
+// StatusBar.tsx — dense horizontal strip of scanner metrics.
+//
+// Replaces the original 4 large metric cards. Reads the same
+// `status.scanner_state` fields.
 // ============================================================
 
 import React from 'react';
+import styles from './StatusBar.module.css';
 import type { StatusResponse } from '../types';
 
 interface StatusBarProps {
   status: StatusResponse | null;
 }
 
-interface MetricCardProps {
-  label: string;
-  value: string | number;
-  icon: string;
-  highlight?: boolean;
+interface ItemProps {
+  label:   string;
+  value:   string | number;
+  suffix?: string;
+  tone?:   'bull' | 'bear' | 'warn' | 'neutral' | 'dim';
+  hint?:   string;
 }
-
-const MetricCard: React.FC<MetricCardProps> = ({ label, value, icon, highlight }) => (
-  <div className={`metric-card${highlight ? ' metric-card--highlight' : ''}`}>
-    <div className="metric-icon">{icon}</div>
-    <div className="metric-body">
-      <div className="metric-value">{value}</div>
-      <div className="metric-label">{label}</div>
+const Item: React.FC<ItemProps> = ({ label, value, suffix, tone = 'neutral', hint }) => (
+  <div className={styles.item} title={hint}>
+    <div className={`${styles.label} label`}>{label}</div>
+    <div className={`${styles.value} ${styles[`value--${tone}`]}`}>
+      <span className="num">{typeof value === 'number' ? value.toLocaleString('es-ES') : value}</span>
+      {suffix && <span className={styles.suffix}>{suffix}</span>}
     </div>
   </div>
 );
 
 const StatusBar: React.FC<StatusBarProps> = ({ status }) => {
-  const state = status?.scanner_state;
+  const s = status?.scanner_state;
 
-  const scansTotal = state?.scans_total ?? '—';
-  const signalsTotal = state?.signals_total ?? '—';
-  const errors = state?.errors ?? '—';
-  const lastSymbol = state?.last_symbol ?? '—';
+  const scansTotal   = s?.scans_total   ?? 0;
+  const signalsTotal = s?.signals_total ?? 0;
+  const errors       = s?.errors        ?? 0;
+  const symActive    = s?.symbols_active ?? 0;
+  const lastSymbol   = s?.last_symbol   ?? '—';
 
   return (
-    <div className="status-bar">
-      <MetricCard
-        icon="📊"
-        label="Escaneos totales"
-        value={typeof scansTotal === 'number' ? scansTotal.toLocaleString('es-ES') : scansTotal}
+    <div className={styles.strip}>
+      <Item
+        label="Escaneos"
+        value={scansTotal}
+        suffix={` · ${signalsTotal} señales`}
+        tone="neutral"
+        hint="Total de ciclos de escaneo desde inicio"
       />
-      <MetricCard
-        icon="🎯"
-        label="Señales detectadas"
-        value={typeof signalsTotal === 'number' ? signalsTotal.toLocaleString('es-ES') : signalsTotal}
-        highlight={typeof signalsTotal === 'number' && signalsTotal > 0}
+      <Item
+        label="Señales"
+        value={signalsTotal}
+        tone={signalsTotal > 0 ? 'bull' : 'dim'}
+        hint="Señales detectadas (gatillo 5M confirmado)"
       />
-      <MetricCard
-        icon="⚠️"
+      <Item
         label="Errores"
-        value={typeof errors === 'number' ? errors.toLocaleString('es-ES') : errors}
+        value={errors}
+        tone={errors > 0 ? 'bear' : 'dim'}
+        hint="Fallos en el último ciclo"
       />
-      <MetricCard
-        icon="🔍"
-        label="Último par escaneado"
+      <Item
+        label="Activos"
+        value={symActive}
+        tone="neutral"
+        hint="Símbolos en la watch-list"
+      />
+      <Item
+        label="Último par"
         value={lastSymbol}
+        tone="dim"
+        hint="Último símbolo escaneado"
       />
     </div>
   );

@@ -1,0 +1,14 @@
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border: 1px solid;
+  font-size: 11px;
+  font-family: var(--nbc-font-mono);
+  font-weight: 500;
+}
+.long  { color: var(--bull); border-color: var(--bull); }
+.short { color: var(--bear); border-color: var(--bear); }
+.shape  { font-size: 9px; }
+.letter { font-weight: 600; }

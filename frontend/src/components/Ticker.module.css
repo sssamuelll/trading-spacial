@@ -1,0 +1,78 @@
+.ticker {
+  display: flex;
+  align-items: center;
+  height: 30px;
+  background: #080b09;
+  border-bottom: 1px solid var(--nbc-border-dim);
+  font-family: var(--nbc-font-mono);
+  font-size: 11.5px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.brand {
+  flex-shrink: 0;
+  padding: 0 14px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  font-size: 9.5px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--bull);
+  border-right: 1px solid var(--nbc-border-dimmer);
+}
+
+.viewport {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  height: 100%;
+  display: flex;
+  align-items: center;
+}
+.viewport::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 40px;
+  background: linear-gradient(90deg, transparent, #080b09);
+  pointer-events: none;
+}
+.viewport::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 16px;
+  background: linear-gradient(-90deg, transparent, #080b09);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.track {
+  display: flex;
+  gap: 20px;
+  white-space: nowrap;
+  animation: tickerRoll 70s linear infinite;
+  padding-left: 20px;
+}
+.paused .track { animation: none; }
+@keyframes tickerRoll {
+  to { transform: translateX(-50%); }
+}
+
+.item {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.pair  { color: var(--nbc-fg); font-weight: 500; }
+.price { color: var(--nbc-fg-muted); }
+.chg   { font-size: 10.5px; }
+.chgBull { color: var(--bull); }
+.chgBear { color: var(--bear); }
+.sep   { color: var(--nbc-fg-dim); margin: 0 4px; }

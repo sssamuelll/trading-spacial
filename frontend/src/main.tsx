@@ -5,7 +5,20 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
+
+// Foundation styles — order matters.
+// (1) Legacy stylesheet — still in use by Positions, Kill-switch, modals,
+//     NotificationToast, ErrorBoundary, auth pages. These will be migrated
+//     in follow-up PRs; until then App.css owns their CSS.
 import './App.css';
+// (2) New design tokens — defines all --nbc-*, --bull, --bear, --d-* CSS
+//     custom properties consumed by every .module.css file below.
+import './styles/tokens.css';
+// (3) Base reset + global utility classes (.btn, .label, .num, .prose, .term).
+//     Defined AFTER App.css so the new visual language wins for shared
+//     selectors like `.btn`.
+import './styles/base.css';
+
 import App from './App';
 import { AuthProvider } from './auth/AuthContext';
 import { LoginPage } from './auth/LoginPage';

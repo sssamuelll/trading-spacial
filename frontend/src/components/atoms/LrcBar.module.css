@@ -1,0 +1,27 @@
+.bar {
+  position: relative;
+  height: 6px;
+  margin-top: 4px;
+}
+.track {
+  position: absolute;
+  inset: 0;
+  background: var(--nbc-surface-alt);
+  border: 1px solid var(--nbc-border-dimmer);
+}
+.zone {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: var(--bull-dim);
+  border-left:  1px solid var(--bull);
+  border-right: 1px solid var(--bull);
+}
+.pointer {
+  position: absolute;
+  top: -2px;
+  width: 2px;
+  height: 10px;
+  background: var(--nbc-fg);
+  transform: translateX(-50%);
+}
