@@ -1,0 +1,78 @@
+/* ============================================================
+   App.module.css — top-level layout shell
+   ============================================================ */
+
+.app {
+  background: var(--nbc-bg);
+  color: var(--nbc-fg);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+.appDesktop {
+  padding: 0;
+  gap: 0;
+}
+.appMobile {
+  padding: 0 0 64px;
+  gap: 0;
+  position: relative;
+}
+
+.body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.appMobile .body { display: block; }
+
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px 24px 24px;
+}
+.appMobile .main {
+  padding: 0 12px;
+  gap: 12px;
+}
+
+.errorBanner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: rgba(255, 184, 78, 0.10);
+  border: 1px solid var(--bear);
+  color: var(--bear);
+  font-size: 12px;
+}
+.errorBanner button {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid transparent;
+  color: inherit;
+  cursor: pointer;
+  padding: 2px 8px;
+}
+.errorBanner button:hover { border-color: currentColor; }
+
+.footer {
+  margin-top: auto;
+  padding: 16px 0 0;
+  border-top: 1px solid var(--nbc-border-dimmer);
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--nbc-fg-dim);
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.appMobile .footer {
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 0;
+  text-align: center;
+}
