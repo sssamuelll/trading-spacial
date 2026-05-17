@@ -25,6 +25,8 @@ export interface SymbolStatus {
   live_price?: number | null;
   /** Rolling buffer of recent prices for the sparkline. Populated client-side by `useLiveTicker` from successive ticker polls — empty on mount, grows over time. */
   recent_closes?: number[];
+  /** 24h percent change. Populated client-side from /ticker (Binance 24hr endpoint). */
+  change_24h?: number | null;
   lrc_pct: number | null;
   score: number | null;
   señal: boolean;

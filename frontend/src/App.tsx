@@ -139,14 +139,15 @@ const App: React.FC = () => {
   // Live ticker poll (3s). Overrides `live_price` from /symbols so prices
   // refresh in seconds, and accumulates a per-symbol price history buffer
   // that drives the sparkline in the watchlist cards / rows.
-  const { prices: tickerPrices, history: tickerHistory } = useLiveTicker(3000);
+  const { prices: tickerPrices, changes: tickerChanges, history: tickerHistory } = useLiveTicker(3000);
   const symbols = useMemo(
     () => symbolsRaw.map((s) => ({
       ...s,
       live_price:    tickerPrices[s.symbol]  ?? s.live_price,
+      change_24h:    tickerChanges[s.symbol] ?? s.change_24h ?? null,
       recent_closes: tickerHistory[s.symbol] ?? s.recent_closes ?? [],
     })),
-    [symbolsRaw, tickerPrices, tickerHistory],
+    [symbolsRaw, tickerPrices, tickerChanges, tickerHistory],
   );
 
   const focus = useMemo(
@@ -230,7 +231,7 @@ const App: React.FC = () => {
         mobile={mobile}
       />
 
-      <Ticker symbols={symbols} />
+      <Ticker symbols={symbols} onSymbolClick={setSelectedSymbol} />
 
       <div className={appStyles.body}>
         {!mobile && (
