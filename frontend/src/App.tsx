@@ -45,6 +45,7 @@ import type { MainTab, SymbolsFilter } from './types-ui';
 import { useAuth } from './auth/useAuth';
 import { useScanCountdown } from './hooks/useScanCountdown';
 import { useIsMobile } from './hooks/useIsMobile';
+import { useLiveTicker } from './hooks/useLiveTicker';
 import { computeFocus } from './helpers/hierarchy';
 
 import ChartModal from './components/ChartModal';
@@ -78,7 +79,9 @@ const App: React.FC = () => {
   const mobile = useIsMobile();
 
   // ── data ───────────────────────────────────────────────
-  const [symbols,     setSymbols]     = useState<SymbolStatus[]>([]);
+  // Raw symbols from /symbols. The exposed `symbols` (further down) overlays
+  // live ticker prices on top so the dashboard refreshes in seconds.
+  const [symbolsRaw,  setSymbols]     = useState<SymbolStatus[]>([]);
   const [status,      setStatus]      = useState<StatusResponse | null>(null);
   const [signals,     setSignals]     = useState<Signal[]>([]);
   const [positions,   setPositions]   = useState<Position[]>([]);
@@ -132,6 +135,17 @@ const App: React.FC = () => {
   // ── derived state ──────────────────────────────────────
   const lastRefreshTs = lastRefresh ? lastRefresh.getTime() : null;
   const { progress, secsLeft } = useScanCountdown(REFRESH_INTERVAL_MS, lastRefreshTs);
+
+  // Live ticker poll (3s). Overrides `live_price` from /symbols so prices
+  // refresh in seconds instead of every 5-min scan cycle.
+  const tickerPrices = useLiveTicker(3000);
+  const symbols = useMemo(
+    () => symbolsRaw.map((s) => (
+      tickerPrices[s.symbol] != null ? { ...s, live_price: tickerPrices[s.symbol] } : s
+    )),
+    [symbolsRaw, tickerPrices],
+  );
+
   const focus = useMemo(
     () => computeFocus(symbols, positions, status, Date.now()),
     [symbols, positions, status],
