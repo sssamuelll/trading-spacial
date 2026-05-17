@@ -24,6 +24,9 @@ interface SymbolsGridProps {
   onSymbolClick?: (s: SymbolStatus) => void;
   scoreStyle?:    ScoreVariant;
   freshWithinMin?: number;
+  /** Slot rendered inside the Mercado section, just below the pageBar.
+   *  Currently the dashboard wires StatusBar + FocusPanel here. */
+  belowPageBar?: React.ReactNode;
 }
 
 const SkeletonCard: React.FC = () => (
@@ -38,7 +41,7 @@ const SkeletonCard: React.FC = () => (
 
 const SymbolsGrid: React.FC<SymbolsGridProps> = ({
   symbols, loading, filter, onFilterChange, onSymbolClick,
-  scoreStyle = 'big', freshWithinMin = 8,
+  scoreStyle = 'big', freshWithinMin = 8, belowPageBar,
 }) => {
   const now = Date.now();
   const isFresh = (s: SymbolStatus) =>
@@ -73,6 +76,10 @@ const SymbolsGrid: React.FC<SymbolsGridProps> = ({
           <Chip active={filter === 'fresh'}   onClick={() => onFilterChange('fresh')}  >Nuevos  <span className="num">{totalFresh}</span></Chip>
         </div>
       </div>
+
+      {belowPageBar && (
+        <div className={styles.belowPageBar}>{belowPageBar}</div>
+      )}
 
       {loading ? (
         <div className={styles.gridStandard}>

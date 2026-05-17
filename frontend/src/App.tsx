@@ -261,20 +261,6 @@ const App: React.FC = () => {
           {/* ── Mercado ────────────────────────────────── */}
           {mainTab === 'mercado' && (
             <>
-              <StatusBar status={status} macro={macro} />
-              <FocusPanel
-                items={focus}
-                onAction={(it) => {
-                  if (it.pair) {
-                    const sym = symbols.find((s) => s.symbol === it.pair);
-                    if (sym) setSelectedSymbol(sym);
-                  }
-                  if (it.kind === 'risk-position' || it.kind === 'near-tp') {
-                    setMainTab('posiciones');
-                  }
-                }}
-              />
-
               <ErrorBoundary fallbackLabel="Error en el grid de símbolos">
                 <SymbolsGrid
                   symbols={symbols}
@@ -282,6 +268,23 @@ const App: React.FC = () => {
                   filter={filter}
                   onFilterChange={setFilter}
                   onSymbolClick={setSelectedSymbol}
+                  belowPageBar={
+                    <>
+                      <StatusBar status={status} macro={macro} />
+                      <FocusPanel
+                        items={focus}
+                        onAction={(it) => {
+                          if (it.pair) {
+                            const sym = symbols.find((s) => s.symbol === it.pair);
+                            if (sym) setSelectedSymbol(sym);
+                          }
+                          if (it.kind === 'risk-position' || it.kind === 'near-tp') {
+                            setMainTab('posiciones');
+                          }
+                        }}
+                      />
+                    </>
+                  }
                 />
               </ErrorBoundary>
 
