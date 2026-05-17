@@ -8,7 +8,15 @@ import { openPosition } from '../api';
 
 interface OpenPositionModalProps {
   symbols:   SymbolStatus[];
-  prefill?:  { symbol: string; price?: number | null; sl?: number | null; tp?: number | null; scan_id?: number | null };
+  prefill?:  {
+    symbol:    string;
+    price?:    number | null;
+    sl?:       number | null;
+    tp?:       number | null;
+    scan_id?:  number | null;
+    direction?: 'LONG' | 'SHORT';   // optional — set when coming from a SymbolDetail preset
+    sizeUsd?:  number;              // optional — populates the "Capital" field
+  };
   onClose:   () => void;
   onCreated: () => void;
 }
@@ -16,12 +24,12 @@ interface OpenPositionModalProps {
 const OpenPositionModal: React.FC<OpenPositionModalProps> = ({
   symbols, prefill, onClose, onCreated,
 }) => {
-  const [symbol,     setSymbol]     = useState(prefill?.symbol   ?? 'BTCUSDT');
-  const [direction,  setDirection]  = useState<'LONG' | 'SHORT'>('LONG');
+  const [symbol,     setSymbol]     = useState(prefill?.symbol    ?? 'BTCUSDT');
+  const [direction,  setDirection]  = useState<'LONG' | 'SHORT'>(prefill?.direction ?? 'LONG');
   const [entryPrice, setEntryPrice] = useState(String(prefill?.price ?? ''));
   const [slPrice,    setSlPrice]    = useState(String(prefill?.sl    ?? ''));
   const [tpPrice,    setTpPrice]    = useState(String(prefill?.tp    ?? ''));
-  const [sizeUsd,    setSizeUsd]    = useState('');
+  const [sizeUsd,    setSizeUsd]    = useState(prefill?.sizeUsd != null ? String(prefill.sizeUsd.toFixed(2)) : '');
   const [notes,      setNotes]      = useState('');
   const [saving,     setSaving]     = useState(false);
   const [error,      setError]      = useState<string | null>(null);

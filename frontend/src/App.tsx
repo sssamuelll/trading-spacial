@@ -50,6 +50,7 @@ import { useMacro } from './hooks/useMacro';
 import { computeFocus } from './helpers/hierarchy';
 
 import ChartModal from './components/ChartModal';
+import SymbolDetail, { type PositionPreset } from './components/SymbolDetail';
 import ErrorBoundary from './components/ErrorBoundary';
 import Header from './components/Header';
 import StatusBar from './components/StatusBar';
@@ -102,6 +103,9 @@ const App: React.FC = () => {
 
   // Signal to open as position (passed from SignalsTable → PositionsPanel)
   const [signalForPos, setSignalForPos] = useState<Signal | null>(null);
+
+  // Preset to open as position (passed from SymbolDetail → PositionsPanel)
+  const [presetForPos, setPresetForPos] = useState<PositionPreset | null>(null);
 
   // ── data fetching ──────────────────────────────────────
   const fetchAll = useCallback(async () => {
@@ -189,6 +193,12 @@ const App: React.FC = () => {
 
   const handleOpenFromSignal = useCallback((signal: Signal) => {
     setSignalForPos(signal);
+    setMainTab('posiciones');
+  }, []);
+
+  const handleOpenFromPreset = useCallback((preset: PositionPreset) => {
+    setSelectedSymbol(null);      // close SymbolDetail
+    setPresetForPos(preset);
     setMainTab('posiciones');
   }, []);
 
@@ -306,6 +316,8 @@ const App: React.FC = () => {
                 symbols={symbols}
                 onOpenFromSignal={signalForPos}
                 onSignalConsumed={() => setSignalForPos(null)}
+                onOpenFromPreset={presetForPos}
+                onPresetConsumed={() => setPresetForPos(null)}
               />
             </ErrorBoundary>
           )}
@@ -359,10 +371,17 @@ const App: React.FC = () => {
         />
       )}
 
-      <ChartModal
+      <SymbolDetail
         symbol={selectedSymbol}
         onClose={() => setSelectedSymbol(null)}
+        onOpenPosition={handleOpenFromPreset}
       />
+
+      {/* DEPRECATED: replaced by SymbolDetail. ChartModal kept imported
+          (and rendered behind a permanent false guard) so we can swap
+          back to it from a single line edit if SymbolDetail misbehaves
+          in staging. Delete this branch + the import once verified. */}
+      {false && <ChartModal symbol={selectedSymbol} onClose={() => setSelectedSymbol(null)} />}
     </div>
   );
 };

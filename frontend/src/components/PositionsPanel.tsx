@@ -4,6 +4,7 @@
 
 import React, { useState, useCallback, useEffect } from 'react';
 import type { Position, SymbolStatus, Signal } from '../types';
+import type { PositionPreset } from './SymbolDetail';
 import { getPositions, closePosition, cancelPosition, updatePosition } from '../api';
 import { timeAgo, formatPrice } from '../utils';
 import OpenPositionModal from './OpenPositionModal';
@@ -12,6 +13,9 @@ interface PositionsPanelProps {
   symbols:    SymbolStatus[];    // para precio en tiempo real
   onOpenFromSignal?: Signal | null;
   onSignalConsumed?: () => void;
+  /** Preset delivered by SymbolDetail's "Abrir esta posición" CTA. */
+  onOpenFromPreset?: PositionPreset | null;
+  onPresetConsumed?: () => void;
 }
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -168,6 +172,8 @@ const PositionsPanel: React.FC<PositionsPanelProps> = ({
   symbols,
   onOpenFromSignal,
   onSignalConsumed,
+  onOpenFromPreset,
+  onPresetConsumed,
 }) => {
   const [positions,   setPositions]   = useState<Position[]>([]);
   const [loading,     setLoading]     = useState(true);
@@ -175,7 +181,15 @@ const PositionsPanel: React.FC<PositionsPanelProps> = ({
   const [openModal,   setOpenModal]   = useState(false);
   const [closingId,   setClosingId]   = useState<number | null>(null);
   const [editingId,   setEditingId]   = useState<number | null>(null);
-  type PrefillData = { symbol: string; price?: number | null; sl?: number | null; tp?: number | null; scan_id?: number | null };
+  type PrefillData = {
+    symbol:    string;
+    price?:    number | null;
+    sl?:       number | null;
+    tp?:       number | null;
+    scan_id?:  number | null;
+    direction?: 'LONG' | 'SHORT';
+    sizeUsd?:  number;
+  };
   const [prefill,     setPrefill]     = useState<PrefillData | undefined>();
 
   const prices = priceMap(symbols);
@@ -211,6 +225,23 @@ const PositionsPanel: React.FC<PositionsPanelProps> = ({
       onSignalConsumed?.();
     }
   }, [onOpenFromSignal, onSignalConsumed]);
+
+  // If a SymbolDetail preset was passed from outside, pre-fill the modal
+  // with the calculator's entry/SL/TP/size + direction.
+  useEffect(() => {
+    if (onOpenFromPreset) {
+      setPrefill({
+        symbol:    onOpenFromPreset.symbol,
+        price:     onOpenFromPreset.entry,
+        sl:        onOpenFromPreset.sl,
+        tp:        onOpenFromPreset.tp,
+        direction: onOpenFromPreset.direction,
+        sizeUsd:   onOpenFromPreset.sizeUsd,
+      });
+      setOpenModal(true);
+      onPresetConsumed?.();
+    }
+  }, [onOpenFromPreset, onPresetConsumed]);
 
   const handleClose = async (id: number, exitPrice: number) => {
     try {
