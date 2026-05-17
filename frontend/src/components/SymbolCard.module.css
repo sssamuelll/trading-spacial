@@ -19,10 +19,6 @@
   border-color: var(--bull);
   box-shadow: 0 0 0 1px var(--bull-dim) inset;
 }
-.standard.sym--dim {
-  border-color: var(--nbc-border-dimmer);
-  opacity: 0.85;
-}
 
 .fresh::before {
   content: "";
