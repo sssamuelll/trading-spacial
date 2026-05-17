@@ -1,0 +1,49 @@
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  border: 1px solid;
+  font-family: var(--nbc-font-mono);
+  white-space: nowrap;
+}
+
+.icon { font-size: 9px; line-height: 1; }
+
+/* Fireable signal — the brightest state. */
+.pill--signal {
+  color:        var(--bull);
+  border-color: var(--bull);
+  background:   #6ad7ff14;
+}
+.pill--signal .icon { color: var(--bull); }
+
+/* Setup + gatillo aligned but not firing (something else gated it).
+   Same cyan family but without the bg highlight. */
+.pill--armed {
+  color:        var(--bull);
+  border-color: var(--bull);
+}
+
+/* Setup detected, waiting on gatillo. Warning amber. */
+.pill--setup {
+  color:        var(--warn);
+  border-color: var(--warn);
+}
+
+/* Excluded by E2-E5 manual gating. */
+.pill--blocked {
+  color:        var(--bear);
+  border-color: var(--bear);
+  background:   #ffb84e14;
+}
+
+/* Default — nothing actionable. Quiet, gray, almost invisible. */
+.pill--idle {
+  color:        var(--nbc-fg-dim);
+  border-color: var(--nbc-border-dimmer);
+}

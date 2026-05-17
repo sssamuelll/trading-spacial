@@ -87,6 +87,14 @@ body {
    Legacy `.btn.btn-primary` etc still live in App.css until
    their owning components are migrated.
    ============================================================ */
+/* Neo-brutalist buttons.
+ *   - sharp corners (radius 2px from tokens.css)
+ *   - hard offset shadow as the "resting" elevation on primary / danger
+ *   - hover bumps the shadow + nudges the button up-left
+ *   - active "presses in": shadow disappears, button slides into where the
+ *     shadow was — tactile feedback without any easing curve
+ *   - ghost + icon stay flat (no shadow) so they read as secondary
+ */
 .btn {
   position: relative;
   display: inline-flex;
@@ -98,31 +106,65 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.10em;
   border: 1px solid var(--nbc-border-dim);
+  border-radius: var(--nbc-button-radius);
   background: transparent;
   color: var(--nbc-fg);
   padding: 7px 12px;
   font-size: 11px;
   cursor: pointer;
-  transition: background 80ms ease, border-color 80ms ease, color 80ms ease;
+  transition: background 80ms ease, border-color 80ms ease, color 80ms ease,
+              box-shadow 80ms ease, transform 80ms ease;
   white-space: nowrap;
 }
 .btn:hover { border-color: var(--nbc-secondary); color: var(--nbc-secondary); }
 .btn:focus-visible { outline: none; background: var(--bull); color: var(--nbc-primary-fg); border-color: var(--bull); }
-.btn:active { transform: translateY(1px); }
-.btn:disabled, .btn--disabled { opacity: 0.4; cursor: not-allowed; }
+.btn:active { transform: translate(1px, 1px); box-shadow: none; }
+.btn:disabled, .btn--disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none !important; transform: none !important; }
 
 .btn--sm   { padding: 5px 10px; font-size: 10px; }
 .btn--icon { width: 30px; height: 30px; padding: 0; position: relative; }
 .btn--icon.btn--sm { width: 26px; height: 26px; }
 
-.btn--primary  { background: transparent; color: var(--bull); border-color: var(--bull); }
-.btn--primary:hover { background: var(--bull); color: var(--nbc-primary-fg); border-color: var(--bull); }
+/* Primary — cyan, brutalist resting shadow, presses in on click. */
+.btn--primary {
+  background: transparent;
+  color: var(--bull);
+  border-color: var(--bull);
+  box-shadow: 2px 2px 0 var(--bull-dim);
+}
+.btn--primary:hover {
+  background: var(--bull);
+  color: var(--nbc-primary-fg);
+  border-color: var(--bull);
+  box-shadow: 3px 3px 0 var(--bull-dim);
+  transform: translate(-1px, -1px);
+}
+.btn--primary:active {
+  transform: translate(2px, 2px);
+  box-shadow: none;
+}
 
+/* Ghost — flat secondary action, no shadow even on hover (stays "quiet"). */
 .btn--ghost   { border-color: transparent; color: var(--nbc-fg-muted); }
 .btn--ghost:hover { border-color: var(--nbc-border-dim); color: var(--nbc-fg); background: var(--nbc-surface-alt); }
+.btn--ghost:active { transform: translate(1px, 1px); }
 
-.btn--danger  { border-color: var(--bear); color: var(--bear); }
-.btn--danger:hover { background: var(--bear); color: #fff; }
+/* Danger — same brutalist signature as primary but amber. */
+.btn--danger {
+  border-color: var(--bear);
+  color: var(--bear);
+  box-shadow: 2px 2px 0 var(--bear-dim);
+}
+.btn--danger:hover {
+  background: var(--bear);
+  color: #fff;
+  box-shadow: 3px 3px 0 var(--bear-dim);
+  transform: translate(-1px, -1px);
+}
+.btn--danger:active {
+  transform: translate(2px, 2px);
+  box-shadow: none;
+}
 
 .btn--active {
   border-color: var(--bull) !important;

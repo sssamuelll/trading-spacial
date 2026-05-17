@@ -10,7 +10,7 @@ import { formatPrice, timeAgo } from '../utils';
 import ScoreGrid, { type ScoreVariant } from './atoms/ScoreGrid';
 import LrcBar from './atoms/LrcBar';
 import SideBadge from './atoms/SideBadge';
-import TriggerPill from './atoms/TriggerPill';
+import StatusPill from './atoms/StatusPill';
 import PriceSpark from './atoms/PriceSpark';
 import { fakeScoreComponents } from '../helpers/hierarchy';
 
@@ -129,7 +129,12 @@ const SymbolCard: React.FC<SymbolCardProps> = ({
       </div>
 
       <footer className={styles.footer}>
-        <TriggerPill on={symbol.gatillo} />
+        <StatusPill
+          señal={symbol.señal}
+          setup={symbol.setup ?? false}
+          gatillo={symbol.gatillo}
+          estado={symbol.estado}
+        />
         <span className={`${styles.lastUpdated} prose`}>
           {symbol.ts ? timeAgo(symbol.ts) : '—'}
         </span>

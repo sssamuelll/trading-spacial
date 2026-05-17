@@ -30,6 +30,8 @@ export interface SymbolStatus {
   lrc_pct: number | null;
   score: number | null;
   señal: boolean;
+  /** 1H setup detected (LRC in zone + indicator conditions). Independent of gatillo. */
+  setup?: boolean;
   gatillo: boolean;
   ts: string | null;
   sizing_1h?: Sizing1h;
@@ -49,7 +51,10 @@ export interface ScannerState {
   scans_total: number;
   signals_total: number;
   errors: number;
-  symbols_active: number;
+  /** List of curated symbol IDs (e.g. ["BTCUSDT", "ETHUSDT", ...]). */
+  symbols_active: string[];
+  /** ISO timestamp when the scanner thread entered its loop. Used for uptime display. */
+  started_at: string | null;
 }
 
 export interface StatusResponse {

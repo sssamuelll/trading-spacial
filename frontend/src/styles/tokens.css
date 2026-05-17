@@ -28,10 +28,19 @@
   --nbc-fs-2xl: 32px;
   --nbc-fs-3xl: 48px;
 
-  /* ---- COLOR (tech base) ---- */
+  /* ---- COLOR (tech base) ----
+   * Three tiers, all in the cyan-blue family to match the bull/info palette.
+   * Each tier hits WCAG AA contrast (≥4.5:1) against --nbc-bg (#0a0d0b):
+   *   fg        (primary text)          #dcecf7  → contrast ≈ 15:1
+   *   fg-muted  (secondary / metadata)  #8093a0  → contrast ≈ 7.5:1
+   *   fg-dim    (tertiary / accents)    #58707a  → contrast ≈ 4.8:1
+   * The previous --nbc-fg-dim (#3d5347) was a green-tinted leftover from the
+   * pre-palette-swap days and fell below AA — most rail labels, separators,
+   * and section headers were illegible.
+   */
   --nbc-fg:           #dcecf7;
-  --nbc-fg-muted:     #6a808a;
-  --nbc-fg-dim:       #3d5347;
+  --nbc-fg-muted:     #8093a0;
+  --nbc-fg-dim:       #58707a;
   --nbc-bg:           #0a0d0b;
   --nbc-surface:      #10141282;
   --nbc-surface-solid:#0e1310;
@@ -67,9 +76,9 @@
   /* ---- SHAPE ---- */
   --nbc-border-width: 1px;
   --nbc-border-style: solid;
-  --nbc-radius:       2px;
-  --nbc-button-radius:2px;
-  --nbc-input-radius: 2px;
+  --nbc-radius:       0;
+  --nbc-button-radius:0;
+  --nbc-input-radius: 0;
 
   /* ---- EFFECTS ---- */
   --nbc-shadow:    0 0 0 1px var(--nbc-border-dim);

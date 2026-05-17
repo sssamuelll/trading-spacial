@@ -26,7 +26,7 @@
   font-size: 9px;
   letter-spacing: 0.20em;
   text-transform: uppercase;
-  color: var(--nbc-fg-dim);
+  color: var(--nbc-fg-muted);
   padding: 8px 8px 4px;
 }
 .sectionLabel::before {

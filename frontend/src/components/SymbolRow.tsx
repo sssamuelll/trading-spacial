@@ -7,7 +7,7 @@ import styles from './SymbolRow.module.css';
 import type { SymbolStatus } from '../types';
 import { formatPrice } from '../utils';
 import ScoreGrid from './atoms/ScoreGrid';
-import TriggerPill from './atoms/TriggerPill';
+import StatusPill from './atoms/StatusPill';
 import PriceSpark from './atoms/PriceSpark';
 import { fakeScoreComponents } from '../helpers/hierarchy';
 
@@ -46,7 +46,12 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, onClick }) => {
         <ScoreGrid components={components} score={score} max={9} variant="big" size="sm" />
       </div>
       <div className={styles.trigger}>
-        <TriggerPill on={symbol.gatillo} />
+        <StatusPill
+          señal={symbol.señal}
+          setup={symbol.setup ?? false}
+          gatillo={symbol.gatillo}
+          estado={symbol.estado}
+        />
       </div>
       <button
         className="btn btn--ghost btn--sm"

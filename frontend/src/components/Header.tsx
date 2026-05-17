@@ -43,6 +43,30 @@ function formatTime(date: Date | null): string {
   return date.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+/** Compact uptime label from an ISO timestamp. "7d 14h" / "3h 22m" / "47s". */
+function formatUptime(startedAt: string | null | undefined, nowMs: number): string {
+  if (!startedAt) return '—';
+  const start = new Date(startedAt).getTime();
+  if (Number.isNaN(start)) return '—';
+  const sec = Math.max(0, Math.floor((nowMs - start) / 1000));
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${sec}s`;
+}
+
+/** Map backend role IDs to human-facing UI labels. */
+function roleLabel(role: string | null | undefined): string {
+  if (!role) return '';
+  const r = role.toLowerCase();
+  if (r === 'admin')  return 'operador';
+  if (r === 'viewer') return 'observador';
+  return r;
+}
+
 interface HeaderProps {
   status:        StatusResponse | null;
   user:          AuthUser | null;
@@ -123,7 +147,7 @@ const Header: React.FC<HeaderProps> = (props) => {
           <TeleStat label="scans"   value={scanner?.scans_total   ?? '—'} />
           <TeleStat label="signals" value={scanner?.signals_total ?? '—'} tone="bull" />
           <TeleStat label="err"     value={scanner?.errors        ?? '—'} tone={(scanner?.errors ?? 0) > 0 ? 'bear' : 'dim'} />
-          <TeleStat label="active"  value={scanner?.symbols_active ?? '—'} />
+          <TeleStat label="uptime"  value={formatUptime(scanner?.started_at, Date.now())} tone="neutral" />
         </div>
 
         {/* Command bar */}
@@ -191,7 +215,7 @@ const Header: React.FC<HeaderProps> = (props) => {
               <div className={styles.userDot} />
               <div className={styles.userText}>
                 <div className={styles.userEmail}>{user.email}</div>
-                <div className={styles.userRole}>{user.role}</div>
+                <div className={styles.userRole}>{roleLabel(user.role)}</div>
               </div>
               <span className={styles.userChev}>▾</span>
             </button>

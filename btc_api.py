@@ -423,6 +423,7 @@ def list_symbols():
             "lrc_pct":    row["lrc_pct"]       if row else None,
             "score":      row["score"]         if row else None,
             "señal":      bool(row["señal"])   if row else False,
+            "setup":      bool(row["setup"])   if row else False,
             "gatillo":    bool(row["gatillo"]) if row else False,
             "ts":         row["ts"]            if row else None,
         })

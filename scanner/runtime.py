@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from typing import List
 
 import requests as req_lib
@@ -57,6 +58,7 @@ _scanner_state: dict = {
     "signals_total":  0,
     "errors":         0,
     "symbols_active": [],
+    "started_at":     None,   # ISO-8601 UTC; set when the scanner thread enters its loop
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,6 +300,7 @@ def scanner_loop():
     n_sym    = cfg.get("num_symbols", 20)
     log.info(f"Scanner iniciado — intervalo: {interval}s  |  simbolos: {n_sym}")
     _scanner_state["running"] = True
+    _scanner_state["started_at"] = datetime.now(timezone.utc).isoformat()
 
     while _scanner_state["running"]:
         cycle_start = time.time()
