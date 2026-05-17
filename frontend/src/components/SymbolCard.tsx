@@ -88,7 +88,7 @@ const SymbolCard: React.FC<SymbolCardProps> = ({
       <div className={styles.priceRow}>
         <div className={styles.price}>
           <span className={styles.dollar}>$</span>
-          <span className="num">{formatPrice(symbol.price)}</span>
+          <span className="num">{formatPrice(symbol.live_price ?? symbol.price)}</span>
         </div>
         <div className={[
           styles.change,
