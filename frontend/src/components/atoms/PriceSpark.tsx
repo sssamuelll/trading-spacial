@@ -1,12 +1,16 @@
 // ============================================================
-// PriceSpark — small SVG sparkline of price ticks.
+// PriceSpark — sparkline of recent ticker samples.
 //
-// Distinct from the existing Sparkline.tsx, which renders W/L/null
-// trade outcomes for the kill-switch view. This one takes a number[]
-// price series and auto-colors bull/bear based on first vs last value.
+// Renders nothing for <2 data points (otherwise react-sparklines'
+// auto-scaling produces a flat ugly line). Auto-colors based on
+// first vs last sample (bull/bear) unless `color` is provided.
+//
+// Data source is the rolling buffer populated by `useLiveTicker` in
+// App.tsx, propagated as `symbol.recent_closes`.
 // ============================================================
 
 import React from 'react';
+import { Sparklines, SparklinesLine } from 'react-sparklines';
 
 interface PriceSparkProps {
   data: number[];
@@ -18,31 +22,21 @@ interface PriceSparkProps {
 const PriceSpark: React.FC<PriceSparkProps> = ({
   data, width = 60, height = 18, color,
 }) => {
-  if (!data || data.length < 2) return null;
-  const min = Math.min(...data);
-  const max = Math.max(...data);
-  const range = (max - min) || 1;
-  const stride = width / (data.length - 1);
-  const points = data
-    .map((v, i) => {
-      const x = i * stride;
-      const y = height - ((v - min) / range) * height;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(' ');
+  if (!data || data.length < 2) {
+    // Reserve the slot so layout doesn't jump when data arrives.
+    return <span style={{ display: 'inline-block', width, height }} aria-hidden="true" />;
+  }
   const isUp = data[data.length - 1] >= data[0];
   const stroke = color ?? (isUp ? 'var(--bull)' : 'var(--bear)');
   return (
-    <svg width={width} height={height} aria-hidden="true" style={{ opacity: 0.85 }}>
-      <polyline
-        points={points}
-        fill="none"
-        stroke={stroke}
-        strokeWidth="1.25"
-        strokeLinejoin="round"
-        strokeLinecap="round"
-      />
-    </svg>
+    <span style={{ display: 'inline-flex', width, height, opacity: 0.85 }} aria-hidden="true">
+      <Sparklines data={data} width={width} height={height} margin={1}>
+        <SparklinesLine
+          color={stroke}
+          style={{ strokeWidth: 1.25, fill: 'none', strokeLinejoin: 'round', strokeLinecap: 'round' }}
+        />
+      </Sparklines>
+    </span>
   );
 };
 

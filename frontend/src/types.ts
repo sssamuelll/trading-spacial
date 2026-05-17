@@ -23,6 +23,8 @@ export interface SymbolStatus {
   price: number | null;
   /** Display price (5m close). Refreshes every scan. Prefer this for rendering; fall back to `price`. */
   live_price?: number | null;
+  /** Rolling buffer of recent prices for the sparkline. Populated client-side by `useLiveTicker` from successive ticker polls — empty on mount, grows over time. */
+  recent_closes?: number[];
   lrc_pct: number | null;
   score: number | null;
   señal: boolean;

@@ -97,10 +97,11 @@ const SymbolCard: React.FC<SymbolCardProps> = ({
           {lrcTone === 'bull' ? '▲' : '▼'}{' '}
           <span className="num">{lrc.toFixed(1)}%</span>
         </div>
-        {/* Sparkline is decorative; backend doesn't yet expose tick history.
-            Showing a quiet placeholder shape so layout reads correctly. */}
+        {/* Real-time sparkline. Data is the rolling buffer accumulated by
+            `useLiveTicker` (one sample per ~3s ticker poll). Empty on first
+            mount; grows over the session. */}
         <PriceSpark
-          data={fakePriceSeries(symbol)}
+          data={symbol.recent_closes ?? []}
           width={featured ? 88 : 64}
           height={featured ? 26 : 20}
         />
@@ -144,21 +145,5 @@ const SymbolCard: React.FC<SymbolCardProps> = ({
     </article>
   );
 };
-
-/**
- * Generate a deterministic fake price series for the sparkline based on
- * the symbol's identity. When the backend exposes a real recent-tick
- * series, replace this with the real data.
- */
-function fakePriceSeries(s: SymbolStatus): number[] {
-  const seed = s.symbol.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0);
-  const base = s.price ?? 100;
-  const drift = (s.lrc_pct ?? 50) <= 25 ? 1 : -1;
-  return Array.from({ length: 15 }, (_, i) => {
-    const noise = Math.sin((seed + i * 7) * 0.7) * 0.4;
-    const trend = (i / 14) * drift * 0.6;
-    return base * (1 + (noise + trend) * 0.01);
-  });
-}
 
 export default SymbolCard;

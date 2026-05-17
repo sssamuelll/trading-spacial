@@ -137,13 +137,16 @@ const App: React.FC = () => {
   const { progress, secsLeft } = useScanCountdown(REFRESH_INTERVAL_MS, lastRefreshTs);
 
   // Live ticker poll (3s). Overrides `live_price` from /symbols so prices
-  // refresh in seconds instead of every 5-min scan cycle.
-  const tickerPrices = useLiveTicker(3000);
+  // refresh in seconds, and accumulates a per-symbol price history buffer
+  // that drives the sparkline in the watchlist cards / rows.
+  const { prices: tickerPrices, history: tickerHistory } = useLiveTicker(3000);
   const symbols = useMemo(
-    () => symbolsRaw.map((s) => (
-      tickerPrices[s.symbol] != null ? { ...s, live_price: tickerPrices[s.symbol] } : s
-    )),
-    [symbolsRaw, tickerPrices],
+    () => symbolsRaw.map((s) => ({
+      ...s,
+      live_price:    tickerPrices[s.symbol]  ?? s.live_price,
+      recent_closes: tickerHistory[s.symbol] ?? s.recent_closes ?? [],
+    })),
+    [symbolsRaw, tickerPrices, tickerHistory],
   );
 
   const focus = useMemo(
