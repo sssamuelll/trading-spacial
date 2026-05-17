@@ -297,38 +297,44 @@ _ticker_cache: dict = {"ts": 0.0, "data": {}}
 _TICKER_CACHE_TTL_SEC = 2.5
 
 
-@app.get("/ticker", summary="Precios spot en vivo (cacheado ~2.5s)")
+@app.get("/ticker", summary="Precios spot en vivo + cambio 24h (cacheado ~2.5s)")
 def get_ticker():
-    """Return {symbol: price} for the curated watchlist symbols.
+    """Return live spot price + 24h % change for the curated watchlist.
 
-    Hits Binance batch /api/v3/ticker/price in a single request. Results
-    cached server-side for ~2.5s so multiple polling tabs converge to one
-    upstream call. Independent of the scanner: prices refresh in seconds
-    instead of every 5-min scan cycle.
+    Hits Binance batch /api/v3/ticker/24hr in a single request. Same batch
+    shape as /ticker/price but the response also carries priceChangePercent
+    so the dashboard can show "BTC ▲ +0.43%" alongside the price. Cached
+    server-side ~2.5s.
     """
     import json as _json   # noqa: PLC0415
     import time as _time   # noqa: PLC0415
     now = _time.monotonic()
-    if now - _ticker_cache["ts"] < _TICKER_CACHE_TTL_SEC and _ticker_cache["data"]:
-        return {"prices": _ticker_cache["data"], "cached": True}
+    cached_payload = _ticker_cache["data"]
+    if now - _ticker_cache["ts"] < _TICKER_CACHE_TTL_SEC and cached_payload:
+        return {"prices":  cached_payload.get("prices", {}),
+                "changes": cached_payload.get("changes", {}),
+                "cached":  True}
 
     symbols = _scanner_state.get("symbols_active") or get_active_symbols()
     try:
         # Binance rejects whitespace inside the symbols array. Compact JSON
         # (no spaces) is required: `["BTC","ETH"]` not `["BTC", "ETH"]`.
         r = req_lib.get(
-            "https://api.binance.com/api/v3/ticker/price",
+            "https://api.binance.com/api/v3/ticker/24hr",
             params={"symbols": _json.dumps(symbols, separators=(",", ":"))},
             timeout=5,
         )
         r.raise_for_status()
-        out = {item["symbol"]: float(item["price"]) for item in r.json()}
-        _ticker_cache.update(ts=now, data=out)
-        return {"prices": out, "cached": False}
+        prices  = {item["symbol"]: float(item["lastPrice"])           for item in r.json()}
+        changes = {item["symbol"]: float(item["priceChangePercent"])  for item in r.json()}
+        _ticker_cache.update(ts=now, data={"prices": prices, "changes": changes})
+        return {"prices": prices, "changes": changes, "cached": False}
     except Exception as e:
         log.warning("ticker endpoint failed: %s", e)
         # Serve last-known cache on failure (better stale than nothing).
-        return {"prices": _ticker_cache["data"], "error": str(e)}
+        return {"prices":  cached_payload.get("prices", {}),
+                "changes": cached_payload.get("changes", {}),
+                "error":   str(e)}
 
 
 @app.get("/symbols", summary="Estado actual de cada par monitoreado")

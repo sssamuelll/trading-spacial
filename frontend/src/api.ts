@@ -114,11 +114,12 @@ export async function getSymbols(): Promise<SymbolsResponse> {
   return request<SymbolsResponse>('/symbols');
 }
 
-// GET /ticker — live spot prices (server-cached ~2.5s)
+// GET /ticker — live spot prices + 24h % change (server-cached ~2.5s)
 export interface TickerResponse {
-  prices: Record<string, number>;
+  prices:  Record<string, number>;
+  changes: Record<string, number>;   // 24h percent change per symbol
   cached?: boolean;
-  error?: string;
+  error?:  string;
 }
 export async function getTicker(): Promise<TickerResponse> {
   return request<TickerResponse>('/ticker');

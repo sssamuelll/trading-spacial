@@ -17,6 +17,7 @@ import { getTicker } from '../api';
 
 export interface LiveTickerData {
   prices:  Record<string, number>;
+  changes: Record<string, number>;     // 24h percent change per symbol
   history: Record<string, number[]>;
 }
 
@@ -24,6 +25,7 @@ const MAX_HISTORY = 60;
 
 export function useLiveTicker(intervalMs: number = 3000): LiveTickerData {
   const [prices,  setPrices]  = useState<Record<string, number>>({});
+  const [changes, setChanges] = useState<Record<string, number>>({});
   const [history, setHistory] = useState<Record<string, number[]>>({});
 
   useEffect(() => {
@@ -34,6 +36,7 @@ export function useLiveTicker(intervalMs: number = 3000): LiveTickerData {
         const resp = await getTicker();
         if (cancelled || !resp.prices) return;
         setPrices(resp.prices);
+        if (resp.changes) setChanges(resp.changes);
         setHistory((prev) => {
           const next: Record<string, number[]> = { ...prev };
           for (const [sym, p] of Object.entries(resp.prices)) {
@@ -52,5 +55,5 @@ export function useLiveTicker(intervalMs: number = 3000): LiveTickerData {
     return () => { cancelled = true; clearInterval(id); };
   }, [intervalMs]);
 
-  return { prices, history };
+  return { prices, changes, history };
 }
