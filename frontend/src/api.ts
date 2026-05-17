@@ -125,6 +125,21 @@ export async function getTicker(): Promise<TickerResponse> {
   return request<TickerResponse>('/ticker');
 }
 
+// GET /macro — macro "weather" (regime + F&G + funding + BTC 24h)
+export interface MacroResponse {
+  regime:           'BULL' | 'BEAR' | 'NEUTRAL' | null;
+  regime_score:     number | null;
+  fear_greed_index: number | null;
+  fear_greed_label: string | null;
+  funding_rate_pct: number | null;
+  btc_24h_pct:      number | null;
+  btc_price:        number | null;
+  ts:               string | null;
+}
+export async function getMacro(): Promise<MacroResponse> {
+  return request<MacroResponse>('/macro');
+}
+
 // GET /status
 export async function getStatus(): Promise<StatusResponse> {
   return request<StatusResponse>('/status');

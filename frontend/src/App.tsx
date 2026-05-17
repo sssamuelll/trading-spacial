@@ -46,6 +46,7 @@ import { useAuth } from './auth/useAuth';
 import { useScanCountdown } from './hooks/useScanCountdown';
 import { useIsMobile } from './hooks/useIsMobile';
 import { useLiveTicker } from './hooks/useLiveTicker';
+import { useMacro } from './hooks/useMacro';
 import { computeFocus } from './helpers/hierarchy';
 
 import ChartModal from './components/ChartModal';
@@ -149,6 +150,9 @@ const App: React.FC = () => {
     })),
     [symbolsRaw, tickerPrices, tickerChanges, tickerHistory],
   );
+
+  // Macro signals (régimen / F&G / funding) — slow, 30s polling.
+  const macro = useMacro(30000);
 
   const focus = useMemo(
     () => computeFocus(symbols, positions, status, Date.now()),
@@ -257,7 +261,7 @@ const App: React.FC = () => {
           {/* ── Mercado ────────────────────────────────── */}
           {mainTab === 'mercado' && (
             <>
-              <StatusBar status={status} />
+              <StatusBar status={status} macro={macro} />
               <FocusPanel
                 items={focus}
                 onAction={(it) => {

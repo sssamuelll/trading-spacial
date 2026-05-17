@@ -337,6 +337,65 @@ def get_ticker():
                 "error":   str(e)}
 
 
+# Module-level cache for the macro endpoint. Regime is refreshed daily,
+# F&G daily, funding 8h — slow-moving. TTL keeps fan-out cheap.
+_macro_cache: dict = {"ts": 0.0, "data": None}
+_MACRO_CACHE_TTL_SEC = 30.0
+
+
+@app.get("/macro", summary="Indicadores macro (régimen + F&G + funding + BTC 24h)")
+def get_macro():
+    """Return the macro 'weather' panel for the dashboard StatusBar.
+
+    Composes the daily regime cache (regime / score / F&G / funding) with a
+    fresh-ish BTC 24h % change from Binance. Cached server-side ~30s — the
+    underlying signals don't change faster than that.
+    """
+    import time as _time  # noqa: PLC0415
+    now = _time.monotonic()
+    if now - _macro_cache["ts"] < _MACRO_CACHE_TTL_SEC and _macro_cache["data"]:
+        return _macro_cache["data"]
+
+    try:
+        from strategy.regime import get_cached_regime  # noqa: PLC0415
+        cached = get_cached_regime() or {}
+    except Exception as e:
+        log.warning("macro: regime cache lookup failed: %s", e)
+        cached = {}
+
+    details = cached.get("details") or {}
+    sentiment = details.get("sentiment") or {}
+    funding = details.get("funding") or {}
+
+    btc_24h_pct = None
+    btc_price = None
+    try:
+        r = req_lib.get(
+            "https://api.binance.com/api/v3/ticker/24hr",
+            params={"symbol": "BTCUSDT"},
+            timeout=5,
+        )
+        r.raise_for_status()
+        d = r.json()
+        btc_24h_pct = float(d.get("priceChangePercent", 0))
+        btc_price = float(d.get("lastPrice", 0))
+    except Exception as e:
+        log.warning("macro: BTC 24h fetch failed: %s", e)
+
+    out = {
+        "regime":             cached.get("regime"),
+        "regime_score":       cached.get("score"),
+        "fear_greed_index":   sentiment.get("fear_greed_index"),
+        "fear_greed_label":   sentiment.get("classification"),
+        "funding_rate_pct":   funding.get("rate_pct"),
+        "btc_24h_pct":        btc_24h_pct,
+        "btc_price":          btc_price,
+        "ts":                 cached.get("ts"),
+    }
+    _macro_cache.update(ts=now, data=out)
+    return out
+
+
 @app.get("/symbols", summary="Estado actual de cada par monitoreado")
 def list_symbols():
     """Retorna el último escaneo de cada símbolo, ordenado por señal y score."""
