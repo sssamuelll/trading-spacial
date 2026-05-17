@@ -29,7 +29,7 @@ const Ticker: React.FC<TickerProps> = ({ symbols, animate = true }) => {
             return (
               <span key={`${s.symbol}-${i}`} className={styles.item}>
                 <span className={styles.pair}>{s.symbol.replace('USDT', '')}</span>
-                <span className={`num ${styles.price}`}>${formatPrice(s.price)}</span>
+                <span className={`num ${styles.price}`}>${formatPrice(s.live_price ?? s.price)}</span>
                 <span className={`${styles.chg} ${isUp ? styles.chgBull : styles.chgBear}`}>
                   {isUp ? '▲' : '▼'} <span className="num">{lrc.toFixed(1)}%</span>
                 </span>

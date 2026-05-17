@@ -36,7 +36,7 @@ const SymbolRow: React.FC<SymbolRowProps> = ({ symbol, onClick }) => {
         <span className={styles.quote}>/USDT</span>
       </div>
       <div className={`${styles.price} num`}>
-        <span className={styles.dollar}>$</span>{formatPrice(symbol.price)}
+        <span className={styles.dollar}>$</span>{formatPrice(symbol.live_price ?? symbol.price)}
       </div>
       <div className={[styles.change, lrcTone === 'bull' ? styles.changeBull : styles.changeBear].join(' ')}>
         {lrcTone === 'bull' ? '▲' : '▼'} <span className="num">{lrc.toFixed(1)}%</span>
