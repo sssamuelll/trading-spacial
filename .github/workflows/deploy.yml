@@ -38,8 +38,9 @@ jobs:
 
       - name: Frontend build
         working-directory: frontend
+        # `install` instead of `ci` — see ci.yml comment on the same step.
         run: |
-          npm ci
+          npm install --no-audit --no-fund
           npm run build
 
       - name: Setup SSH

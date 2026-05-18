@@ -69,7 +69,12 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
-        run: npm ci
+        # Using `install` instead of `ci` because vitest 4.x ships a nested
+        # vite@8 that wants esbuild ^0.27, while our top-level vite@5 pins
+        # esbuild ^0.21. npm dedupes at runtime (tests pass) but the lock
+        # gets flagged as inconsistent by `npm ci`. Realign vitest/vite in
+        # a follow-up to switch back to `npm ci`.
+        run: npm install --no-audit --no-fund
 
       - name: Type check
         # Run separately from the build so a tsc failure surfaces with a
