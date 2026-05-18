@@ -112,8 +112,7 @@ files in your repo are byte-identical:
 - `src/auth/*` (AuthContext, useAuth, api, LoginPage, SetupPage, ProtectedRoute, *.css)
 - `src/components/NotificationToast.tsx` — works fine alongside the new bell
 - `src/components/ErrorBoundary.tsx`
-- `src/components/ChartModal.tsx` — left as is; modals come in a follow-up
-- `src/components/OpenPositionModal.tsx` — same
+- `src/components/OpenPositionModal.tsx` — Modal styling not yet redesigned (functional)
 - `src/components/TuneReportModal.tsx` — same
 - `src/components/PositionsPanel.tsx` — Posiciones tab still uses legacy styling
 - `src/components/KillSwitchDashboard.tsx`, `KillSwitchSymbolCard.tsx`,
@@ -148,7 +147,7 @@ follow-up PR:
 
 1. **PositionsPanel** (`PositionsPanel.tsx`, 21KB) — biggest unmigrated piece. Needs its own pass for the empty state, open / closed tables, and probably a redesign of the inline position-cards.
 2. **KillSwitch tab** (`KillSwitchDashboard.tsx` + `KillSwitchSymbolCard.tsx` + `PortfolioPanel.tsx` + `AlertsStrip.tsx` + `MetricsBlock.tsx` + `Sparkline.tsx`).
-3. **Modals**: `ChartModal`, `OpenPositionModal`, `TuneReportModal` — wrap in the new backdrop+blur shell and re-skin the controls.
+3. **Modals**: `OpenPositionModal`, `TuneReportModal` — wrap in the new backdrop+blur shell and re-skin the controls. (`ChartModal` was replaced by `SymbolDetail` and removed.)
 4. **NotificationToast** — toast stack styles are still legacy; should adopt the new card/glyph language consistent with the bell dropdown.
 5. **Auth pages** (`LoginPage`, `SetupPage`) — separate `.css` files; not yet redesigned.
 

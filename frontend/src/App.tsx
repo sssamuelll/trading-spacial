@@ -49,7 +49,6 @@ import { useLiveTicker } from './hooks/useLiveTicker';
 import { useMacro } from './hooks/useMacro';
 import { computeFocus } from './helpers/hierarchy';
 
-import ChartModal from './components/ChartModal';
 import SymbolDetail, { type PositionPreset } from './components/SymbolDetail';
 import ErrorBoundary from './components/ErrorBoundary';
 import Header from './components/Header';
@@ -376,12 +375,6 @@ const App: React.FC = () => {
         onClose={() => setSelectedSymbol(null)}
         onOpenPosition={handleOpenFromPreset}
       />
-
-      {/* DEPRECATED: replaced by SymbolDetail. ChartModal kept imported
-          (and rendered behind a permanent false guard) so we can swap
-          back to it from a single line edit if SymbolDetail misbehaves
-          in staging. Delete this branch + the import once verified. */}
-      {false && <ChartModal symbol={selectedSymbol} onClose={() => setSelectedSymbol(null)} />}
     </div>
   );
 };

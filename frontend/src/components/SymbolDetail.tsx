@@ -7,7 +7,7 @@
 // as it reaches for "tools" via trailing markers like <<<TOOL:setup>>>.
 //
 // Architecture
-//   - Left pane: lightweight-charts (same library ChartModal used)
+//   - Left pane: lightweight-charts (TradingView's open-source lib)
 //   - Right pane: <Copilot/> — header + scroll + suggestion chips + input
 //   - Tool cards rendered inline by <CopilotMessage/>:
 //       <<<TOOL:setup>>>    → <SetupCard/>
