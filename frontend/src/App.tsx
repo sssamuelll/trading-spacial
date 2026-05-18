@@ -39,6 +39,7 @@ import type {
   Signal,
   TuneResult,
   Position,
+  MacroState,
 } from './types';
 import type { MainTab, SymbolsFilter } from './types-ui';
 
@@ -50,6 +51,8 @@ import { useMacro } from './hooks/useMacro';
 import { computeFocus } from './helpers/hierarchy';
 
 import SymbolDetail, { type PositionPreset } from './components/SymbolDetail';
+import AgentBrief from './components/AgentBrief';
+import AgentDock from './components/AgentDock';
 import ErrorBoundary from './components/ErrorBoundary';
 import Header from './components/Header';
 import StatusBar from './components/StatusBar';
@@ -72,6 +75,13 @@ import UserMenu from './components/UserMenu';
 import appStyles from './App.module.css';
 
 const REFRESH_INTERVAL_MS = 30_000;
+
+// Agent feature flag — same gate the SymbolDetail copilot uses. When off,
+// FocusPanel stays in the briefing slot and the AgentDock FAB is hidden.
+const AGENT_ENABLED: boolean = (() => {
+  const flag = (import.meta.env.VITE_AGENT_ENABLED ?? '').toString().trim().toLowerCase();
+  return flag !== '0' && flag !== 'false' && flag !== 'off';
+})();
 
 type OverlayKind = 'notifs' | 'settings' | 'user' | null;
 
@@ -105,6 +115,11 @@ const App: React.FC = () => {
 
   // Preset to open as position (passed from SymbolDetail → PositionsPanel)
   const [presetForPos, setPresetForPos] = useState<PositionPreset | null>(null);
+
+  // AgentDock state — open flag + optional prompt the AgentBrief chip
+  // injected when the user clicked one of the canned questions.
+  const [dockOpen,          setDockOpen]          = useState(false);
+  const [dockInitialPrompt, setDockInitialPrompt] = useState<string | null>(null);
 
   // ── data fetching ──────────────────────────────────────
   const fetchAll = useCallback(async () => {
@@ -157,6 +172,19 @@ const App: React.FC = () => {
   // Macro signals (régimen / F&G / funding) — slow, 30s polling.
   const macro = useMacro(30000);
 
+  // Compose the MacroState the agent (Brief + Dock) consumes — merges the
+  // /macro response with /status scanner counters. Kill-switch count isn't
+  // exposed by /status yet, so we placeholder to 0 — same as StatusBar.
+  const macroState: MacroState = useMemo(() => ({
+    regime:           macro?.regime ?? null,
+    fng:              macro?.fear_greed_index ?? null,
+    funding:          macro?.funding_rate_pct != null ? macro.funding_rate_pct / 100 : null,
+    scansToday:       status?.scanner_state?.scans_total   ?? 0,
+    signalsToday:     status?.scanner_state?.signals_total ?? 0,
+    errors:           status?.scanner_state?.errors        ?? 0,
+    killSwitchActive: 0,
+  }), [macro, status]);
+
   const focus = useMemo(
     () => computeFocus(symbols, positions, status, Date.now()),
     [symbols, positions, status],
@@ -200,6 +228,25 @@ const App: React.FC = () => {
     setPresetForPos(preset);
     setMainTab('posiciones');
   }, []);
+
+  const openDock = useCallback((kind?: 'changes' | 'plain') => {
+    if (kind === 'changes') setDockInitialPrompt('¿Qué cambió desde ayer?');
+    else if (kind === 'plain') setDockInitialPrompt('Hazme un resumen muy directo, sin jerga, como para alguien que no es trader.');
+    else setDockInitialPrompt(null);
+    setDockOpen(true);
+  }, []);
+
+  const closeDock = useCallback(() => {
+    setDockOpen(false);
+    setDockInitialPrompt(null);
+  }, []);
+
+  // Open SymbolDetail by pair id. Accepts either "BTCUSDT" or just "BTC".
+  const openSymbolByPair = useCallback((pair: string) => {
+    const full = pair.endsWith('USDT') ? pair : `${pair}USDT`;
+    const sym = symbols.find((s) => s.symbol === full);
+    if (sym) setSelectedSymbol(sym);
+  }, [symbols]);
 
   const handleTuneApply  = useCallback(async () => { await applyTune();  await fetchAll(); }, [fetchAll]);
   const handleTuneReject = useCallback(async () => { await rejectTune(); await fetchAll(); }, [fetchAll]);
@@ -280,18 +327,28 @@ const App: React.FC = () => {
                   belowPageBar={
                     <>
                       <StatusBar status={status} macro={macro} />
-                      <FocusPanel
-                        items={focus}
-                        onAction={(it) => {
-                          if (it.pair) {
-                            const sym = symbols.find((s) => s.symbol === it.pair);
-                            if (sym) setSelectedSymbol(sym);
-                          }
-                          if (it.kind === 'risk-position' || it.kind === 'near-tp') {
-                            setMainTab('posiciones');
-                          }
-                        }}
-                      />
+                      {AGENT_ENABLED ? (
+                        <AgentBrief
+                          symbols={symbols}
+                          positions={positions}
+                          macro={macroState}
+                          onOpenDock={openDock}
+                          onOpenSymbol={openSymbolByPair}
+                        />
+                      ) : (
+                        <FocusPanel
+                          items={focus}
+                          onAction={(it) => {
+                            if (it.pair) {
+                              const sym = symbols.find((s) => s.symbol === it.pair);
+                              if (sym) setSelectedSymbol(sym);
+                            }
+                            if (it.kind === 'risk-position' || it.kind === 'near-tp') {
+                              setMainTab('posiciones');
+                            }
+                          }}
+                        />
+                      )}
                     </>
                   }
                 />
@@ -375,6 +432,19 @@ const App: React.FC = () => {
         onClose={() => setSelectedSymbol(null)}
         onOpenPosition={handleOpenFromPreset}
       />
+
+      {AGENT_ENABLED && (
+        <AgentDock
+          open={dockOpen}
+          onOpen={() => openDock()}
+          onClose={closeDock}
+          symbols={symbols}
+          positions={positions}
+          macro={macroState}
+          initialPrompt={dockInitialPrompt}
+          onOpenSymbol={openSymbolByPair}
+        />
+      )}
     </div>
   );
 };
