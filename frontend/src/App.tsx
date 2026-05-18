@@ -32,6 +32,9 @@ import {
   applyTune,
   rejectTune,
   getPositions,
+  getCapital,
+  closePosition,
+  updatePosition,
 } from './api';
 import type {
   SymbolStatus,
@@ -40,6 +43,7 @@ import type {
   TuneResult,
   Position,
   MacroState,
+  Capital,
 } from './types';
 import type { MainTab, SymbolsFilter } from './types-ui';
 
@@ -59,8 +63,10 @@ import StatusBar from './components/StatusBar';
 import SymbolsGrid from './components/SymbolsGrid';
 import SignalsTable from './components/SignalsTable';
 import ConfigPanel from './components/ConfigPanel';
-import PositionsPanel from './components/PositionsPanel';
+import PositionsView, { type PortfolioSummary } from './components/PositionsView';
+import OpenPositionModal from './components/OpenPositionModal';
 import TuneReportModal from './components/TuneReportModal';
+import { type PositionInsight } from './helpers/position-insight';
 import NotificationToast from './components/NotificationToast';
 import KillSwitchDashboard from './components/KillSwitchDashboard';
 
@@ -110,10 +116,10 @@ const App: React.FC = () => {
   const [openOverlay,    setOpenOverlay]    = useState<OverlayKind>(null);
   const [unreadCount,    setUnreadCount]    = useState<number>(0);
 
-  // Signal to open as position (passed from SignalsTable → PositionsPanel)
+  // Signal to open as position (passed from SignalsTable)
   const [signalForPos, setSignalForPos] = useState<Signal | null>(null);
 
-  // Preset to open as position (passed from SymbolDetail → PositionsPanel)
+  // Preset to open as position (passed from SymbolDetail)
   const [presetForPos, setPresetForPos] = useState<PositionPreset | null>(null);
 
   // AgentDock state — open flag + optional prompt the AgentBrief chip
@@ -121,21 +127,57 @@ const App: React.FC = () => {
   const [dockOpen,          setDockOpen]          = useState(false);
   const [dockInitialPrompt, setDockInitialPrompt] = useState<string | null>(null);
 
+  // OpenPositionModal — mounted at App level so the PositionsView CTA,
+  // the SignalsTable flow, and the SymbolDetail preset can all trigger it.
+  type ModalPrefill = {
+    symbol:    string;
+    price?:    number | null;
+    sl?:       number | null;
+    tp?:       number | null;
+    scan_id?:  number | null;
+    direction?: 'LONG' | 'SHORT';
+    sizeUsd?:  number;
+  };
+  const [openPositionModalOpen, setOpenPositionModalOpen] = useState(false);
+  const [openPositionPrefill,   setOpenPositionPrefill]   = useState<ModalPrefill | undefined>();
+
+  // Closed-positions snapshot for the 7d hero metrics (win rate, P&L 7d).
+  const [closedPositions7d, setClosedPositions7d] = useState<Position[]>([]);
+
+  // Capital — drives the Equity hero readout. Fetched once on mount and on
+  // tab navigation back to posiciones (cheap, ~1 row).
+  const [capital, setCapital] = useState<Capital | null>(null);
+
   // ── data fetching ──────────────────────────────────────
   const fetchAll = useCallback(async () => {
     try {
-      const [symbolsRes, statusRes, signalsRes, tuneRes, positionsRes] = await Promise.all([
+      const [symbolsRes, statusRes, signalsRes, tuneRes, positionsRes, closedRes, capitalRes] = await Promise.all([
         getSymbols(),
         getStatus(),
         getSignals({ limit: 20, only_signals: false, since_hours: 24 }),
         getTuneLatest().catch(() => null),
         getPositions('open').catch(() => ({ total: 0, positions: [] })),
+        getPositions('closed').catch(() => ({ total: 0, positions: [] })),
+        // /capital 404s when the row isn't initialized — treat as "no data" and
+        // fall back to a zeroed PortfolioSummary so PositionsView renders.
+        getCapital().catch(() => null),
       ]);
       setSymbols(symbolsRes.symbols);
       setStatus(statusRes);
       setSignals(signalsRes.signals);
       setTuneResult(tuneRes);
       setPositions(positionsRes.positions ?? []);
+      // Filter closed positions to the last 7 days client-side. The backend
+      // doesn't accept a window param yet (TODO).
+      const sevenDaysAgoMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      const recentClosed = (closedRes.positions ?? []).filter((p: Position) => {
+        const tsStr = p.exit_ts ?? p.entry_ts;
+        if (!tsStr) return false;
+        const t = new Date(tsStr).getTime();
+        return Number.isFinite(t) && t >= sevenDaysAgoMs;
+      });
+      setClosedPositions7d(recentClosed);
+      setCapital(capitalRes ?? null);
       setLastRefresh(new Date());
       setError(null);
     } catch (err) {
@@ -172,6 +214,38 @@ const App: React.FC = () => {
   // Macro signals (régimen / F&G / funding) — slow, 30s polling.
   const macro = useMacro(30000);
 
+  // Pre-fill the OpenPositionModal whenever upstream sources push a
+  // signal or a SymbolDetail preset. Both flows used to live inside
+  // PositionsPanel — lifted here so the modal can be a top-level overlay.
+  useEffect(() => {
+    if (signalForPos) {
+      setOpenPositionPrefill({
+        symbol:  signalForPos.symbol,
+        price:   signalForPos.price,
+        scan_id: signalForPos.id,
+      });
+      setOpenPositionModalOpen(true);
+      setSignalForPos(null);
+    }
+  }, [signalForPos]);
+
+  useEffect(() => {
+    if (presetForPos) {
+      // PositionPreset carries qty (base coin units); the modal's Capital
+      // field wants USD notional, so derive sizeUsd = qty × entry.
+      setOpenPositionPrefill({
+        symbol:    presetForPos.symbol,
+        price:     presetForPos.entry,
+        sl:        presetForPos.sl,
+        tp:        presetForPos.tp,
+        direction: presetForPos.direction,
+        sizeUsd:   presetForPos.qty * presetForPos.entry,
+      });
+      setOpenPositionModalOpen(true);
+      setPresetForPos(null);
+    }
+  }, [presetForPos]);
+
   // Compose the MacroState the agent (Brief + Dock) consumes — merges the
   // /macro response with /status scanner counters. Kill-switch count isn't
   // exposed by /status yet, so we placeholder to 0 — same as StatusBar.
@@ -184,6 +258,26 @@ const App: React.FC = () => {
     errors:           status?.scanner_state?.errors        ?? 0,
     killSwitchActive: 0,
   }), [macro, status]);
+
+  // PortfolioSummary for PositionsView's hero strip. Derived from /capital
+  // and the open-position pnl_pct totals.
+  // - equity: capital balance, fallback to 0 if /capital 404s
+  // - pnlToday: not exposed by backend yet → 0 with TODO
+  // - drawdown: capital.max_drawdown_pct
+  const portfolio: PortfolioSummary = useMemo(() => ({
+    equity:   capital?.balance ?? 0,
+    pnlToday: 0,   // TODO: backend doesn't expose intraday delta yet
+    drawdown: capital?.max_drawdown_pct ?? 0,
+  }), [capital]);
+
+  // Highest-score symbol with señal=true — used as the empty-state
+  // suggestion in PositionsView.
+  const topFreshSetup: SymbolStatus | null = useMemo(() => {
+    const candidates = symbols
+      .filter((s) => s.señal === true && (s.score ?? 0) >= 5)
+      .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    return candidates[0] ?? null;
+  }, [symbols]);
 
   const focus = useMemo(
     () => computeFocus(symbols, positions, status, Date.now()),
@@ -228,6 +322,63 @@ const App: React.FC = () => {
     setPresetForPos(preset);
     setMainTab('posiciones');
   }, []);
+
+  // ── Position management handlers (lifted from the old PositionsPanel) ──
+  const handleAbrirPosicion = useCallback(() => {
+    setOpenPositionPrefill(undefined);
+    setOpenPositionModalOpen(true);
+  }, []);
+
+  const handleEditSlTp = useCallback(async (p: Position) => {
+    // Lightweight stub for now — prompt() is honest about the deferred work
+    // and avoids shipping a half-built modal. Replace with a proper inline
+    // editor when the redesign reaches positions.
+    const slStr = window.prompt(`Nuevo SL para ${p.symbol}:`, p.sl_price != null ? String(p.sl_price) : '');
+    if (slStr === null) return;
+    const tpStr = window.prompt(`Nuevo TP para ${p.symbol}:`, p.tp_price != null ? String(p.tp_price) : '');
+    if (tpStr === null) return;
+    const sl = parseFloat(slStr);
+    const tp = parseFloat(tpStr);
+    if (!Number.isFinite(sl) || !Number.isFinite(tp)) return;
+    try {
+      await updatePosition(p.id, { sl_price: sl, tp_price: tp });
+      await fetchAll();
+    } catch (err) {
+      window.alert(`No se pudo actualizar: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [fetchAll]);
+
+  const handleClosePosition = useCallback(async (p: Position) => {
+    const liveSym = symbols.find((s) => s.symbol === p.symbol);
+    const exitPx = liveSym?.live_price ?? liveSym?.price ?? p.entry_price * (1 + (p.pnl_pct ?? 0) / 100);
+    const ok = window.confirm(
+      `Cerrar ${p.symbol} a $${exitPx.toFixed(2)} (P&L ${(p.pnl_pct ?? 0).toFixed(2)}%)?`,
+    );
+    if (!ok) return;
+    try {
+      await closePosition(p.id, { exit_price: exitPx, exit_reason: 'MANUAL' });
+      await fetchAll();
+    } catch (err) {
+      window.alert(`No se pudo cerrar: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [symbols, fetchAll]);
+
+  const handleAskAgent = useCallback((p: Position, insight: PositionInsight) => {
+    const liveSym = symbols.find((s) => s.symbol === p.symbol);
+    const currentPx = liveSym?.live_price ?? liveSym?.price ?? p.entry_price * (1 + (p.pnl_pct ?? 0) / 100);
+    const pnlPct = p.pnl_pct ?? 0;
+    const pnlAbs = p.pnl_usd ?? 0;
+    const display = p.symbol.replace('USDT', '');
+    const prompt =
+      `Hablemos de mi posición en ${display}. ` +
+      `Estado: ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}% ` +
+      `(${pnlAbs >= 0 ? '+' : ''}$${pnlAbs.toFixed(2)}). ` +
+      `Entrada $${p.entry_price}, ahora $${currentPx.toFixed(2)}, ` +
+      `SL $${p.sl_price ?? '—'}, TP $${p.tp_price ?? '—'}. ` +
+      `Tu lectura inicial fue: "${insight.text}" — ${insight.action}.`;
+    setDockInitialPrompt(prompt);
+    setDockOpen(true);
+  }, [symbols]);
 
   const openDock = useCallback((kind?: 'changes' | 'plain') => {
     if (kind === 'changes') setDockInitialPrompt('¿Qué cambió desde ayer?');
@@ -368,12 +519,18 @@ const App: React.FC = () => {
           {/* ── Posiciones ─────────────────────────────── */}
           {mainTab === 'posiciones' && (
             <ErrorBoundary fallbackLabel="Error en el panel de posiciones">
-              <PositionsPanel
+              <PositionsView
+                positions={positions}
+                portfolio={portfolio}
+                closedRecent7d={closedPositions7d}
+                freshSetup={topFreshSetup}
                 symbols={symbols}
-                onOpenFromSignal={signalForPos}
-                onSignalConsumed={() => setSignalForPos(null)}
-                onOpenFromPreset={presetForPos}
-                onPresetConsumed={() => setPresetForPos(null)}
+                onOpenSymbol={openSymbolByPair}
+                onAbrirPosicion={handleAbrirPosicion}
+                onAskAgent={handleAskAgent}
+                onEditSlTp={handleEditSlTp}
+                onClosePosition={handleClosePosition}
+                mobile={mobile}
               />
             </ErrorBoundary>
           )}
@@ -443,6 +600,18 @@ const App: React.FC = () => {
           macro={macroState}
           initialPrompt={dockInitialPrompt}
           onOpenSymbol={openSymbolByPair}
+        />
+      )}
+
+      {openPositionModalOpen && (
+        <OpenPositionModal
+          symbols={symbols}
+          prefill={openPositionPrefill}
+          onClose={() => setOpenPositionModalOpen(false)}
+          onCreated={async () => {
+            setOpenPositionModalOpen(false);
+            await fetchAll();
+          }}
         />
       )}
     </div>
