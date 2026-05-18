@@ -232,6 +232,25 @@
   color: var(--nbc-primary-fg);
 }
 
+/* confirm_release marker — destructive override, amber to signal weight */
+.toolConfirm {
+  font-family: var(--nbc-font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 6px 12px;
+  background: rgba(255, 184, 78, 0.06);
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  cursor: pointer;
+  align-self: flex-start;
+  transition: all 80ms ease;
+}
+.toolConfirm:hover {
+  background: var(--warn);
+  color: var(--nbc-bg);
+}
+
 /* Suggestion chips */
 .sugg {
   display: flex;

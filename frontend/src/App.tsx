@@ -35,6 +35,8 @@ import {
   getCapital,
   closePosition,
   updatePosition,
+  getHealthDashboard,
+  releaseKillSwitch,
 } from './api';
 import type {
   SymbolStatus,
@@ -44,6 +46,8 @@ import type {
   Position,
   MacroState,
   Capital,
+  DashboardResponse,
+  DashboardSymbolState,
 } from './types';
 import type { MainTab, SymbolsFilter } from './types-ui';
 
@@ -68,7 +72,8 @@ import OpenPositionModal from './components/OpenPositionModal';
 import TuneReportModal from './components/TuneReportModal';
 import { type PositionInsight } from './helpers/position-insight';
 import NotificationToast from './components/NotificationToast';
-import KillSwitchDashboard from './components/KillSwitchDashboard';
+import KillSwitchView, { type AskAgentPayload as KsAskAgentPayload } from './components/KillSwitchView';
+import { type CardVerdict } from './helpers/kill-switch-copilot';
 
 // New components
 import LeftRail from './components/LeftRail';
@@ -148,10 +153,13 @@ const App: React.FC = () => {
   // tab navigation back to posiciones (cheap, ~1 row).
   const [capital, setCapital] = useState<Capital | null>(null);
 
+  // Kill-switch dashboard. Polled alongside everything else in fetchAll.
+  const [dashboard, setDashboard] = useState<DashboardResponse | null>(null);
+
   // ── data fetching ──────────────────────────────────────
   const fetchAll = useCallback(async () => {
     try {
-      const [symbolsRes, statusRes, signalsRes, tuneRes, positionsRes, closedRes, capitalRes] = await Promise.all([
+      const [symbolsRes, statusRes, signalsRes, tuneRes, positionsRes, closedRes, capitalRes, dashboardRes] = await Promise.all([
         getSymbols(),
         getStatus(),
         getSignals({ limit: 20, only_signals: false, since_hours: 24 }),
@@ -161,6 +169,9 @@ const App: React.FC = () => {
         // /capital 404s when the row isn't initialized — treat as "no data" and
         // fall back to a zeroed PortfolioSummary so PositionsView renders.
         getCapital().catch(() => null),
+        // /health/dashboard is the kill-switch v2 view's data source. Cheap
+        // server-side (cached); polling alongside everything else is fine.
+        getHealthDashboard().catch(() => null),
       ]);
       setSymbols(symbolsRes.symbols);
       setStatus(statusRes);
@@ -178,6 +189,7 @@ const App: React.FC = () => {
       });
       setClosedPositions7d(recentClosed);
       setCapital(capitalRes ?? null);
+      setDashboard(dashboardRes ?? null);
       setLastRefresh(new Date());
       setError(null);
     } catch (err) {
@@ -363,6 +375,57 @@ const App: React.FC = () => {
     }
   }, [symbols, fetchAll]);
 
+  // ── Kill-switch copilot handlers ─────────────────────────────────────
+  // KsAskAgentPayload is either a full DashboardSymbolState (per-card
+  // verdict click) or `{ __freeform: string }` (top-reading chip).
+  const handleKsAskAgent = useCallback((payload: KsAskAgentPayload) => {
+    if ('__freeform' in payload) {
+      setDockInitialPrompt(payload.__freeform);
+    } else {
+      const s = payload;
+      const base = s.symbol.replace('USDT', '');
+      const reason = s.last_transition?.reason ?? s.next_conditions ?? 'sin razón registrada';
+      const wr20 = ((s.metrics.win_rate_20_trades ?? 0) * 100).toFixed(0);
+      const pnl30 = (s.metrics.pnl_30d ?? 0).toFixed(2);
+      setDockInitialPrompt(
+        `Hablemos de ${base} en el kill-switch. Estado actual: ${s.state}. ` +
+        `WR 20 últimas: ${wr20}%. P&L 30d: $${pnl30}. ` +
+        `Razón: ${reason}. ` +
+        `Próxima condición de salida: ${s.next_conditions}.`,
+      );
+    }
+    setDockOpen(true);
+  }, []);
+
+  // Override negotiation — opens the dock with a confrontational prompt
+  // INSTEAD of releasing directly. The release only fires once the agent
+  // emits <<<TOOL:confirm_release:SYM>>> and the user clicks the amber
+  // button.
+  const handleNegotiateRelease = useCallback((sym: DashboardSymbolState, verdict: CardVerdict | null) => {
+    const base   = sym.symbol.replace('USDT', '');
+    const sinceMs = sym.state_since ? Date.now() - new Date(sym.state_since).getTime() : 0;
+    const sinceH  = Math.max(0, Math.round(sinceMs / 3600000));
+    setDockInitialPrompt(
+      `Estoy por liberar ${base} (${sym.symbol}) manualmente antes del ciclo automático. ` +
+      `El sistema lo tiene en ${sym.state} desde hace ~${sinceH}h. ` +
+      `Tu lectura inicial fue: "${verdict?.text ?? 'sin lectura previa'}". ` +
+      `Antes de confirmar, ayúdame a articular: ¿qué cambió en mi tesis del par para querer adelantarme al sistema? ` +
+      `Hazme preguntas concretas; no me dejes liberar sin justificación.`,
+    );
+    setDockOpen(true);
+  }, []);
+
+  // Confirm path — only fired by the dock when the agent emitted the
+  // confirm_release tool marker AND the user clicked the amber button.
+  const handleConfirmRelease = useCallback(async (symbol: string) => {
+    try {
+      await releaseKillSwitch(symbol, 'manual_override_via_copilot');
+      await fetchAll();
+    } catch (err) {
+      window.alert(`No se pudo liberar ${symbol}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [fetchAll]);
+
   const handleAskAgent = useCallback((p: Position, insight: PositionInsight) => {
     const liveSym = symbols.find((s) => s.symbol === p.symbol);
     const currentPx = liveSym?.live_price ?? liveSym?.price ?? p.entry_price * (1 + (p.pnl_pct ?? 0) / 100);
@@ -536,10 +599,20 @@ const App: React.FC = () => {
           )}
 
           {/* ── Kill-switch ───────────────────────────── */}
-          {mainTab === 'kill-switch' && (
+          {mainTab === 'kill-switch' && dashboard && (
             <ErrorBoundary fallbackLabel="Error en dashboard de kill switch">
-              <KillSwitchDashboard />
+              <KillSwitchView
+                dashboard={dashboard}
+                onAskAgent={handleKsAskAgent}
+                onNegotiateRelease={handleNegotiateRelease}
+                mobile={mobile}
+              />
             </ErrorBoundary>
+          )}
+          {mainTab === 'kill-switch' && !dashboard && (
+            <div style={{ padding: 40, textAlign: 'center', color: 'var(--nbc-fg-muted)' }}>
+              cargando estado del kill-switch…
+            </div>
           )}
 
           <footer className={appStyles.footer}>
@@ -600,6 +673,7 @@ const App: React.FC = () => {
           macro={macroState}
           initialPrompt={dockInitialPrompt}
           onOpenSymbol={openSymbolByPair}
+          onConfirmRelease={handleConfirmRelease}
         />
       )}
 

@@ -350,6 +350,23 @@ export async function getHealthDashboard(): Promise<DashboardResponse> {
   return request<DashboardResponse>('/health/dashboard');
 }
 
+// POST /health/reactivate/{symbol} — manually release a PAUSED symbol back
+// to PROBATION. The `reason` field is logged by the backend for audit. The
+// KillSwitchView's negotiated-override flow funnels its conversation
+// summary here as the reason string.
+export async function releaseKillSwitch(
+  symbol: string,
+  reason: string = 'manual_override',
+): Promise<{ ok: boolean; symbol: string; state: string }> {
+  return request<{ ok: boolean; symbol: string; state: string }>(
+    `/health/reactivate/${encodeURIComponent(symbol)}`,
+    {
+      method: 'POST',
+      body:   JSON.stringify({ reason }),
+    },
+  );
+}
+
 // ---- Multi-tenant resources (Epic B #253, B.5 follow-up B) ----
 //
 // tenant_id is derived from JWT on the backend — these functions intentionally

@@ -25,6 +25,10 @@ interface AgentDockProps {
   macro:          MacroState;
   initialPrompt?: string | null;
   onOpenSymbol?:  (pair: string) => void;
+  /** Confirm a manual kill-switch release once the agent emits
+   *  <<<TOOL:confirm_release:SYM>>>. Renders an amber "▸ confirmar
+   *  release de SYM" button inline under the agent message. */
+  onConfirmRelease?: (symbol: string) => Promise<void> | void;
   unreadHint?:    boolean;
 }
 
@@ -49,7 +53,7 @@ const DOCK_SUGGESTIONS = [
 const AgentDock: React.FC<AgentDockProps> = ({
   open, onOpen, onClose,
   symbols, positions, macro,
-  initialPrompt, onOpenSymbol, unreadHint,
+  initialPrompt, onOpenSymbol, onConfirmRelease, unreadHint,
 }) => {
   const [msgs,    setMsgs]    = useState<DockMsg[]>([]);
   const [input,   setInput]   = useState('');
@@ -127,6 +131,7 @@ INSTRUCCIONES:
 - Responde en español, breve (2-4 oraciones máx).
 - No inventes datos que no están arriba.
 - Si el usuario pregunta sobre un par específico, sugiere abrirlo terminando con <<<TOOL:open_symbol:NOMBRE>>> donde NOMBRE es el símbolo completo incluyendo USDT (ej: <<<TOOL:open_symbol:BTCUSDT>>>).
+- Si el usuario quiere liberar manualmente un par del kill-switch y justifica con UN argumento concreto (cambio de régimen macro, evento puntual identificable, par específico con causa clara, etc), termina la respuesta con <<<TOOL:confirm_release:NOMBRE>>> con el símbolo completo incluyendo USDT. Si la justificación es vaga ("siento que ya está bien", "creo que ya pasó"), pide MÁS detalles concretos SIN emitir el marker — tu trabajo es hacer que el usuario articule su tesis antes del override.
 - Si pregunta por todas sus posiciones, lista las que están arriba.
 - Si pide un resumen "en simple" o "para papá", usa lenguaje muy directo, sin jerga.
 - No uses negrita más de una vez por respuesta.`;
@@ -184,7 +189,12 @@ INSTRUCCIONES:
 
           <div className={styles.scroll} ref={scrollRef}>
             {msgs.map((m, i) => (
-              <DockMessage key={i} m={m} onOpenSymbol={onOpenSymbol} />
+              <DockMessage
+                key={i}
+                m={m}
+                onOpenSymbol={onOpenSymbol}
+                onConfirmRelease={onConfirmRelease}
+              />
             ))}
             {loading && <DockTyping />}
           </div>
@@ -231,7 +241,11 @@ function extractTools(text: string): { tools: ToolCall[]; cleaned: string } {
   return { tools, cleaned };
 }
 
-const DockMessage: React.FC<{ m: DockMsg; onOpenSymbol?: (pair: string) => void }> = ({ m, onOpenSymbol }) => {
+const DockMessage: React.FC<{
+  m: DockMsg;
+  onOpenSymbol?:    (pair: string) => void;
+  onConfirmRelease?: (symbol: string) => Promise<void> | void;
+}> = ({ m, onOpenSymbol, onConfirmRelease }) => {
   if (m.role === 'user') {
     return (
       <div className={`${styles.msg} ${styles.msgUser}`}>
@@ -257,6 +271,16 @@ const DockMessage: React.FC<{ m: DockMsg; onOpenSymbol?: (pair: string) => void 
                 className={styles.toolLink}
                 onClick={() => onOpenSymbol(t.arg!)}
               >▸ abrir {display}</button>
+            );
+          }
+          if (t.name === 'confirm_release' && t.arg && onConfirmRelease) {
+            const display = t.arg.replace('USDT', '');
+            return (
+              <button
+                key={i}
+                className={styles.toolConfirm}
+                onClick={() => void onConfirmRelease(t.arg!)}
+              >▸ confirmar release de {display}</button>
             );
           }
           return null;
