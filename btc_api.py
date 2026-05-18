@@ -25,6 +25,7 @@ except ImportError:
 import requests as req_lib  # tests patch btc_api.req_lib.post (test_api.py); also used directly at line 187
 from fastapi import Depends, FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # Auth (added 2026-04-29) — JWT cookie auth + CSRF + role gating.
 from api.auth import router as auth_router
@@ -394,6 +395,73 @@ def get_macro():
     }
     _macro_cache.update(ts=now, data=out)
     return out
+
+
+# ── Agent chat proxy ────────────────────────────────────────────────
+# Used by the SymbolDetail copilot drawer. Thin pass-through to Anthropic
+# Messages API. No conversation history is stored — the frontend owns the
+# transcript and resends it on every turn.
+
+class _AgentMessage(BaseModel):
+    role:    str
+    content: str
+
+class _AgentRequest(BaseModel):
+    system:   str
+    messages: list[_AgentMessage]
+
+
+@app.post("/agent/chat", summary="Copilot proxy (Anthropic Messages)")
+def agent_chat(body: _AgentRequest):
+    """Proxy a single chat turn to Anthropic. Returns the assistant text only.
+
+    Requires ANTHROPIC_API_KEY in the environment. The frontend should hide
+    its input row when the feature flag is off — but in case it slips, we
+    return a 503 with a clear reason so the UI can render a graceful note.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        from fastapi import HTTPException  # noqa: PLC0415
+        raise HTTPException(
+            status_code=503,
+            detail="ANTHROPIC_API_KEY not configured. Set it in .env and restart the API.",
+        )
+
+    payload = {
+        "model":      "claude-haiku-4-5",
+        "max_tokens": 1024,
+        "system":     body.system,
+        "messages":   [{"role": m.role, "content": m.content} for m in body.messages],
+    }
+    try:
+        r = req_lib.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+        # Anthropic returns content as a list of blocks; we only care about
+        # the first text block — tool-use blocks aren't relevant here.
+        text = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                text = block.get("text", "")
+                break
+        return {"text": text}
+    except req_lib.HTTPError as e:
+        log.warning("agent_chat upstream error: %s — body=%s", e, getattr(e.response, "text", ""))
+        from fastapi import HTTPException  # noqa: PLC0415
+        raise HTTPException(status_code=502, detail=f"Anthropic upstream error: {e}")
+    except Exception as e:
+        log.warning("agent_chat unexpected error: %s", e)
+        from fastapi import HTTPException  # noqa: PLC0415
+        raise HTTPException(status_code=500, detail=f"Agent error: {e}")
 
 
 @app.get("/symbols", summary="Estado actual de cada par monitoreado")

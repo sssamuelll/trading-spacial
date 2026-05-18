@@ -1,15 +1,21 @@
 // ============================================================
-// SymbolDetail — slide-up sheet that replaces ChartModal.
+// SymbolDetail v2 — conversational copilot drawer.
 //
-// Three tabs in the right-pane:
-//   - Setup    : 9-factor checklist + verdict (synthetic until backend
-//                exposes score_components: boolean[])
-//   - Posición : hypothetical sizing calculator + "Abrir posición" CTA
-//                that bubbles a PositionPreset up to App.tsx
-//   - Historial: real closed positions for this pair, last 6
+// Replaces the v1 tabbed layout (Setup / Posición / Historial) with a
+// chat-first right pane. An AI agent reads the symbol state, opens with
+// a proactive greeting + setup card, and renders rich data cards inline
+// as it reaches for "tools" via trailing markers like <<<TOOL:setup>>>.
 //
-// Chart pane uses lightweight-charts (same setup ChartModal already
-// had — ported here so we can deprecate ChartModal once verified).
+// Architecture
+//   - Left pane: lightweight-charts (same library ChartModal used)
+//   - Right pane: <Copilot/> — header + scroll + suggestion chips + input
+//   - Tool cards rendered inline by <CopilotMessage/>:
+//       <<<TOOL:setup>>>    → <SetupCard/>
+//       <<<TOOL:position>>> → <PositionCard/>
+//       <<<TOOL:history>>>  → <HistoryCard/>
+//   - Agent backend: POST /agent/chat (proxies to Anthropic Haiku 4.5)
+//   - Feature flag: VITE_AGENT_ENABLED (default on). When off, the input
+//     row is hidden and only the synchronous greeting + setup card render.
 // ============================================================
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
@@ -23,8 +29,8 @@ import {
 
 import styles from './SymbolDetail.module.css';
 import type { SymbolStatus, Position, OhlcvCandle, OhlcvVolume } from '../types';
-import { formatPrice, timeAgo } from '../utils';
-import { getOhlcv, getPositions } from '../api';
+import { formatPrice } from '../utils';
+import { getOhlcv, getPositions, chatAgent, type AgentMessage } from '../api';
 import { SCORE_FACTORS } from '../constants/score-factors';
 
 // ── Public types ─────────────────────────────────────────────
@@ -37,7 +43,7 @@ export interface PositionPreset {
   entry:     number;
   sl:        number;
   tp:        number;
-  sizeUsd:   number;
+  qty:       number;
 }
 
 interface SymbolDetailProps {
@@ -45,6 +51,13 @@ interface SymbolDetailProps {
   onClose:         () => void;
   onOpenPosition?: (preset: PositionPreset) => void;
 }
+
+// Read the agent feature flag once at module load. Default ENABLED.
+// Disable with `VITE_AGENT_ENABLED=0` in `frontend/.env.local`.
+const AGENT_ENABLED: boolean = (() => {
+  const flag = (import.meta.env.VITE_AGENT_ENABLED ?? '').toString().trim().toLowerCase();
+  return flag !== '0' && flag !== 'false' && flag !== 'off';
+})();
 
 // ── Helpers ──────────────────────────────────────────────────
 
@@ -64,8 +77,6 @@ function computeSMA(candles: OhlcvCandle[], period: number): { time: UTCTimestam
   return out;
 }
 
-// Resolve a CSS custom property to its computed hex string. Lightweight-charts
-// doesn't evaluate `var(--foo)` — it needs the literal color string.
 function cssVar(name: string, fallback: string): string {
   if (typeof window === 'undefined') return fallback;
   const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -73,8 +84,7 @@ function cssVar(name: string, fallback: string): string {
 }
 
 // TODO: replace when backend exposes symbol.score_components: boolean[].
-// Until then, derive a deterministic per-symbol pass/fail breakdown that
-// adds up to symbol.score, locking LRC + TRIG to the real flags.
+// See: frontend/src/constants/score-factors.ts for the 9-factor catalog.
 function buildFactors(symbol: SymbolStatus) {
   const score   = symbol.score ?? 0;
   const lrc     = symbol.lrc_pct ?? 50;
@@ -84,7 +94,6 @@ function buildFactors(symbol: SymbolStatus) {
   const passes = new Set<number>();
   if (lrc < 25) passes.add(0);   // LRC
   if (trigger)  passes.add(8);   // TRIG
-
   let i = 0;
   while (passes.size < score && i < 100) {
     const idx = (seed + i * 7) % 9;
@@ -92,6 +101,16 @@ function buildFactors(symbol: SymbolStatus) {
     i++;
   }
   return SCORE_FACTORS.map((f, idx) => ({ ...f, pass: passes.has(idx) }));
+}
+
+// Strip and collect `<<<TOOL:name>>>` markers from agent text.
+function extractTools(text: string): { tools: string[]; cleaned: string } {
+  const tools: string[] = [];
+  const cleaned = text.replace(/<<<TOOL:([a-z_]+)>>>/g, (_, name: string) => {
+    tools.push(name);
+    return '';
+  }).trim();
+  return { tools, cleaned };
 }
 
 const TIMEFRAMES: { v: Timeframe; l: string }[] = [
@@ -107,10 +126,8 @@ const TIMEFRAMES: { v: Timeframe; l: string }[] = [
 // ============================================================
 
 const SymbolDetail: React.FC<SymbolDetailProps> = ({ symbol, onClose, onOpenPosition }) => {
-  const [tf,  setTf]  = useState<Timeframe>('1h');
-  const [tab, setTab] = useState<'setup' | 'position' | 'history'>('setup');
+  const [tf, setTf] = useState<Timeframe>('1h');
 
-  // Close on Escape
   useEffect(() => {
     if (!symbol) return;
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
@@ -135,7 +152,7 @@ const SymbolDetail: React.FC<SymbolDetailProps> = ({ symbol, onClose, onOpenPosi
       <aside
         className={styles.sheet}
         role="dialog"
-        aria-label={`Detalle ${base}`}
+        aria-label={`Detalle ${base} con copiloto`}
       >
         {/* ── Header ── */}
         <header className={styles.hd}>
@@ -153,9 +170,9 @@ const SymbolDetail: React.FC<SymbolDetailProps> = ({ symbol, onClose, onOpenPosi
           </div>
 
           <div className={styles.hdChips}>
-            <Chip label="SCORE"     value={`${score}/9`}                          tone={scoreTone} />
-            <Chip label="LRC 1H"    value={`${lrc.toFixed(1)}%`}                  tone={macroTone} />
-            <Chip label="MACRO 4H"  value={macroTone === 'bull' ? 'Alcista ✓' : 'Adversa ✗'} tone={macroTone} />
+            <Chip label="SCORE"    value={`${score}/9`}                                  tone={scoreTone} />
+            <Chip label="LRC 1H"   value={`${lrc.toFixed(1)}%`}                          tone={macroTone} />
+            <Chip label="MACRO 4H" value={macroTone === 'bull' ? 'Alcista ✓' : 'Adversa ✗'} tone={macroTone} />
             <Chip
               label="ESTADO"
               value={isFreshSenal ? 'SETUP VÁLIDO' : symbol.señal ? 'Esperando filtros' : 'Sin gatillo'}
@@ -197,27 +214,16 @@ const SymbolDetail: React.FC<SymbolDetailProps> = ({ symbol, onClose, onOpenPosi
             </div>
           </section>
 
-          <section className={styles.analysis}>
-            <nav className={styles.tabs}>
-              <TabBtn active={tab === 'setup'}    onClick={() => setTab('setup')}>Setup</TabBtn>
-              <TabBtn active={tab === 'position'} onClick={() => setTab('position')}>Posición</TabBtn>
-              <TabBtn active={tab === 'history'}  onClick={() => setTab('history')}>Historial</TabBtn>
-            </nav>
-            <div className={styles.tabBody}>
-              {tab === 'setup'    && <SetupTab    symbol={symbol} />}
-              {tab === 'position' && <PositionTab symbol={symbol} onOpenPosition={onOpenPosition} />}
-              {tab === 'history'  && <HistoryTab  symbol={symbol} />}
-            </div>
-          </section>
+          <Copilot symbol={symbol} onOpenPosition={onOpenPosition} />
         </div>
 
         {/* ── Footer ── */}
         <footer className={styles.ft}>
           <span className="prose">
-            <span className="num">LRC ≤ 25%</span> = zona LONG · <span className="num">SMA 100</span> = filtro macro
+            <span className="num">enter</span> envía · <span className="num">esc</span> cierra
           </span>
           <span className="prose">
-            Datos cada ~3s · Última actualización ahora mismo
+            copiloto powered by Claude · razonamiento basado en señal en vivo
           </span>
         </footer>
       </aside>
@@ -226,7 +232,7 @@ const SymbolDetail: React.FC<SymbolDetailProps> = ({ symbol, onClose, onOpenPosi
 };
 
 // ============================================================
-// CHART — lightweight-charts (ported from ChartModal)
+// CHART — lightweight-charts pane
 // ============================================================
 
 interface ChartCanvasProps {
@@ -242,15 +248,10 @@ const ChartCanvas: React.FC<ChartCanvasProps> = ({ symbol, timeframe }) => {
 
   useEffect(() => {
     if (!containerRef.current) return;
-
-    // Tear down any prior chart on this slot.
     chartRef.current?.remove();
     chartRef.current = null;
-
     const container = containerRef.current;
 
-    // Pull colors from the redesign tokens so the chart matches the
-    // rest of the dashboard (cyan/amber, dark bg).
     const C_BG     = cssVar('--nbc-bg',            '#0a0d0b');
     const C_GRID   = cssVar('--nbc-border-dimmer', '#6ad7ff19');
     const C_BORDER = cssVar('--nbc-border-dim',    '#6ad7ff33');
@@ -267,10 +268,7 @@ const ChartCanvas: React.FC<ChartCanvasProps> = ({ symbol, timeframe }) => {
         fontFamily: "'JetBrains Mono', 'Geist Mono', ui-monospace, monospace",
         fontSize:   11,
       },
-      grid: {
-        vertLines: { color: C_GRID },
-        horzLines: { color: C_GRID },
-      },
+      grid: { vertLines: { color: C_GRID }, horzLines: { color: C_GRID } },
       crosshair: {
         mode: CrosshairMode.Normal,
         vertLine: { color: C_TEXT, style: 2, width: 1, labelBackgroundColor: C_BORDER },
@@ -285,8 +283,6 @@ const ChartCanvas: React.FC<ChartCanvasProps> = ({ symbol, timeframe }) => {
         borderColor:    C_BORDER,
         timeVisible:    true,
         secondsVisible: false,
-        fixLeftEdge:    false,
-        fixRightEdge:   false,
       },
       width:  container.clientWidth  || 800,
       height: container.clientHeight || 420,
@@ -311,9 +307,7 @@ const ChartCanvas: React.FC<ChartCanvasProps> = ({ symbol, timeframe }) => {
         if (!alive || chartRef.current !== chart) return;
         const candles = data.candles;
         if (!candles.length) return;
-
-        const lastClose = candles[candles.length - 1].close;
-        const fmt       = priceFormat(lastClose);
+        const fmt = priceFormat(candles[candles.length - 1].close);
 
         const candleSeries = chart.addCandlestickSeries({
           upColor:         C_BULL,
@@ -339,9 +333,7 @@ const ChartCanvas: React.FC<ChartCanvasProps> = ({ symbol, timeframe }) => {
           priceFormat:  { type: 'volume' },
           priceScaleId: 'vol',
         });
-        chart.priceScale('vol').applyOptions({
-          scaleMargins: { top: 0.82, bottom: 0 },
-        });
+        chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
         volSeries.setData(
           (data.volumes as OhlcvVolume[]).map((v) => ({
             time:  v.time as UTCTimestamp,
@@ -352,38 +344,16 @@ const ChartCanvas: React.FC<ChartCanvasProps> = ({ symbol, timeframe }) => {
 
         const sma20 = computeSMA(candles, 20);
         if (sma20.length) {
-          const s20 = chart.addLineSeries({
-            color:                  C_SMA20,
-            lineWidth:              1,
-            priceLineVisible:       false,
-            lastValueVisible:       false,
-            crosshairMarkerVisible: false,
-            title:                  'SMA 20',
-          });
-          s20.setData(sma20);
+          chart.addLineSeries({ color: C_SMA20, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, title: 'SMA 20' }).setData(sma20);
         }
         const sma100 = computeSMA(candles, 100);
         if (sma100.length) {
-          const s100 = chart.addLineSeries({
-            color:                  C_SMA100,
-            lineWidth:              1,
-            priceLineVisible:       false,
-            lastValueVisible:       false,
-            crosshairMarkerVisible: false,
-            title:                  'SMA 100',
-          });
-          s100.setData(sma100);
+          chart.addLineSeries({ color: C_SMA100, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, title: 'SMA 100' }).setData(sma100);
         }
-
         chart.timeScale().fitContent();
       })
-      .catch((err) => {
-        if (!alive) return;
-        setError(err instanceof Error ? err.message : 'Error cargando datos');
-      })
-      .finally(() => {
-        if (alive) setLoading(false);
-      });
+      .catch((err) => { if (alive) setError(err instanceof Error ? err.message : 'Error cargando datos'); })
+      .finally(() => { if (alive) setLoading(false); });
 
     return () => {
       alive = false;
@@ -405,59 +375,311 @@ const ChartCanvas: React.FC<ChartCanvasProps> = ({ symbol, timeframe }) => {
 };
 
 // ============================================================
-// SETUP TAB — 9-factor checklist + verdict
+// COPILOT — chat-first right pane
 // ============================================================
 
-const SetupTab: React.FC<{ symbol: SymbolStatus }> = ({ symbol }) => {
-  const factors   = useMemo(() => buildFactors(symbol), [symbol]);
-  const passCount = factors.filter((f) => f.pass).length;
-  const verdict =
-    passCount >= 6
-      ? { tone: 'bull' as const, title: 'Setup firme — considera abrir',          body: 'La mayoría de filtros coinciden. Riesgo controlado con ATR.' }
-      : passCount >= 4
-      ? { tone: 'warn' as const, title: 'Setup parcial — observa',                body: `${9 - passCount} filtros aún no cumplen. Espera confirmación antes de abrir.` }
-      : { tone: 'bear' as const, title: 'NO operes — demasiados filtros en contra', body: 'El sistema no recomienda abrir posición en estas condiciones.' };
+type Verdict = 'bull' | 'warn' | 'bear';
 
-  const verdictClass = verdict.tone === 'bull' ? styles.verdictBull : verdict.tone === 'warn' ? styles.verdictWarn : styles.verdictBear;
+interface CopilotMsg {
+  role:    'user' | 'assistant';
+  text:    string;
+  tools?:  string[];
+  verdict?: Verdict;
+  error?:  boolean;
+}
+
+const SUGGESTIONS = [
+  { label: '¿qué muestra el score?', msg: 'Explícame el desglose del score.' },
+  { label: 'simular posición $1000',  msg: 'Si abro $1000 aquí con 1% de riesgo, ¿cómo queda?' },
+  { label: 'historial del par',       msg: '¿Cómo le ha ido al sistema con este par últimamente?' },
+  { label: '¿debo operar ahora?',     msg: '¿Recomiendas que abra una posición ahora mismo?' },
+];
+
+interface CopilotProps {
+  symbol:          SymbolStatus;
+  onOpenPosition?: (preset: PositionPreset) => void;
+}
+
+const Copilot: React.FC<CopilotProps> = ({ symbol, onOpenPosition }) => {
+  const [msgs,    setMsgs]    = useState<CopilotMsg[]>([]);
+  const [input,   setInput]   = useState('');
+  const [loading, setLoading] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Proactive greeting when a symbol opens — runs sync, no API call.
+  useEffect(() => {
+    if (!symbol) return;
+    const factors = buildFactors(symbol);
+    const passing = factors.filter((f) => f.pass);
+    const failing = factors.filter((f) => !f.pass);
+    const verdict: Verdict =
+      passing.length >= 6 ? 'bull' :
+      passing.length >= 4 ? 'warn' :
+      'bear';
+    const base = symbol.symbol.replace('USDT', '');
+    const greeting =
+      verdict === 'bull'
+        ? `Detecté **setup firme** en ${base}. Score ${passing.length}/9, gatillo activo. ¿Quieres que te explique los factores o prefieres simular una posición?`
+        : verdict === 'warn'
+        ? `${base} muestra **setup parcial** (${passing.length}/9). Faltan ${failing.length} confirmaciones. ¿Te explico cuáles?`
+        : `${base} **no recomienda entrar ahora** — sólo ${passing.length} de 9 filtros se cumplen. ¿Te muestro qué falta?`;
+
+    setMsgs([{ role: 'assistant', text: greeting, verdict, tools: ['setup'] }]);
+  }, [symbol.symbol]);
+
+  // Autoscroll on new messages
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [msgs, loading]);
+
+  const send = async (text: string) => {
+    const t = text.trim();
+    if (!t || loading) return;
+    setMsgs((prev) => [...prev, { role: 'user', text: t }]);
+    setInput('');
+    if (!AGENT_ENABLED) return;
+    setLoading(true);
+
+    try {
+      const factors = buildFactors(symbol);
+      const passing = factors.filter((f) => f.pass);
+      const failing = factors.filter((f) => !f.pass);
+      const base    = symbol.symbol.replace('USDT', '');
+      const sysPrompt = `Eres un copiloto de trading conversando en español casual y directo.
+El usuario está mirando el par ${base}/USDT a $${formatPrice(symbol.live_price ?? symbol.price ?? 0)}.
+
+DATOS ACTUALES:
+- Score: ${passing.length}/9
+- LRC%: ${(symbol.lrc_pct ?? 0).toFixed(1)}%
+- Cambio 24h: ${(symbol.change_24h ?? 0).toFixed(2)}%
+- Side sugerido: ${symbol.direction ?? 'LONG'}
+- Gatillo 5M activo: ${symbol.señal ? 'sí' : 'no'}
+
+FACTORES QUE PASAN: ${passing.map((f) => f.key).join(', ') || 'ninguno'}
+FACTORES QUE FALLAN: ${failing.map((f) => f.key).join(', ') || 'ninguno'}
+
+INSTRUCCIONES:
+- Responde MUY breve (1-3 oraciones máximo). El usuario está en una UI compacta.
+- Si el usuario pregunta sobre el score o factores, termina tu respuesta con <<<TOOL:setup>>>
+- Si quiere simular una posición o calcular riesgo, termina con <<<TOOL:position>>>
+- Si pregunta por historial pasado, termina con <<<TOOL:history>>>
+- Si pregunta "¿debo operar?", da una recomendación clara basada en el score y termina con <<<TOOL:setup>>>
+- NUNCA inventes datos. Si no sabes algo, dilo.
+- No uses asteriscos para negrita más de 1-2 veces por respuesta.`;
+
+      // Keep last 6 turns of context — enough for follow-ups, cheap on tokens.
+      const history: AgentMessage[] = msgs.slice(-6).map((m) => ({
+        role:    m.role,
+        content: m.text,
+      }));
+
+      const resp = await chatAgent({
+        system:   sysPrompt,
+        messages: [...history, { role: 'user', content: t }],
+      });
+      const { tools, cleaned } = extractTools(resp.text || '');
+      setMsgs((prev) => [...prev, { role: 'assistant', text: cleaned, tools }]);
+    } catch (err) {
+      setMsgs((prev) => [...prev, {
+        role:  'assistant',
+        text:  err instanceof Error ? `No pude analizar eso: ${err.message}` : 'No pude analizar eso. Intenta de nuevo.',
+        error: true,
+      }]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const submitInput = (e: React.FormEvent) => {
+    e.preventDefault();
+    send(input);
+  };
+
+  const base = symbol.symbol.replace('USDT', '');
 
   return (
-    <div className={styles.tab}>
-      <div>
-        <div className={styles.checklistHd}>
-          <span className="label">— desglose del score</span>
-          <span className={styles.checklistScore}>
-            <span className="num">{passCount}</span>
-            <span className={styles.checklistMax}>/9</span>
-          </span>
+    <section className={styles.cp}>
+      <header className={styles.cpHd}>
+        <div className={styles.cpHdId}>
+          <span className={styles.cpHdGlyph}>◈</span>
+          <div>
+            <div className={styles.cpHdName}>copiloto</div>
+            <div className={styles.cpHdSub}>leyendo {base}/USDT en vivo</div>
+          </div>
         </div>
-        <ul className={styles.checklistList}>
-          {factors.map((f) => (
-            <li key={f.key} className={styles.fact}>
-              <span className={[styles.factGlyph, f.pass ? styles.factGlyphPass : styles.factGlyphFail].join(' ')}>
-                {f.pass ? '✓' : '✗'}
-              </span>
-              <div className={styles.factBody}>
-                <div className={styles.factTitle}>
-                  <span className={styles.factKey}>{f.key}</span>
-                  <span className={styles.factLabel}>{f.label}</span>
-                </div>
-                <div className={`${styles.factPlain} prose`}>{f.plain}</div>
-              </div>
-              <div className={[styles.factPill, f.pass ? styles.factPillPass : styles.factPillFail].join(' ')}>
-                {f.pass ? 'PASA' : 'FALLA'}
-              </div>
-            </li>
-          ))}
-        </ul>
+        <div className={`${styles.cpHdStatus} ${AGENT_ENABLED ? '' : styles.cpHdStatusOff}`}>
+          <span className={`${styles.cpHdDot} ${AGENT_ENABLED ? '' : styles.cpHdDotOff}`} />
+          <span className={styles.cpHdStatusLbl}>{AGENT_ENABLED ? 'online' : 'offline'}</span>
+        </div>
+      </header>
+
+      <div className={styles.cpScroll} ref={scrollRef}>
+        {msgs.map((m, i) => (
+          <CopilotMessage key={i} message={m} symbol={symbol} onOpenPosition={onOpenPosition} />
+        ))}
+        {loading && <TypingBubble />}
       </div>
 
-      <div className={`${styles.verdict} ${verdictClass}`}>
-        <div className={styles.verdictIcon}>
-          {verdict.tone === 'bull' ? '◉' : verdict.tone === 'warn' ? '◐' : '⏸'}
+      {AGENT_ENABLED ? (
+        <>
+          <div className={styles.cpSuggestions}>
+            {SUGGESTIONS.map((s, i) => (
+              <button
+                key={i}
+                className={styles.cpChip}
+                onClick={() => send(s.msg)}
+                disabled={loading}
+              >{s.label}</button>
+            ))}
+          </div>
+          <form className={styles.cpInputRow} onSubmit={submitInput}>
+            <span className={styles.cpInputPrompt}>&gt;</span>
+            <input
+              className={styles.cpInput}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder={loading ? 'pensando…' : 'pregunta lo que quieras sobre este par'}
+              disabled={loading}
+              autoFocus
+            />
+            <button
+              className={styles.cpSend}
+              type="submit"
+              disabled={loading || !input.trim()}
+            >↵</button>
+          </form>
+        </>
+      ) : (
+        <div className={styles.cpFlagOff}>
+          copiloto desactivado (VITE_AGENT_ENABLED=0). Modo solo-lectura.
+        </div>
+      )}
+    </section>
+  );
+};
+
+// ── CopilotMessage + helpers ─────────────────────────────────
+
+interface CopilotMessageProps {
+  message:         CopilotMsg;
+  symbol:          SymbolStatus;
+  onOpenPosition?: (preset: PositionPreset) => void;
+}
+const CopilotMessage: React.FC<CopilotMessageProps> = ({ message, symbol, onOpenPosition }) => {
+  if (message.role === 'user') {
+    return (
+      <div className={`${styles.cpMsg} ${styles.cpMsgUser}`}>
+        <div className={`${styles.cpBubble} ${styles.cpBubbleUser}`}>{message.text}</div>
+      </div>
+    );
+  }
+
+  const verdictClass =
+    message.verdict === 'bull' ? styles.cpBubbleVerdictBull :
+    message.verdict === 'warn' ? styles.cpBubbleVerdictWarn :
+    message.verdict === 'bear' ? styles.cpBubbleVerdictBear : '';
+  const errorClass = message.error ? styles.cpBubbleError : '';
+
+  return (
+    <div className={`${styles.cpMsg} ${styles.cpMsgAsst}`}>
+      <div className={styles.cpMsgAvatar}>◈</div>
+      <div className={styles.cpMsgBody}>
+        {message.text && (
+          <div className={[styles.cpBubble, styles.cpBubbleAsst, errorClass, verdictClass].filter(Boolean).join(' ')}>
+            <FormattedText text={message.text} />
+          </div>
+        )}
+        {message.tools?.map((t, i) => {
+          if (t === 'setup')    return <SetupCard    key={i} symbol={symbol} />;
+          if (t === 'position') return <PositionCard key={i} symbol={symbol} onOpen={onOpenPosition} />;
+          if (t === 'history')  return <HistoryCard  key={i} symbol={symbol} />;
+          return null;
+        })}
+      </div>
+    </div>
+  );
+};
+
+const FormattedText: React.FC<{ text: string }> = ({ text }) => {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return (
+    <>
+      {parts.map((p, i) => {
+        if (p.startsWith('**') && p.endsWith('**')) {
+          return <strong key={i}>{p.slice(2, -2)}</strong>;
+        }
+        return (
+          <React.Fragment key={i}>
+            {p.split('\n').map((line, j) => (
+              <React.Fragment key={j}>{j > 0 && <br />}{line}</React.Fragment>
+            ))}
+          </React.Fragment>
+        );
+      })}
+    </>
+  );
+};
+
+const TypingBubble: React.FC = () => (
+  <div className={`${styles.cpMsg} ${styles.cpMsgAsst}`}>
+    <div className={styles.cpMsgAvatar}>◈</div>
+    <div className={styles.cpMsgBody}>
+      <div className={`${styles.cpBubble} ${styles.cpBubbleAsst} ${styles.cpBubbleTyping}`}>
+        <span className={styles.cpTypingDot} />
+        <span className={styles.cpTypingDot} />
+        <span className={styles.cpTypingDot} />
+      </div>
+    </div>
+  </div>
+);
+
+// ============================================================
+// SETUP CARD — two-column pass/fail breakdown
+// ============================================================
+
+const SetupCard: React.FC<{ symbol: SymbolStatus }> = ({ symbol }) => {
+  const factors = useMemo(() => buildFactors(symbol), [symbol]);
+  const passing = factors.filter((f) => f.pass);
+  const failing = factors.filter((f) => !f.pass);
+  return (
+    <div className={styles.cpCard}>
+      <div className={styles.cpCardHead}>
+        <span className={styles.cpCardIcon}>◧</span>
+        <span className={styles.cpCardTitle}>Desglose del score</span>
+        <span className={`${styles.cpCardScore} num`}>{passing.length}/9</span>
+      </div>
+      <div className={styles.cpFactCols}>
+        <div>
+          <div className={styles.cpFactColsHd}>
+            <span className={`${styles.cpFactColsDot} ${styles.cpFactColsDotOk}`} />
+            <span className={styles.cpFactColsLabel}>PASAN ({passing.length})</span>
+          </div>
+          <ul className={styles.cpFactList}>
+            {passing.length === 0 ? (
+              <li className={`${styles.cpFact} ${styles.cpFactEmpty} prose`}>— ninguno todavía</li>
+            ) : passing.map((f) => (
+              <li key={f.key} className={`${styles.cpFact} ${styles.cpFactPass}`}>
+                <span className={styles.cpFactKey}>{f.key}</span>
+                <span className={styles.cpFactTxt}>{f.label}</span>
+              </li>
+            ))}
+          </ul>
         </div>
         <div>
-          <div className={styles.verdictTitle}>{verdict.title}</div>
-          <div className={`${styles.verdictBody} prose`}>{verdict.body}</div>
+          <div className={styles.cpFactColsHd}>
+            <span className={`${styles.cpFactColsDot} ${styles.cpFactColsDotNo}`} />
+            <span className={styles.cpFactColsLabel}>FALLAN ({failing.length})</span>
+          </div>
+          <ul className={styles.cpFactList}>
+            {failing.length === 0 ? (
+              <li className={`${styles.cpFact} ${styles.cpFactEmpty} prose`}>— ninguno, score perfecto</li>
+            ) : failing.map((f) => (
+              <li key={f.key} className={`${styles.cpFact} ${styles.cpFactFail}`}>
+                <span className={styles.cpFactKey}>{f.key}</span>
+                <span className={styles.cpFactTxt}>{f.label}</span>
+              </li>
+            ))}
+          </ul>
         </div>
       </div>
     </div>
@@ -465,25 +687,23 @@ const SetupTab: React.FC<{ symbol: SymbolStatus }> = ({ symbol }) => {
 };
 
 // ============================================================
-// POSITION TAB — hypothetical sizing calculator + CTA
+// POSITION CARD — inline knobs + RR + outputs + CTA
 // ============================================================
 
-interface PositionTabProps {
-  symbol:          SymbolStatus;
-  onOpenPosition?: (preset: PositionPreset) => void;
+interface PositionCardProps {
+  symbol: SymbolStatus;
+  onOpen?: (preset: PositionPreset) => void;
 }
-
-const PositionTab: React.FC<PositionTabProps> = ({ symbol, onOpenPosition }) => {
+const PositionCard: React.FC<PositionCardProps> = ({ symbol, onOpen }) => {
   const [capital, setCapital] = useState(1000);
   const [riskPct, setRiskPct] = useState(1);
-  const [slPct,   setSlPct]   = useState(2.5);
   const [rr,      setRr]      = useState(2);
+  const [slPct,   setSlPct]   = useState(2.5);
 
   const entry  = symbol.live_price ?? symbol.price ?? 0;
   const isLong = (symbol.direction ?? 'LONG') === 'LONG';
   const sl     = isLong ? entry * (1 - slPct / 100) : entry * (1 + slPct / 100);
   const tp     = isLong ? entry * (1 + (slPct * rr) / 100) : entry * (1 - (slPct * rr) / 100);
-
   const riskUsd   = capital * (riskPct / 100);
   const slDistAbs = Math.abs(entry - sl);
   const qty       = slDistAbs > 0 ? riskUsd / slDistAbs : 0;
@@ -495,208 +715,216 @@ const PositionTab: React.FC<PositionTabProps> = ({ symbol, onOpenPosition }) => 
   const span   = (maxBar - minBar) || 1;
   const posOf  = (p: number) => ((p - minBar) / span) * 100;
 
-  const ctaDisabled = entry <= 0 || qty <= 0;
+  const disabled = entry <= 0 || qty <= 0;
 
   const handleOpen = () => {
-    if (!onOpenPosition || ctaDisabled) return;
-    onOpenPosition({
+    if (!onOpen || disabled) return;
+    onOpen({
       symbol:    symbol.symbol,
       direction: isLong ? 'LONG' : 'SHORT',
       entry,
       sl,
       tp,
-      sizeUsd:   posValue,
+      qty,
     });
   };
 
   return (
-    <div className={styles.tab}>
-      <div className={styles.posHead}>
-        <span className="label">— calculadora hipotética</span>
-        <span className="prose">si abres aquí con tu plan de riesgo actual</span>
+    <div className={styles.cpCard}>
+      <div className={styles.cpCardHead}>
+        <span className={styles.cpCardIcon}>✦</span>
+        <span className={styles.cpCardTitle}>Calculadora de posición</span>
+        <span className={styles.cpCardScore}>
+          <span className="num">${posValue.toFixed(0)}</span>
+        </span>
       </div>
 
-      <div className={styles.posInputs}>
-        <Stepper label="Capital"  value={`$${capital}`}            onMinus={() => setCapital(Math.max(100, capital - 100))} onPlus={() => setCapital(capital + 100)} />
-        <Stepper label="Riesgo %" value={`${riskPct.toFixed(1)}%`} onMinus={() => setRiskPct(Math.max(0.1, +(riskPct - 0.1).toFixed(1)))} onPlus={() => setRiskPct(+(riskPct + 0.1).toFixed(1))} />
-        <Stepper label="SL %"     value={`${slPct.toFixed(2)}%`}   onMinus={() => setSlPct(Math.max(0.5, +(slPct - 0.25).toFixed(2)))}   onPlus={() => setSlPct(+(slPct + 0.25).toFixed(2))} />
-        <Stepper label="R:R"      value={`1:${rr}`}                onMinus={() => setRr(Math.max(1, rr - 0.5))} onPlus={() => setRr(rr + 0.5)} />
+      <div className={styles.cpKnobs}>
+        <Knob label="capital"  value={`$${capital}`}             onMinus={() => setCapital(Math.max(100, capital - 100))} onPlus={() => setCapital(capital + 100)} />
+        <Knob label="riesgo %" value={riskPct.toFixed(1)}        onMinus={() => setRiskPct(Math.max(0.1, +(riskPct - 0.1).toFixed(1)))} onPlus={() => setRiskPct(+(riskPct + 0.1).toFixed(1))} />
+        <Knob label="sl %"     value={slPct.toFixed(2)}          onMinus={() => setSlPct(Math.max(0.5, +(slPct - 0.25).toFixed(2)))}   onPlus={() => setSlPct(+(slPct + 0.25).toFixed(2))} />
+        <Knob label="r:r"      value={`1:${rr}`}                 onMinus={() => setRr(Math.max(1, rr - 0.5))} onPlus={() => setRr(rr + 0.5)} />
       </div>
 
-      <div className={styles.posViz}>
-        <div className={styles.posBar}>
-          <div className={`${styles.posZone} ${styles.posZoneLoss}`} style={{ left: '0%', width: `${posOf(entry)}%` }} />
-          <div className={`${styles.posZone} ${styles.posZoneGain}`} style={{ left: `${posOf(entry)}%`, right: '0%' }} />
-          <div className={`${styles.posMarker} ${styles.posMarkerSl}`}    style={{ left: `${posOf(sl)}%` }}>
-            <span className={styles.posMarkerLbl}>SL</span>
-            <span className={`num ${styles.posMarkerVal}`}>{formatPrice(sl)}</span>
-          </div>
-          <div className={`${styles.posMarker} ${styles.posMarkerEntry}`} style={{ left: `${posOf(entry)}%` }}>
-            <span className={styles.posMarkerLbl}>ENTRY</span>
-            <span className={`num ${styles.posMarkerVal}`}>{formatPrice(entry)}</span>
-          </div>
-          <div className={`${styles.posMarker} ${styles.posMarkerTp}`}    style={{ left: `${posOf(tp)}%` }}>
-            <span className={styles.posMarkerLbl}>TP</span>
-            <span className={`num ${styles.posMarkerVal}`}>{formatPrice(tp)}</span>
-          </div>
+      <div className={styles.cpRr}>
+        <div className={styles.cpRrBar}>
+          <div className={`${styles.cpRrZone} ${styles.cpRrZoneLoss}`} style={{ left: '0%', width: `${posOf(entry)}%` }} />
+          <div className={`${styles.cpRrZone} ${styles.cpRrZoneGain}`} style={{ left: `${posOf(entry)}%`, right: '0%' }} />
+          {[
+            { name: 'sl' as const,    val: sl,    cls: styles.cpRrMarkSl },
+            { name: 'entry' as const, val: entry, cls: styles.cpRrMarkEntry },
+            { name: 'tp' as const,    val: tp,    cls: styles.cpRrMarkTp },
+          ].map((m) => (
+            <div key={m.name} className={`${styles.cpRrMark} ${m.cls}`} style={{ left: `${posOf(m.val)}%` }}>
+              <span className={styles.cpRrMarkLbl}>{m.name.toUpperCase()}</span>
+              <span className={`${styles.cpRrMarkVal} num`}>{formatPrice(m.val)}</span>
+            </div>
+          ))}
         </div>
       </div>
 
-      <div className={styles.posOutputs}>
-        <Output label="Cantidad"       value={qty.toFixed(4)}            tone="neutral" />
-        <Output label="Valor posición" value={`$${posValue.toFixed(2)}`} tone="neutral" />
-        <Output label="Riesgo"         value={`-$${riskUsd.toFixed(2)}`} tone="bear" sub="si toca SL" />
-        <Output label="Reward"         value={`+$${rewardUsd.toFixed(2)}`} tone="bull" sub="si toca TP" />
+      <div className={styles.cpOuts}>
+        <KV label="qty"          value={qty.toFixed(4)}              tone="neutral" />
+        <KV label="-riesgo"      value={`$${riskUsd.toFixed(2)}`}    tone="bear" />
+        <KV label="+reward"      value={`$${rewardUsd.toFixed(2)}`}  tone="bull" />
+        <KV label="risk:reward"  value={`1:${rr}`}                   tone="neutral" />
       </div>
 
-      <button
-        className={`btn btn--primary ${styles.posCta}`}
-        onClick={handleOpen}
-        disabled={ctaDisabled}
-      >
-        <span className="btn__caret">▸</span> Abrir esta posición
+      <button className={styles.cpCardCta} onClick={handleOpen} disabled={disabled}>
+        <span style={{ color: 'var(--bull)' }}>▸</span> abrir esta posición
       </button>
     </div>
   );
 };
 
-const Stepper: React.FC<{ label: string; value: string; onMinus: () => void; onPlus: () => void }> = ({ label, value, onMinus, onPlus }) => (
-  <div className={styles.stepper}>
-    <div className={`${styles.stepperLabel} label`}>{label}</div>
-    <div className={styles.stepperRow}>
-      <button className={styles.stepperBtn} onClick={onMinus}>−</button>
-      <span className={`${styles.stepperVal} num`}>{value}</span>
-      <button className={styles.stepperBtn} onClick={onPlus}>+</button>
-    </div>
-  </div>
-);
-
-type OutputTone = 'bull' | 'bear' | 'warn' | 'neutral';
-const Output: React.FC<{ label: string; value: React.ReactNode; tone: OutputTone; sub?: string }> = ({ label, value, tone, sub }) => {
-  const toneClass =
-    tone === 'bull'    ? styles.outBull :
-    tone === 'bear'    ? styles.outBear :
-    tone === 'warn'    ? styles.outWarn :
-                         styles.outNeutral;
-  return (
-    <div className={`${styles.out} ${toneClass}`}>
-      <div className={`${styles.outLabel} label`}>{label}</div>
-      <div className={`${styles.outVal} num`}>{value}</div>
-      {sub && <div className={`${styles.outSub} prose`}>{sub}</div>}
-    </div>
-  );
-};
-
 // ============================================================
-// HISTORY TAB — real closed positions for this pair
+// HISTORY CARD — real closed positions for this pair
 // ============================================================
 
 interface HistoryEntry {
-  ts:      string;
+  daysAgo: number;
   outcome: 'tp' | 'sl' | 'manual';
-  score:   number | null;
   pnl:     number;
 }
 
-const HistoryTab: React.FC<{ symbol: SymbolStatus }> = ({ symbol }) => {
-  const [entries, setEntries] = useState<HistoryEntry[] | null>(null);
-  const [error,   setError]   = useState<string | null>(null);
+const HistoryCard: React.FC<{ symbol: SymbolStatus }> = ({ symbol }) => {
+  const [items, setItems] = useState<HistoryEntry[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
-    setEntries(null);
+    setItems(null);
     setError(null);
-    // TODO: backend doesn't accept symbol query param on /positions yet,
-    // so we filter client-side. Replace when the endpoint supports it.
+    // TODO: when /positions accepts `?symbol=X`, drop the client-side filter.
     getPositions('closed')
       .then((resp) => {
         if (!alive) return;
+        const now = Date.now();
         const list: HistoryEntry[] = (resp.positions ?? [])
           .filter((p: Position) => p.symbol === symbol.symbol)
           .slice(0, 6)
-          .map((p: Position) => ({
-            ts:      p.exit_ts ?? p.entry_ts,
-            outcome: p.exit_reason === 'TP_HIT' ? 'tp' : p.exit_reason === 'SL_HIT' ? 'sl' : 'manual',
-            score:   null,                    // TODO: join with scan to get score at signal time
-            pnl:     p.pnl_pct ?? 0,
-          }));
-        setEntries(list);
+          .map((p: Position) => {
+            const ts = p.exit_ts ?? p.entry_ts;
+            const daysAgo = ts
+              ? Math.max(0, Math.round((now - new Date(ts).getTime()) / (1000 * 60 * 60 * 24)))
+              : 0;
+            return {
+              daysAgo,
+              outcome: p.exit_reason === 'TP_HIT' ? 'tp' : p.exit_reason === 'SL_HIT' ? 'sl' : 'manual',
+              pnl:     p.pnl_pct ?? 0,
+            };
+          });
+        setItems(list);
       })
-      .catch((err) => {
-        if (alive) setError(err instanceof Error ? err.message : 'Error cargando historial');
-      });
+      .catch((err) => { if (alive) setError(err instanceof Error ? err.message : 'Error cargando historial'); });
     return () => { alive = false; };
   }, [symbol.symbol]);
 
-  if (entries === null && !error) {
+  if (items === null && !error) {
     return (
-      <div className={styles.tab}>
-        <div className={`${styles.histEmpty} prose`}>Cargando historial…</div>
+      <div className={styles.cpCard}>
+        <div className={styles.cpCardHead}>
+          <span className={styles.cpCardIcon}>◉</span>
+          <span className={styles.cpCardTitle}>Historial reciente</span>
+        </div>
+        <div className={`${styles.cpHistEmpty} prose`}>Cargando…</div>
       </div>
     );
   }
   if (error) {
     return (
-      <div className={styles.tab}>
-        <div className={`${styles.histEmpty} prose`}>Error: {error}</div>
+      <div className={styles.cpCard}>
+        <div className={styles.cpCardHead}>
+          <span className={styles.cpCardIcon}>◉</span>
+          <span className={styles.cpCardTitle}>Historial reciente</span>
+        </div>
+        <div className={`${styles.cpHistEmpty} prose`}>Error: {error}</div>
       </div>
     );
   }
-  const list = entries ?? [];
+  const list = items ?? [];
+  if (list.length === 0) {
+    return (
+      <div className={styles.cpCard}>
+        <div className={styles.cpCardHead}>
+          <span className={styles.cpCardIcon}>◉</span>
+          <span className={styles.cpCardTitle}>Historial reciente</span>
+        </div>
+        <div className={`${styles.cpHistEmpty} prose`}>Sin operaciones previas en este par.</div>
+      </div>
+    );
+  }
   const wins = list.filter((h) => h.pnl > 0).length;
-  const wr   = list.length > 0 ? (wins / list.length) * 100 : 0;
+  const wr   = (wins / list.length) * 100;
 
   return (
-    <div className={styles.tab}>
-      <div className={styles.histHead}>
-        <span className="label">— últimas operaciones del par</span>
+    <div className={styles.cpCard}>
+      <div className={styles.cpCardHead}>
+        <span className={styles.cpCardIcon}>◉</span>
+        <span className={styles.cpCardTitle}>Historial reciente</span>
+        <span className={styles.cpCardScore}>
+          <span className="num">{wr.toFixed(0)}%</span>
+          <span className={styles.cpCardScoreSuf}>WR · {list.length}</span>
+        </span>
       </div>
-
-      <div className={styles.histStats}>
-        <Output label="Total" value={list.length} tone="neutral" />
-        <Output label="Wins"  value={wins}        tone="bull" />
-        <Output label="WR"    value={`${wr.toFixed(0)}%`} tone={wr >= 60 ? 'bull' : wr >= 40 ? 'warn' : 'bear'} />
+      <div className={styles.cpHistStrip}>
+        {list.map((h, i) => {
+          const tone: 'bull' | 'bear' | 'warn' = h.pnl > 0 ? 'bull' : h.pnl < 0 ? 'bear' : 'warn';
+          const tag  = h.outcome === 'tp' ? 'TP' : h.outcome === 'sl' ? 'SL' : 'MAN';
+          const toneCellClass =
+            tone === 'bull' ? styles.cpHistCellBull :
+            tone === 'bear' ? styles.cpHistCellBear : styles.cpHistCellWarn;
+          const tonePnlClass =
+            tone === 'bull' ? styles.cpHistCellPnlBull :
+            tone === 'bear' ? styles.cpHistCellPnlBear : styles.cpHistCellPnlWarn;
+          return (
+            <div
+              key={i}
+              className={`${styles.cpHistCell} ${toneCellClass}`}
+              title={`hace ${h.daysAgo}d · ${tag} · ${h.pnl.toFixed(2)}%`}
+            >
+              <span className={styles.cpHistCellTag}>{tag}</span>
+              <span className={`${styles.cpHistCellPnl} num ${tonePnlClass}`}>
+                {h.pnl > 0 ? '+' : ''}{h.pnl.toFixed(1)}%
+              </span>
+              <span className={`${styles.cpHistCellWhen} prose`}>{h.daysAgo}d</span>
+            </div>
+          );
+        })}
       </div>
-
-      {list.length === 0 ? (
-        <div className={`${styles.histEmpty} prose`}>Sin operaciones previas en este par.</div>
-      ) : (
-        <>
-          <ul className={styles.histList}>
-            {list.map((h, i) => {
-              const tone: 'bull' | 'bear' | 'warn' = h.pnl > 0 ? 'bull' : h.pnl < 0 ? 'bear' : 'warn';
-              const tag  = h.outcome === 'tp' ? 'TP' : h.outcome === 'sl' ? 'SL' : 'MAN';
-              const tagClass  = tone === 'bull' ? styles.histTagBull : tone === 'bear' ? styles.histTagBear : styles.histTagWarn;
-              const pnlClass  = tone === 'bull' ? styles.histPnlBull : tone === 'bear' ? styles.histPnlBear : styles.histPnlWarn;
-              return (
-                <li key={i} className={styles.histItem}>
-                  <span className={`${styles.histWhen} prose`}>{timeAgo(h.ts)}</span>
-                  <span className={`${styles.histTag} ${tagClass}`}>{tag}</span>
-                  <span className={styles.histScore}>
-                    {h.score != null ? <>score <span className="num">{h.score}/9</span></> : <span className="prose">—</span>}
-                  </span>
-                  <span className={`${styles.histPnl} ${pnlClass} num`}>
-                    {h.pnl > 0 ? '+' : ''}{h.pnl.toFixed(2)}%
-                  </span>
-                </li>
-              );
-            })}
-          </ul>
-          <div className={`${styles.histNote} prose`}>
-            "MAN" = cerrada manualmente antes de TP/SL.
-          </div>
-        </>
-      )}
     </div>
   );
 };
 
 // ============================================================
-// Header chip + tab button helpers
+// Tiny atoms
 // ============================================================
 
-type ChipTone = 'bull' | 'bear' | 'warn' | 'dim';
+const Knob: React.FC<{ label: string; value: string; onMinus: () => void; onPlus: () => void }> = ({ label, value, onMinus, onPlus }) => (
+  <div className={styles.cpKnob}>
+    <span className={styles.cpKnobLabel}>{label}</span>
+    <button className={`${styles.cpKnobBtn} ${styles.cpKnobBtnMinus}`} onClick={onMinus}>−</button>
+    <span className={`${styles.cpKnobVal} num`}>{value}</span>
+    <button className={`${styles.cpKnobBtn} ${styles.cpKnobBtnPlus}`} onClick={onPlus}>+</button>
+  </div>
+);
 
+type KvTone = 'bull' | 'bear' | 'warn' | 'neutral';
+const KV: React.FC<{ label: string; value: React.ReactNode; tone: KvTone }> = ({ label, value, tone }) => {
+  const toneClass =
+    tone === 'bull'    ? styles.cpKvBull :
+    tone === 'bear'    ? styles.cpKvBear :
+    tone === 'warn'    ? styles.cpKvWarn :
+                         styles.cpKvNeutral;
+  return (
+    <div className={`${styles.cpKv} ${toneClass}`}>
+      <span className={styles.cpKvLabel}>{label}</span>
+      <span className={`${styles.cpKvVal} num`}>{value}</span>
+    </div>
+  );
+};
+
+type ChipTone = 'bull' | 'bear' | 'warn' | 'dim';
 const Chip: React.FC<{ label: string; value: string; tone: ChipTone; long?: boolean }> = ({ label, value, tone, long }) => {
   const toneClass =
     tone === 'bull' ? styles.chipBull :
@@ -710,13 +938,5 @@ const Chip: React.FC<{ label: string; value: string; tone: ChipTone; long?: bool
     </div>
   );
 };
-
-const TabBtn: React.FC<{ active: boolean; onClick: () => void; children: React.ReactNode }> = ({ active, onClick, children }) => (
-  <button
-    className={[styles.tabBtn, active ? styles.tabBtnActive : ''].filter(Boolean).join(' ')}
-    onClick={onClick}
-    aria-current={active ? 'page' : undefined}
-  >{children}</button>
-);
 
 export default SymbolDetail;

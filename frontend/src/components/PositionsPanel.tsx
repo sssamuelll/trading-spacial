@@ -230,13 +230,16 @@ const PositionsPanel: React.FC<PositionsPanelProps> = ({
   // with the calculator's entry/SL/TP/size + direction.
   useEffect(() => {
     if (onOpenFromPreset) {
+      // Preset carries qty (base coin units). The modal's "Capital" field
+      // wants USD notional, so derive it: qty × entry.
+      const sizeUsd = onOpenFromPreset.qty * onOpenFromPreset.entry;
       setPrefill({
         symbol:    onOpenFromPreset.symbol,
         price:     onOpenFromPreset.entry,
         sl:        onOpenFromPreset.sl,
         tp:        onOpenFromPreset.tp,
         direction: onOpenFromPreset.direction,
-        sizeUsd:   onOpenFromPreset.sizeUsd,
+        sizeUsd,
       });
       setOpenModal(true);
       onPresetConsumed?.();
