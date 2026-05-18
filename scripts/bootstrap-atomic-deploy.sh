@@ -1,39 +1,33 @@
 #!/usr/bin/env bash
-# bootstrap-atomic-deploy.sh — migración one-time del layout actual del
-# server (todo en /var/www/trading/) al layout atómico con releases/<sha>
-# + shared/ + symlink current.
+# bootstrap-atomic-deploy.sh — migración al layout atómico (v2, simplificado).
 #
-# Ejecutar como usuario `ubuntu` en el server de producción.
-# Requiere sudo para tocar systemd.
+# Diseño:
 #
-# Pre-condición:
-#   /var/www/trading/                   contiene la app actual deployada
-#   /var/www/trading/.env               existe (creado durante bootstrap original)
-#   /var/www/trading/.venv/             existe (virtualenv del sistema)
+#   /var/www/trading/
+#   ├── current → releases/<sha>     (atomic symlink)
+#   ├── releases/<sha>/
+#   │   ├── btc_api.py / código       (movido del root)
+#   │   ├── .env  → ../../.env        (symlink al .env del root)
+#   │   ├── .venv → ../../.venv       (symlink al .venv del root)
+#   │   └── data  → ../../data        (symlink al data del root)
+#   ├── .env                           (NO se mueve)
+#   ├── .venv/                         (NO se mueve — shebangs siguen válidos)
+#   └── data/                          (NO se mueve — DB queda en path original)
 #
-# Post-condición:
-#   /var/www/trading/current → releases/<initial-sha>
-#   /var/www/trading/shared/.env, shared/.venv/, shared/data/
-#   /var/www/trading/releases/<initial-sha>/  con copia del estado actual
-#   systemd unit `trading-spacial` apuntando a /var/www/trading/current
+# Trade-off conocido: .venv es shared entre releases. Si requirements.txt
+# cambia entre deploys, el OLD release puede romperse hasta el cutover.
+# Aceptable para single-dev sin capital real.
 #
-# El script es idempotente: si /var/www/trading/current ya existe, sale
-# limpio sin tocar nada.
+# El único cambio al systemd unit es WorkingDirectory:
+#   WorkingDirectory=/var/www/trading → /var/www/trading/current
+# ExecStart, EnvironmentFile, ReadWritePaths quedan IGUALES.
 #
-# ── Flags ──────────────────────────────────────────────────────
-#   --dry-run    Muestra todo lo que se haría sin ejecutar nada destructivo.
-#                Calcula el diff del systemd unit pero NO lo escribe.
-#                Implica --yes (no pide confirmación interactiva).
-#   --yes        Skip la confirmación interactiva después del diff del unit.
-#                Pensado para ejecución no-interactiva (CI). Con esto el
-#                script aplica TODO sin pausas. Combinarlo con --dry-run
-#                primero para revisar el plan.
-#   --sha=<id>   ID custom para el release inicial (default: pre-atomic-<ts>).
+# Idempotente: si /var/www/trading/current ya existe, sale sin hacer nada.
 #
-# ── Ejemplos ───────────────────────────────────────────────────
-#   Interactivo (default):       ./bootstrap-atomic-deploy.sh
-#   Preview no-destructivo:      ./bootstrap-atomic-deploy.sh --dry-run
-#   Aplicar sin prompts (CI):    ./bootstrap-atomic-deploy.sh --yes
+# Flags:
+#   --dry-run   Preview sin destruir. Implica --yes.
+#   --yes       Skip prompt interactivo después del diff del unit.
+#   --sha=<id>  ID para el release inicial (default pre-atomic-<ts>).
 
 set -euo pipefail
 
@@ -65,11 +59,8 @@ if [ -z "$INITIAL_SHA" ]; then
 fi
 
 BASE=/var/www/trading
-UNIT_FILE=/etc/systemd/system/trading-spacial.service
+UNIT=/etc/systemd/system/trading-spacial.service
 
-# ── Helpers ──────────────────────────────────────────────────
-
-# `run` ejecuta el comando si no estamos en dry-run; si sí, lo imprime.
 run() {
   if [ "$DRY_RUN" = "1" ]; then
     echo "  [dry-run] would run: $*"
@@ -78,35 +69,34 @@ run() {
   fi
 }
 
-# ── 0. Sanity checks (siempre se ejecutan) ───────────────────
+# ── 0. Sanity checks ─────────────────────────────────────────
 
-echo "==> Bootstrap atómico"
+echo "==> Bootstrap atómico (v2 simplificado)"
 echo "    BASE         = $BASE"
 echo "    INITIAL_SHA  = $INITIAL_SHA"
 echo "    DRY_RUN      = $DRY_RUN"
-echo "    ASSUME_YES   = $ASSUME_YES"
 echo
 
 if [ ! -d "$BASE" ]; then
-  echo "::error::$BASE no existe — ¿bootstrap original completado?"
+  echo "::error::$BASE no existe"
   exit 1
 fi
 
 if [ -L "$BASE/current" ]; then
-  echo "==> $BASE/current ya existe. Layout atómico ya está bootstrapped."
-  echo "==> Release activo: $(readlink $BASE/current)"
+  echo "==> $BASE/current ya existe → $(readlink $BASE/current)"
+  echo "==> Layout atómico ya bootstrapped. Saliendo."
   exit 0
 fi
 
 for f in .env .venv; do
   if [ ! -e "$BASE/$f" ]; then
-    echo "::error::$BASE/$f no existe. Bootstrap original incompleto."
+    echo "::error::$BASE/$f no existe"
     exit 1
   fi
 done
 
-if [ ! -f "$UNIT_FILE" ]; then
-  echo "::error::$UNIT_FILE no existe. Bootstrap original incompleto."
+if [ ! -f "$UNIT" ]; then
+  echo "::error::$UNIT no existe"
   exit 1
 fi
 
@@ -119,50 +109,49 @@ echo "==> Step 1: Pausar trading-spacial"
 run sudo systemctl stop trading-spacial
 echo
 
-# ── 2. Crear shared/ y mover .env, .venv, data/ ──────────────
+# ── 2. Crear releases/<initial-sha>/ ─────────────────────────
 
-echo "==> Step 2: Crear $BASE/shared/ y mover .env, .venv, data/"
-run sudo mkdir -p "$BASE/shared"
-run sudo mv "$BASE/.env"  "$BASE/shared/.env"
-run sudo mv "$BASE/.venv" "$BASE/shared/.venv"
-if [ -d "$BASE/data" ]; then
-  run sudo mv "$BASE/data" "$BASE/shared/data"
-else
-  run sudo mkdir -p "$BASE/shared/data"
-fi
+echo "==> Step 2: Crear $BASE/releases/$INITIAL_SHA/"
+run sudo mkdir -p "$BASE/releases/$INITIAL_SHA"
 echo
 
-# ── 3. Crear releases/<initial-sha>/ con el resto ────────────
+# ── 3. Mover código (todo excepto .env, .venv, data, releases, current) ──
 
-echo "==> Step 3: Crear $BASE/releases/$INITIAL_SHA/ con el estado actual"
-run sudo mkdir -p "$BASE/releases/$INITIAL_SHA"
+echo "==> Step 3: Mover archivos de código a releases/$INITIAL_SHA/"
+echo "          (excluye: .env, .venv, data, releases, current)"
 
 cd "$BASE"
-# En dry-run mostramos la lista de archivos que se moverían.
+
+# bash `*` no incluye dotfiles por default. Agregamos los conocidos manualmente.
 if [ "$DRY_RUN" = "1" ]; then
-  echo "  [dry-run] would move these entries from $BASE to releases/$INITIAL_SHA/:"
-  for f in *; do
+  echo "  [dry-run] would move these entries:"
+  for f in * .[!.]*; do
+    [ -e "$f" ] || continue
     case "$f" in
-      releases|shared|current) ;;
+      .env|.venv|data|releases|current) ;;
       *) echo "    - $f" ;;
     esac
   done
 else
-  for f in *; do
+  for f in * .[!.]*; do
+    [ -e "$f" ] || continue
     case "$f" in
-      releases|shared|current) ;;
+      .env|.venv|data|releases|current) ;;
       *) sudo mv "$f" "releases/$INITIAL_SHA/" ;;
     esac
   done
 fi
 echo
 
-# ── 4. Linkear shared/* dentro del release inicial ───────────
+# ── 4. Symlinks dentro del release apuntando al root ─────────
 
-echo "==> Step 4: Linkear shared/.env, shared/.venv, shared/data en el release"
-run sudo ln -sfn ../../shared/.env  "$BASE/releases/$INITIAL_SHA/.env"
-run sudo ln -sfn ../../shared/.venv "$BASE/releases/$INITIAL_SHA/.venv"
-run sudo ln -sfn ../../shared/data  "$BASE/releases/$INITIAL_SHA/data"
+echo "==> Step 4: Crear symlinks dentro del release (apuntan a root)"
+run sudo ln -sfn ../../.env  "$BASE/releases/$INITIAL_SHA/.env"
+run sudo ln -sfn ../../.venv "$BASE/releases/$INITIAL_SHA/.venv"
+# data: solo si existe en root
+if [ -d "$BASE/data" ]; then
+  run sudo ln -sfn ../../data "$BASE/releases/$INITIAL_SHA/data"
+fi
 echo
 
 # ── 5. Symlink current → release inicial ─────────────────────
@@ -171,40 +160,36 @@ echo "==> Step 5: Crear symlink $BASE/current → releases/$INITIAL_SHA"
 run sudo ln -sfn "releases/$INITIAL_SHA" "$BASE/current"
 echo
 
-# ── 6. Actualizar systemd unit ───────────────────────────────
+# ── 6. Actualizar systemd unit (1 sola línea) ────────────────
 
-echo "==> Step 6: Reescribir paths del systemd unit"
-echo "    /var/www/trading  →  /var/www/trading/current"
+echo "==> Step 6: Actualizar systemd unit"
+echo "    WorkingDirectory=/var/www/trading → /var/www/trading/current"
+echo "    (ExecStart, EnvironmentFile, ReadWritePaths NO cambian)"
 echo
 
-# Calculamos el nuevo contenido del unit usando perl con lookahead negativo
-# para no doble-prefijar paths que ya empiezan con current/, releases/, o shared/.
-ORIGINAL_UNIT_CONTENT=$(sudo cat "$UNIT_FILE")
-NEW_UNIT_CONTENT=$(echo "$ORIGINAL_UNIT_CONTENT" | perl -pe 's#/var/www/trading(?!/(?:current|releases|shared))(\b)#/var/www/trading/current\1#g')
+ORIGINAL_UNIT=$(sudo cat "$UNIT")
+NEW_UNIT=$(echo "$ORIGINAL_UNIT" | sed 's|^WorkingDirectory=/var/www/trading$|WorkingDirectory=/var/www/trading/current|')
 
 echo "    Diff del systemd unit:"
 echo "    ──────────────────────"
-diff <(echo "$ORIGINAL_UNIT_CONTENT") <(echo "$NEW_UNIT_CONTENT") | sed 's/^/    /' || true
+diff <(echo "$ORIGINAL_UNIT") <(echo "$NEW_UNIT") | sed 's/^/    /' || true
 echo "    ──────────────────────"
 echo
 
 if [ "$DRY_RUN" = "1" ]; then
-  echo "  [dry-run] would back up $UNIT_FILE → ${UNIT_FILE}.bak.<timestamp>"
-  echo "  [dry-run] would write the diff above to $UNIT_FILE"
-  echo "  [dry-run] would run: sudo systemctl daemon-reload"
+  echo "  [dry-run] would backup unit + write new + daemon-reload"
 else
-  BAK="${UNIT_FILE}.bak.$(date +%s)"
+  BAK="${UNIT}.bak.$(date +%s)"
   echo "==> Backup del unit en $BAK"
-  sudo cp "$UNIT_FILE" "$BAK"
+  sudo cp "$UNIT" "$BAK"
 
   if [ "$ASSUME_YES" = "0" ]; then
-    echo "==> ¿OK el diff de arriba?"
-    echo "    Enter para aplicar · Ctrl+C para abortar."
+    echo "==> ¿OK el diff de arriba? Enter para aplicar · Ctrl+C para abortar."
     read -r _
   fi
 
-  echo "==> Reescribiendo $UNIT_FILE"
-  echo "$NEW_UNIT_CONTENT" | sudo tee "$UNIT_FILE" > /dev/null
+  echo "==> Reescribiendo $UNIT"
+  echo "$NEW_UNIT" | sudo tee "$UNIT" > /dev/null
 
   echo "==> systemctl daemon-reload"
   sudo systemctl daemon-reload
@@ -213,14 +198,13 @@ echo
 
 # ── 7. Restart + health check ────────────────────────────────
 
-echo "==> Step 7: Arrancar trading-spacial con el nuevo layout"
+echo "==> Step 7: Arrancar trading-spacial"
 run sudo systemctl start trading-spacial
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "  [dry-run] would wait 8s then curl http://localhost:8100/health"
   echo
-  echo "==> Dry-run completado. Para aplicar:"
-  echo "       $0 --yes"
+  echo "==> Dry-run completado. Para aplicar: $0 --yes"
   exit 0
 fi
 
@@ -232,25 +216,15 @@ if curl -fsS http://localhost:8100/health > /dev/null; then
   echo "==> ✓ Bootstrap completado."
   echo "==> Release activo: $INITIAL_SHA"
   echo "==> Layout final:"
-  echo "      current       → $(readlink $BASE/current)"
-  echo "      shared/.env   → $(ls -la $BASE/shared/.env 2>/dev/null | awk '{print $NF}')"
-  echo "      shared/.venv  → $(ls -la $BASE/shared/.venv 2>/dev/null | awk '{print $NF}')"
-  echo
-  echo "==> Próximos deploys vía CI usarán el flujo atómico de .github/workflows/deploy.yml"
+  echo "      current  → $(readlink $BASE/current)"
+  echo "      .env     → $(ls -lad $BASE/.env  2>/dev/null | awk '{print $1, $NF}')"
+  echo "      .venv    → $(ls -lad $BASE/.venv 2>/dev/null | awk '{print $1, $NF}')"
+  echo "      data     → $(ls -lad $BASE/data  2>/dev/null | awk '{print $1, $NF}')"
 else
-  echo "::error::Health check falló. El service no levantó con el nuevo layout."
+  echo "::error::Health check falló."
   echo "::error::Logs:"
   sudo journalctl -u trading-spacial -n 60 --no-pager
   echo
-  echo "::error::Para revertir manualmente:"
-  echo "  sudo systemctl stop trading-spacial"
-  echo "  sudo cp ${UNIT_FILE}.bak.* ${UNIT_FILE}"
-  echo "  sudo mv $BASE/releases/$INITIAL_SHA/* $BASE/"
-  echo "  sudo mv $BASE/shared/.env  $BASE/.env"
-  echo "  sudo mv $BASE/shared/.venv $BASE/.venv"
-  echo "  sudo mv $BASE/shared/data  $BASE/data 2>/dev/null || true"
-  echo "  sudo rm -rf $BASE/{current,releases,shared}"
-  echo "  sudo systemctl daemon-reload"
-  echo "  sudo systemctl start trading-spacial"
+  echo "::error::Para rollback automático: gh workflow run \"Bootstrap atomic deploy\" -f mode=rollback"
   exit 1
 fi

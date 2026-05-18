@@ -244,15 +244,14 @@ jobs:
             sudo journalctl -u trading-spacial -n 20 --no-pager 2>&1 | tail -20
           REMOTE_SCRIPT
 
-      - name: Rollback — revertir al layout viejo
-        # Revierte todos los cambios del bootstrap:
-        #   1. Stop trading-spacial
-        #   2. Restaura el unit del backup .bak.<ts>
-        #   3. Mueve releases/<sha>/* de vuelta al root de /var/www/trading/
-        #   4. Mueve shared/.env, .venv, data de vuelta al root
-        #   5. Elimina symlink current, dirs releases/ y shared/
-        #   6. Elimina symlink legacy .venv si existe
-        #   7. daemon-reload + start + health check
+      - name: Rollback — revertir al layout flat (v2)
+        # Con el nuevo diseño (.env, .venv, data NO se mueven), el rollback es:
+        #   1. Stop service
+        #   2. Restaurar systemd unit desde .bak
+        #   3. Mover archivos de código desde releases/<sha>/ al root
+        #      (skipeando los symlinks .env, .venv, data que apuntan a root)
+        #   4. Borrar symlink current y dir releases/
+        #   5. daemon-reload + start + health check
         if: ${{ inputs.mode == 'rollback' }}
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
@@ -284,42 +283,39 @@ jobs:
             echo "==> Step 2: Restaurar systemd unit desde el .bak más reciente"
             LATEST_BAK=$(ls -t ${UNIT}.bak.* 2>/dev/null | head -n1 || true)
             if [ -z "$LATEST_BAK" ]; then
-              echo "::warning::No hay backup del unit. Aplicando sed inverso en el unit actual."
-              sudo sed -i \
-                -e 's|/var/www/trading/current\b|/var/www/trading|g' \
-                "$UNIT"
+              echo "::warning::No hay backup del unit. Aplicando sed inverso."
+              sudo sed -i 's|^WorkingDirectory=/var/www/trading/current$|WorkingDirectory=/var/www/trading|' "$UNIT"
             else
               echo "    Backup más reciente: $LATEST_BAK"
               sudo cp "$LATEST_BAK" "$UNIT"
             fi
             sudo systemctl daemon-reload
-            echo "==> Unit restaurado. ReadWritePaths:"
-            grep -E "^(WorkingDirectory|EnvironmentFile|ExecStart|ReadWritePaths)=" "$UNIT" | sed 's/^/    /'
             echo
 
-            echo "==> Step 3: Eliminar symlink legacy .venv (si existe)"
+            # Limpiar symlink legacy /var/www/trading/.venv si vino de una versión
+            # anterior del bootstrap (v1 con shared/).
             if [ -L "$BASE/.venv" ]; then
-              sudo rm "$BASE/.venv"
-              echo "    Eliminado."
-            else
-              echo "    No existe (OK)."
+              echo "==> Step 3a: Detectado symlink legacy en .venv → $(readlink $BASE/.venv)"
+              # Solo borrar si apunta a shared/.venv (de v1); si apunta a .venv real, dejarlo
+              case "$(readlink $BASE/.venv)" in
+                */shared/.venv) sudo rm "$BASE/.venv"; echo "    Borrado (era de v1 shared)" ;;
+                *)              echo "    Mantenido (parece OK)" ;;
+              esac
             fi
-            echo
 
-            echo "==> Step 4: Borrar symlink current"
-            sudo rm "$BASE/current"
-            echo
-
-            echo "==> Step 5: Mover archivos de $RELEASE_DIR de vuelta a $BASE"
+            echo "==> Step 3: Mover archivos de release back al root"
+            echo "          (skip symlinks que apunten a ../../{.env,.venv,data})"
             cd "$RELEASE_DIR"
             for f in * .[!.]*; do
-              # Skip empty glob expansions
-              [ -e "$f" ] || continue
-              # Skip los symlinks que apuntan a shared/ (los recreamos como reales abajo)
+              [ -e "$f" ] || [ -L "$f" ] || continue
               if [ -L "$f" ]; then
                 target=$(readlink "$f")
                 case "$target" in
-                  ../../shared/*) echo "    skip symlink $f → $target (apunta a shared)"; sudo rm "$f"; continue ;;
+                  ../../.env|../../.venv|../../data|../../shared/*)
+                    echo "    skip + delete symlink $f → $target"
+                    sudo rm "$f"
+                    continue
+                    ;;
                 esac
               fi
               echo "    mv $f → $BASE/$f"
@@ -328,31 +324,27 @@ jobs:
             cd /
             echo
 
-            echo "==> Step 6: Mover shared/.env, .venv, data de vuelta al root"
-            if [ -e "$BASE/shared/.env" ]; then
-              sudo mv "$BASE/shared/.env" "$BASE/.env"
-              echo "    .env restaurado."
-            fi
-            if [ -e "$BASE/shared/.venv" ]; then
-              sudo mv "$BASE/shared/.venv" "$BASE/.venv"
-              echo "    .venv restaurado."
-            fi
-            if [ -e "$BASE/shared/data" ]; then
-              # Si data existe ya en root (de un mv anterior), no sobrescribir
-              if [ -e "$BASE/data" ]; then
-                echo "::warning::Tanto shared/data como $BASE/data existen. Dejando shared/data — investigá manualmente."
-              else
-                sudo mv "$BASE/shared/data" "$BASE/data"
-                echo "    data/ restaurado."
+            # Limpiar shared/ residual (de v1)
+            if [ -d "$BASE/shared" ]; then
+              echo "==> Step 3b: Detectado shared/ residual (v1). Limpiando..."
+              if [ ! -e "$BASE/.env" ] && [ -e "$BASE/shared/.env" ]; then
+                sudo mv "$BASE/shared/.env" "$BASE/.env"
               fi
+              if [ ! -e "$BASE/.venv" ] && [ -e "$BASE/shared/.venv" ]; then
+                sudo mv "$BASE/shared/.venv" "$BASE/.venv"
+              fi
+              if [ ! -e "$BASE/data" ] && [ -e "$BASE/shared/data" ]; then
+                sudo mv "$BASE/shared/data" "$BASE/data"
+              fi
+              sudo rm -rf "$BASE/shared"
             fi
+
+            echo "==> Step 4: Borrar symlink current y dir releases/"
+            sudo rm "$BASE/current"
+            sudo rm -rf "$BASE/releases"
             echo
 
-            echo "==> Step 7: Borrar releases/ y shared/"
-            sudo rm -rf "$BASE/releases" "$BASE/shared"
-            echo
-
-            echo "==> Step 8: Arrancar trading-spacial..."
+            echo "==> Step 5: Arrancar trading-spacial..."
             sudo systemctl start trading-spacial
             sleep 8
 
