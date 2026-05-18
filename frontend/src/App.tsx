@@ -74,6 +74,8 @@ import { type PositionInsight } from './helpers/position-insight';
 import NotificationToast from './components/NotificationToast';
 import KillSwitchView, { type AskAgentPayload as KsAskAgentPayload } from './components/KillSwitchView';
 import { type CardVerdict } from './helpers/kill-switch-copilot';
+import HistorialView from './components/HistorialView';
+import type { ClosedTrade } from './helpers/historial';
 
 // New components
 import LeftRail from './components/LeftRail';
@@ -146,8 +148,9 @@ const App: React.FC = () => {
   const [openPositionModalOpen, setOpenPositionModalOpen] = useState(false);
   const [openPositionPrefill,   setOpenPositionPrefill]   = useState<ModalPrefill | undefined>();
 
-  // Closed-positions snapshot for the 7d hero metrics (win rate, P&L 7d).
-  const [closedPositions7d, setClosedPositions7d] = useState<Position[]>([]);
+  // Full closed-positions list — drives the Historial view (any window) and
+  // the 7d-filtered metric in PositionsView (derived via useMemo below).
+  const [closedPositions, setClosedPositions] = useState<Position[]>([]);
 
   // Capital — drives the Equity hero readout. Fetched once on mount and on
   // tab navigation back to posiciones (cheap, ~1 row).
@@ -178,16 +181,7 @@ const App: React.FC = () => {
       setSignals(signalsRes.signals);
       setTuneResult(tuneRes);
       setPositions(positionsRes.positions ?? []);
-      // Filter closed positions to the last 7 days client-side. The backend
-      // doesn't accept a window param yet (TODO).
-      const sevenDaysAgoMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
-      const recentClosed = (closedRes.positions ?? []).filter((p: Position) => {
-        const tsStr = p.exit_ts ?? p.entry_ts;
-        if (!tsStr) return false;
-        const t = new Date(tsStr).getTime();
-        return Number.isFinite(t) && t >= sevenDaysAgoMs;
-      });
-      setClosedPositions7d(recentClosed);
+      setClosedPositions(closedRes.positions ?? []);
       setCapital(capitalRes ?? null);
       setDashboard(dashboardRes ?? null);
       setLastRefresh(new Date());
@@ -270,6 +264,47 @@ const App: React.FC = () => {
     errors:           status?.scanner_state?.errors        ?? 0,
     killSwitchActive: 0,
   }), [macro, status]);
+
+  // 7-day window of closed positions — drives the win-rate / P&L 7d metrics
+  // in PositionsView's hero strip. The Historial view uses the full list.
+  const closedPositions7d = useMemo(() => {
+    const sevenDaysAgoMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    return closedPositions.filter((p) => {
+      const tsStr = p.exit_ts ?? p.entry_ts;
+      if (!tsStr) return false;
+      const t = new Date(tsStr).getTime();
+      return Number.isFinite(t) && t >= sevenDaysAgoMs;
+    });
+  }, [closedPositions]);
+
+  // Map our Position → ClosedTrade shape the Historial view expects.
+  // Our backend uses exit_ts/exit_reason (README from bundle used closed_ts/
+  // close_reason — adapted here).
+  const closedTrades: ClosedTrade[] = useMemo(() => {
+    const now = Date.now();
+    const out: ClosedTrade[] = [];
+    for (const p of closedPositions) {
+      if (p.status !== 'closed' || p.exit_price == null || p.exit_ts == null) continue;
+      const exitMs = new Date(p.exit_ts).getTime();
+      const entryMs = new Date(p.entry_ts).getTime();
+      if (!Number.isFinite(exitMs) || !Number.isFinite(entryMs)) continue;
+      out.push({
+        id:        p.id,
+        symbol:    p.symbol,
+        pair:      p.symbol.replace(/USDT$/, ''),
+        side:      p.direction === 'LONG' ? 'L' : 'S',
+        entry:     p.entry_price,
+        exit:      p.exit_price,
+        qty:       p.qty ?? 0,
+        pnlAbs:    p.pnl_usd ?? 0,
+        pnlPct:    p.pnl_pct ?? 0,
+        reason:    p.exit_reason === 'TP_HIT' ? 'TP_HIT' : p.exit_reason === 'SL_HIT' ? 'SL_HIT' : 'MANUAL',
+        daysAgo:   Math.max(0, Math.floor((now - exitMs) / 86_400_000)),
+        heldHours: Math.max(0, (exitMs - entryMs) / 3_600_000),
+      });
+    }
+    return out;
+  }, [closedPositions]);
 
   // PortfolioSummary for PositionsView's hero strip. Derived from /capital
   // and the open-position pnl_pct totals.
@@ -613,6 +648,18 @@ const App: React.FC = () => {
             <div style={{ padding: 40, textAlign: 'center', color: 'var(--nbc-fg-muted)' }}>
               cargando estado del kill-switch…
             </div>
+          )}
+
+          {/* ── Historial (Análisis → Historial) ───────── */}
+          {mainTab === 'historial' && (
+            <ErrorBoundary fallbackLabel="Error en el historial">
+              <HistorialView
+                trades={closedTrades}
+                onOpenSymbol={openSymbolByPair}
+                onAskAgent={(payload) => handleKsAskAgent(payload)}
+                mobile={mobile}
+              />
+            </ErrorBoundary>
           )}
 
           <footer className={appStyles.footer}>

@@ -49,7 +49,7 @@ const LeftRail: React.FC<LeftRailProps> = ({
 
   const analysisItems: RailItemDef[] = [
     { id: 'tune', label: 'Auto-tune', icon: 'tune',  badge: hasPendingTune ? 'PEND' : undefined, onClick: onTuneOpen },
-    { id: 'history', label: 'Historial', icon: 'history' },
+    { id: 'history', label: 'Historial', icon: 'history', tab: 'historial' },
   ];
 
   return (
@@ -85,8 +85,11 @@ const LeftRail: React.FC<LeftRailProps> = ({
           <RailItem
             key={it.id}
             def={it}
-            active={false}
-            onClick={it.onClick}
+            active={it.tab === active}
+            onClick={() => {
+              if (it.tab) onSelect(it.tab);
+              else if (it.onClick) it.onClick();
+            }}
           />
         ))}
       </div>
