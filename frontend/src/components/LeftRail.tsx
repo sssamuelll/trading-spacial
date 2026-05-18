@@ -37,7 +37,7 @@ interface RailItemDef {
 }
 
 const LeftRail: React.FC<LeftRailProps> = ({
-  active, counts, onSelect, onLogout, onTuneOpen, hasPendingTune,
+  active, counts, onSelect, onLogout, hasPendingTune,
 }) => {
   const { user } = useAuth();
 
@@ -48,7 +48,7 @@ const LeftRail: React.FC<LeftRailProps> = ({
   ];
 
   const analysisItems: RailItemDef[] = [
-    { id: 'tune', label: 'Auto-tune', icon: 'tune',  badge: hasPendingTune ? 'PEND' : undefined, onClick: onTuneOpen },
+    { id: 'tune', label: 'Auto-tune', icon: 'tune', badge: hasPendingTune ? 'PEND' : undefined, tab: 'autotune' },
     { id: 'history', label: 'Historial', icon: 'history', tab: 'historial' },
   ];
 

@@ -29,6 +29,10 @@ interface AgentDockProps {
    *  <<<TOOL:confirm_release:SYM>>>. Renders an amber "▸ confirmar
    *  release de SYM" button inline under the agent message. */
   onConfirmRelease?: (symbol: string) => Promise<void> | void;
+  /** Confirm applying an auto-tune run once the agent emits
+   *  <<<TOOL:confirm_apply_tune:N>>>. Renders an amber "▸ confirmar
+   *  apply del tune #N" button inline under the agent message. */
+  onConfirmApplyTune?: (tuneId: number) => Promise<void> | void;
   unreadHint?:    boolean;
 }
 
@@ -53,7 +57,7 @@ const DOCK_SUGGESTIONS = [
 const AgentDock: React.FC<AgentDockProps> = ({
   open, onOpen, onClose,
   symbols, positions, macro,
-  initialPrompt, onOpenSymbol, onConfirmRelease, unreadHint,
+  initialPrompt, onOpenSymbol, onConfirmRelease, onConfirmApplyTune, unreadHint,
 }) => {
   const [msgs,    setMsgs]    = useState<DockMsg[]>([]);
   const [input,   setInput]   = useState('');
@@ -132,6 +136,7 @@ INSTRUCCIONES:
 - No inventes datos que no están arriba.
 - Si el usuario pregunta sobre un par específico, sugiere abrirlo terminando con <<<TOOL:open_symbol:NOMBRE>>> donde NOMBRE es el símbolo completo incluyendo USDT (ej: <<<TOOL:open_symbol:BTCUSDT>>>).
 - Si el usuario quiere liberar manualmente un par del kill-switch y justifica con UN argumento concreto (cambio de régimen macro, evento puntual identificable, par específico con causa clara, etc), termina la respuesta con <<<TOOL:confirm_release:NOMBRE>>> con el símbolo completo incluyendo USDT. Si la justificación es vaga ("siento que ya está bien", "creo que ya pasó"), pide MÁS detalles concretos SIN emitir el marker — tu trabajo es hacer que el usuario articule su tesis antes del override.
+- Si el usuario quiere aplicar un auto-tune (modificar SL/TP/BE de la estrategia en vivo) y articula argumentos concretos por símbolo (razón económica, contexto reciente del par, tesis sobre por qué el backtest es representativo del régimen actual), termina la respuesta con <<<TOOL:confirm_apply_tune:N>>> donde N es el ID numérico del tune. Si la justificación es vaga o solo cita las métricas del propio backtest sin razonar sobre el mercado, pedí más detalles SIN emitir el marker.
 - Si pregunta por todas sus posiciones, lista las que están arriba.
 - Si pide un resumen "en simple" o "para papá", usa lenguaje muy directo, sin jerga.
 - No uses negrita más de una vez por respuesta.`;
@@ -194,6 +199,7 @@ INSTRUCCIONES:
                 m={m}
                 onOpenSymbol={onOpenSymbol}
                 onConfirmRelease={onConfirmRelease}
+                onConfirmApplyTune={onConfirmApplyTune}
               />
             ))}
             {loading && <DockTyping />}
@@ -243,9 +249,10 @@ function extractTools(text: string): { tools: ToolCall[]; cleaned: string } {
 
 const DockMessage: React.FC<{
   m: DockMsg;
-  onOpenSymbol?:    (pair: string) => void;
+  onOpenSymbol?:     (pair: string) => void;
   onConfirmRelease?: (symbol: string) => Promise<void> | void;
-}> = ({ m, onOpenSymbol, onConfirmRelease }) => {
+  onConfirmApplyTune?: (tuneId: number) => Promise<void> | void;
+}> = ({ m, onOpenSymbol, onConfirmRelease, onConfirmApplyTune }) => {
   if (m.role === 'user') {
     return (
       <div className={`${styles.msg} ${styles.msgUser}`}>
@@ -281,6 +288,17 @@ const DockMessage: React.FC<{
                 className={styles.toolConfirm}
                 onClick={() => void onConfirmRelease(t.arg!)}
               >▸ confirmar release de {display}</button>
+            );
+          }
+          if (t.name === 'confirm_apply_tune' && t.arg && onConfirmApplyTune) {
+            const id = parseInt(t.arg, 10);
+            if (!Number.isFinite(id)) return null;
+            return (
+              <button
+                key={i}
+                className={styles.toolConfirm}
+                onClick={() => void onConfirmApplyTune(id)}
+              >▸ confirmar apply del tune #{id}</button>
             );
           }
           return null;

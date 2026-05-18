@@ -16,7 +16,7 @@
 //   - NotificationBell dropdown
 //   - ConfigPanel slide-out
 //   - UserMenu dropdown
-//   - ChartModal, TuneReportModal (unchanged)
+//   - SymbolDetail drawer, OpenPositionModal (unchanged)
 //
 // On mobile (<768px), the rail collapses to a BottomNav and the
 // header collapses to brand+scan+bell.
@@ -69,7 +69,8 @@ import SignalsTable from './components/SignalsTable';
 import ConfigPanel from './components/ConfigPanel';
 import PositionsView, { type PortfolioSummary } from './components/PositionsView';
 import OpenPositionModal from './components/OpenPositionModal';
-import TuneReportModal from './components/TuneReportModal';
+import AutoTuneView from './components/AutoTuneView';
+import type { TuneRun, TuneResultRow } from './helpers/auto-tune';
 import { type PositionInsight } from './helpers/position-insight';
 import NotificationToast from './components/NotificationToast';
 import KillSwitchView, { type AskAgentPayload as KsAskAgentPayload } from './components/KillSwitchView';
@@ -118,7 +119,6 @@ const App: React.FC = () => {
   // ── ui ─────────────────────────────────────────────────
   const [filter,         setFilter]         = useState<SymbolsFilter>('all');
   const [mainTab,        setMainTab]        = useState<MainTab>('mercado');
-  const [tuneModalOpen,  setTuneModalOpen]  = useState(false);
   const [selectedSymbol, setSelectedSymbol] = useState<SymbolStatus | null>(null);
   const [openOverlay,    setOpenOverlay]    = useState<OverlayKind>(null);
   const [unreadCount,    setUnreadCount]    = useState<number>(0);
@@ -264,6 +264,35 @@ const App: React.FC = () => {
     errors:           status?.scanner_state?.errors        ?? 0,
     killSwitchActive: 0,
   }), [macro, status]);
+
+  // Auto-tune view shape — our backend's TuneResult is structurally the same
+  // as the view's TuneRun, minus the client-derived `hoursAgo` and the
+  // `results` field which the view requires non-null. Map both at the
+  // boundary so the component can stay strict about its shape.
+  const autotuneRun: TuneRun | null = useMemo(() => {
+    if (!tuneResult) return null;
+    const tsMs = new Date(tuneResult.ts).getTime();
+    const hoursAgo = Number.isFinite(tsMs)
+      ? Math.round(((Date.now() - tsMs) / 3_600_000) * 10) / 10
+      : 0;
+    return {
+      id:            tuneResult.id,
+      ts:            tuneResult.ts,
+      hoursAgo,
+      status:        tuneResult.status,
+      changes_count: tuneResult.changes_count,
+      applied_ts:    tuneResult.applied_ts ?? null,
+      report_md:     tuneResult.report_md,
+      results: (tuneResult.results ?? []).map<TuneResultRow>((r) => ({
+        symbol:           r.symbol,
+        recommendation:   r.recommendation,
+        current_params:   r.current_params,
+        proposed_params:  r.proposed_params ?? null,
+        current_val_pnl:  r.current_val_pnl ?? null,
+        proposal_detail:  r.proposal_detail ?? null,
+      })),
+    };
+  }, [tuneResult]);
 
   // 7-day window of closed positions — drives the win-rate / P&L 7d metrics
   // in PositionsView's hero strip. The Historial view uses the full list.
@@ -497,8 +526,35 @@ const App: React.FC = () => {
     if (sym) setSelectedSymbol(sym);
   }, [symbols]);
 
-  const handleTuneApply  = useCallback(async () => { await applyTune();  await fetchAll(); }, [fetchAll]);
-  const handleTuneReject = useCallback(async () => { await rejectTune(); await fetchAll(); }, [fetchAll]);
+  // ── Auto-tune handlers ───────────────────────────────────────────────
+  // Reject is direct (no friction — rejecting preserves the current state).
+  const handleTuneReject = useCallback(async () => {
+    try { await rejectTune(); await fetchAll(); }
+    catch (err) { window.alert(`No se pudo rechazar el tune: ${err instanceof Error ? err.message : String(err)}`); }
+  }, [fetchAll]);
+
+  // Apply is the friction-by-design path. Opens the dock with a
+  // confrontational prompt instead of calling the backend directly —
+  // the backend call happens later, only after the agent emits
+  // <<<TOOL:confirm_apply_tune:N>>> and the user clicks the amber button.
+  const handleTuneNegotiate = useCallback((tune: TuneRun) => {
+    const changeCount = tune.results.filter((r) => r.recommendation === 'CHANGE').length;
+    setDockInitialPrompt(
+      `Estoy por aplicar el auto-tune #${tune.id} (corrido hace ${tune.hoursAgo}h). ` +
+      `Propone ${changeCount} cambios sobre los multiplicadores ATR (SL/TP/BE) de la estrategia en vivo. ` +
+      `Antes de confirmar, ayúdame a articular: ¿qué riesgos ves? ¿Hay algún símbolo donde la ` +
+      `mejora se vea frágil? Hazme preguntas concretas, no me dejes aplicar sin justificación. ` +
+      `Cuando estés convencido, emití <<<TOOL:confirm_apply_tune:${tune.id}>>>.`,
+    );
+    setDockOpen(true);
+  }, []);
+
+  // Final confirm — triggered by the inline button the dock renders when
+  // the agent emits the confirm_apply_tune marker.
+  const handleConfirmApplyTune = useCallback(async (_tuneId: number) => {
+    try { await applyTune(); await fetchAll(); }
+    catch (err) { window.alert(`No se pudo aplicar el tune: ${err instanceof Error ? err.message : String(err)}`); }
+  }, [fetchAll]);
 
   const handleLogout = async () => {
     try { await logout(); } catch (err) { console.warn('[app] logout error:', err); }
@@ -531,7 +587,7 @@ const App: React.FC = () => {
         onRefresh={handleRefresh}
         onScan={handleScan}
         onConfigOpen={() => setOpenOverlay(openOverlay === 'settings' ? null : 'settings')}
-        onTuneOpen={() => setTuneModalOpen(true)}
+        onTuneOpen={() => setMainTab('autotune')}
         onBellClick={() => setOpenOverlay(openOverlay === 'notifs' ? null : 'notifs')}
         onUserClick={() => setOpenOverlay(openOverlay === 'user' ? null : 'user')}
         notifsOpen={openOverlay === 'notifs'}
@@ -549,7 +605,6 @@ const App: React.FC = () => {
             counts={navCounts}
             onSelect={(tab) => setMainTab(tab)}
             onLogout={handleLogout}
-            onTuneOpen={() => setTuneModalOpen(true)}
             hasPendingTune={hasPendingTune}
           />
         )}
@@ -662,6 +717,20 @@ const App: React.FC = () => {
             </ErrorBoundary>
           )}
 
+          {/* ── Auto-tune (Análisis → Auto-tune) ──────── */}
+          {mainTab === 'autotune' && (
+            <ErrorBoundary fallbackLabel="Error en auto-tune">
+              <AutoTuneView
+                tune={autotuneRun}
+                onOpenSymbol={openSymbolByPair}
+                onAskAgent={(payload) => handleKsAskAgent(payload)}
+                onApplyNegotiate={handleTuneNegotiate}
+                onReject={handleTuneReject}
+                mobile={mobile}
+              />
+            </ErrorBoundary>
+          )}
+
           <footer className={appStyles.footer}>
             <span className="prose">Crypto Scanner V6 · scanner uptime —</span>
             <span className="prose">3 timeframes · 4H macro → 1H signal → 5M entry · cada {REFRESH_INTERVAL_MS / 1000}s</span>
@@ -695,15 +764,6 @@ const App: React.FC = () => {
         />
       )}
 
-      {tuneModalOpen && tuneResult && (
-        <TuneReportModal
-          tune={tuneResult}
-          onApply={handleTuneApply}
-          onReject={handleTuneReject}
-          onClose={() => setTuneModalOpen(false)}
-        />
-      )}
-
       <SymbolDetail
         symbol={selectedSymbol}
         onClose={() => setSelectedSymbol(null)}
@@ -721,6 +781,7 @@ const App: React.FC = () => {
           initialPrompt={dockInitialPrompt}
           onOpenSymbol={openSymbolByPair}
           onConfirmRelease={handleConfirmRelease}
+          onConfirmApplyTune={handleConfirmApplyTune}
         />
       )}
 
