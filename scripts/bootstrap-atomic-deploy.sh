@@ -180,7 +180,7 @@ echo
 # Calculamos el nuevo contenido del unit usando perl con lookahead negativo
 # para no doble-prefijar paths que ya empiezan con current/, releases/, o shared/.
 ORIGINAL_UNIT_CONTENT=$(sudo cat "$UNIT_FILE")
-NEW_UNIT_CONTENT=$(echo "$ORIGINAL_UNIT_CONTENT" | perl -pe 's|/var/www/trading(?!/(?:current|releases|shared))(\b)|/var/www/trading/current\1|g')
+NEW_UNIT_CONTENT=$(echo "$ORIGINAL_UNIT_CONTENT" | perl -pe 's#/var/www/trading(?!/(?:current|releases|shared))(\b)#/var/www/trading/current\1#g')
 
 echo "    Diff del systemd unit:"
 echo "    ──────────────────────"
