@@ -1,0 +1,128 @@
+/* ============================================================
+   tokens.css — design tokens for the tech-theme redesign
+   ============================================================
+   Naming convention:
+   --nbc-*  : foundation tokens (font, color, shape, border)
+   --bull / --bear / --warn / --info : semantic trading colors
+   --d-*    : density tokens (responsive to data-density attr)
+
+   Density / color-blind variants are controlled by attributes on
+   the documentElement: data-density="comfortable|compact|dense",
+   data-cb="on|off".
+   ============================================================ */
+
+:root {
+  /* ---- TYPE ---- */
+  --nbc-font-sans:  'Geist Mono', 'JetBrains Mono', ui-monospace, monospace;
+  --nbc-font-mono:  'JetBrains Mono', ui-monospace, monospace;
+  --nbc-font-prose: 'Inter Tight', system-ui, sans-serif;
+  --nbc-weight-label: 500;
+  --nbc-label-transform: uppercase;
+  --nbc-label-spacing: 0.12em;
+
+  --nbc-fs-xs:  11px;
+  --nbc-fs-sm:  13px;
+  --nbc-fs-md:  14px;
+  --nbc-fs-lg:  17px;
+  --nbc-fs-xl:  22px;
+  --nbc-fs-2xl: 32px;
+  --nbc-fs-3xl: 48px;
+
+  /* ---- COLOR (tech base) ----
+   * Three tiers, all in the cyan-blue family to match the bull/info palette.
+   * Each tier hits WCAG AA contrast (≥4.5:1) against --nbc-bg (#0a0d0b):
+   *   fg        (primary text)          #dcecf7  → contrast ≈ 15:1
+   *   fg-muted  (secondary / metadata)  #8093a0  → contrast ≈ 7.5:1
+   *   fg-dim    (tertiary / accents)    #58707a  → contrast ≈ 4.8:1
+   * The previous --nbc-fg-dim (#3d5347) was a green-tinted leftover from the
+   * pre-palette-swap days and fell below AA — most rail labels, separators,
+   * and section headers were illegible.
+   */
+  --nbc-fg:           #dcecf7;
+  --nbc-fg-muted:     #8093a0;
+  --nbc-fg-dim:       #58707a;
+  --nbc-bg:           #0a0d0b;
+  --nbc-surface:      #10141282;
+  --nbc-surface-solid:#0e1310;
+  --nbc-surface-alt:  #161c19;
+  --nbc-surface-elev: #1a201d;
+
+  /* cyan — primary "everything OK / long" (color-blind safe) */
+  --nbc-primary:     #6ad7ff;
+  --nbc-primary-dim: #6ad7ff55;
+  --nbc-primary-fg:  #06121a;
+
+  /* magenta — secondary (alerts, accents) */
+  --nbc-secondary:    #ff4ecd;
+  --nbc-secondary-fg: #06100a;
+
+  /* danger — amber (color-blind safe replacement for pink) */
+  --nbc-danger:     #ffb84e;
+  --nbc-danger-dim: #ffb84e44;
+  --nbc-danger-fg:  #ffffff;
+
+  /* warn — amber */
+  --nbc-warn:     #ffb84e;
+  --nbc-warn-dim: #ffb84e44;
+
+  /* info — soft cyan */
+  --nbc-info: #6ad7ff;
+
+  --nbc-border-color:  #6ad7ff;
+  --nbc-border-dim:    #6ad7ff33;
+  --nbc-border-dimmer: #6ad7ff19;
+  --nbc-focus:         #6ad7ff;
+
+  /* ---- SHAPE ---- */
+  --nbc-border-width: 1px;
+  --nbc-border-style: solid;
+  --nbc-radius:       0;
+  --nbc-button-radius:0;
+  --nbc-input-radius: 0;
+
+  /* ---- EFFECTS ---- */
+  --nbc-shadow:    0 0 0 1px var(--nbc-border-dim);
+  --nbc-shadow-lg: 0 0 0 1px var(--nbc-primary), 4px 4px 0 #6ad7ff33;
+  --nbc-button-shadow-hover: 0 0 0 1px var(--nbc-secondary), 2px 2px 0 #ff4ecd55;
+  --nbc-hairline: 1px solid var(--nbc-border-dim);
+
+  --nbc-grid-overlay:
+    linear-gradient(to right, #6ad7ff0a 1px, transparent 1px) 0 0 / 24px 24px,
+    linear-gradient(to bottom, #6ad7ff0a 1px, transparent 1px) 0 0 / 24px 24px;
+
+  /* ---- SEMANTIC: trading ---- */
+  --bull:     #6ad7ff;
+  --bull-dim: #6ad7ff26;
+  --bear:     #ffb84e;
+  --bear-dim: #ffb84e26;
+  --warn:     #ffb84e;
+  --warn-dim: #ffb84e26;
+  --info:     #6ad7ff;
+  --info-dim: #6ad7ff26;
+
+  /* ---- DENSITY: comfortable (default) ---- */
+  --d-pad-card:  16px;
+  --d-pad-row:   12px;
+  --d-gap-grid:  12px;
+  --d-row-height:44px;
+  --d-card-min:  240px;
+}
+
+:root[data-density="compact"] {
+  --d-pad-card:  12px;
+  --d-pad-row:   8px;
+  --d-gap-grid:  10px;
+  --d-row-height:38px;
+  --d-card-min:  220px;
+}
+
+:root[data-density="dense"] {
+  --d-pad-card:  10px;
+  --d-pad-row:   6px;
+  --d-gap-grid:  8px;
+  --d-row-height:32px;
+  --d-card-min:  200px;
+}
+
+/* Note: the cyan + amber palette is now the default (see :root above).
+   The data-cb="on" override block was removed when this became permanent. */

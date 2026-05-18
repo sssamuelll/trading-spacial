@@ -1,0 +1,241 @@
+/* ============================================================
+   NotificationBell.module.css — dropdown styles
+   ============================================================ */
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(4, 8, 6, 0.55);
+  z-index: 99;
+  animation: bdFade 120ms ease-out;
+}
+@keyframes bdFade { from { opacity: 0; } }
+
+.dd {
+  position: fixed;
+  z-index: 100;
+  top: 56px;
+  right: 18px;
+  width: 440px;
+  max-width: calc(100vw - 28px);
+  max-height: 620px;
+  background: linear-gradient(180deg, rgba(16, 22, 18, 0.96), rgba(12, 16, 14, 0.96));
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
+  border: 1px solid var(--nbc-border-dim);
+  box-shadow:
+    0 0 0 1px rgba(106, 215, 255, 0.10),
+    0 20px 40px -8px rgba(0, 0, 0, 0.6);
+  animation: ddIn 140ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  transform-origin: top right;
+  display: flex;
+  flex-direction: column;
+}
+@keyframes ddIn {
+  from { opacity: 0; transform: translateY(-6px) scale(0.985); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.hd {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--nbc-border-dimmer);
+}
+.hdTitle { display: flex; align-items: baseline; gap: 8px; }
+.hdName  {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--nbc-fg);
+}
+.hdCount {
+  font-family: var(--nbc-font-mono);
+  font-size: 10px;
+  padding: 1px 6px;
+  background: var(--bull);
+  color: var(--nbc-primary-fg);
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.hdActions { display: flex; align-items: center; gap: 4px; }
+.hdBtn {
+  font-family: inherit;
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  color: var(--nbc-fg-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  padding: 4px 8px;
+  cursor: pointer;
+  transition: color 80ms ease, border-color 80ms ease;
+}
+.hdBtn:hover { color: var(--nbc-fg); border-color: var(--nbc-border-dimmer); }
+.hdClose {
+  width: 24px;
+  height: 24px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--nbc-fg-muted);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  transition: all 80ms ease;
+}
+.hdClose:hover { color: var(--bear); border-color: var(--bear); }
+
+.filter {
+  display: flex;
+  gap: 4px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--nbc-border-dimmer);
+}
+.chip {
+  font-family: inherit;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+  padding: 4px 10px;
+  background: transparent;
+  border: 1px solid var(--nbc-border-dimmer);
+  color: var(--nbc-fg-muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: all 80ms ease;
+}
+.chip:hover { color: var(--nbc-fg); border-color: var(--nbc-border-dim); }
+.chipActive {
+  color: var(--bull);
+  border-color: var(--bull);
+  background: rgba(106, 215, 255, 0.06);
+}
+.chip :global(.num) { font-size: 9.5px; opacity: 0.7; }
+
+.list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.empty {
+  padding: 40px 20px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--nbc-fg-muted);
+  font-size: 12px;
+  align-items: center;
+}
+.emptyMark { font-size: 28px; color: var(--nbc-fg-dim); }
+
+.item {
+  position: relative;
+  display: grid;
+  grid-template-columns: 2px 28px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--nbc-border-dimmer);
+  transition: background 80ms ease;
+}
+.item:last-child { border-bottom: none; }
+.item:hover { background: rgba(255, 255, 255, 0.025); }
+
+.itemBar { width: 2px; align-self: stretch; background: transparent; }
+.itemUnread .itemBar         { background: var(--bull); }
+.itemUnread.item--warn .itemBar { background: var(--warn); }
+.itemUnread.item--bear .itemBar { background: var(--bear); }
+.itemUnread.item--info .itemBar { background: var(--info); }
+
+.itemGlyph {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--nbc-border-dimmer);
+  font-size: 13px;
+  color: var(--nbc-fg-muted);
+  background: var(--nbc-surface-alt);
+}
+.itemGlyph--bull { color: var(--bull); border-color: var(--bull); background: rgba(106,215,255,0.06); }
+.itemGlyph--warn { color: var(--warn); border-color: var(--warn); background: rgba(255,184,78,0.06); }
+.itemGlyph--bear { color: var(--bear); border-color: var(--bear); background: rgba(255,184,78,0.06); }
+.itemGlyph--info { color: var(--info); border-color: var(--info); background: rgba(106,215,255,0.06); }
+
+.itemBody { min-width: 0; }
+.itemTitle {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 12.5px;
+  line-height: 1.3;
+  color: var(--nbc-fg);
+}
+.itemPair { font-family: var(--nbc-font-mono); font-weight: 500; }
+.itemMeta { color: var(--nbc-fg-muted); font-size: 11px; }
+.itemSep  { color: var(--nbc-fg-dim); }
+.itemSide {
+  font-family: var(--nbc-font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 5px;
+  border: 1px solid;
+}
+.itemSideBull { color: var(--bull); border-color: var(--bull); }
+.itemSideBear { color: var(--bear); border-color: var(--bear); }
+.itemSub {
+  font-size: 11.5px;
+  color: var(--nbc-fg-muted);
+  margin-top: 3px;
+}
+
+.itemRight {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+.itemTime { font-size: 10.5px; color: var(--nbc-fg-dim); }
+.itemAck {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  border: 1px solid var(--nbc-border-dimmer);
+  color: var(--nbc-fg-muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 80ms ease;
+}
+.itemAck:hover { color: var(--bull); border-color: var(--bull); }
+
+.ft {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--nbc-border-dimmer);
+  background: rgba(0, 0, 0, 0.18);
+}
+.ftHint { font-size: 10.5px; color: var(--nbc-fg-dim); }
+
+/* Mobile: full-width sheet */
+@media (max-width: 640px) {
+  .dd {
+    top: auto;
+    bottom: 56px; /* sits above BottomNav */
+    left: 8px;
+    right: 8px;
+    width: auto;
+    max-height: 75vh;
+  }
+}

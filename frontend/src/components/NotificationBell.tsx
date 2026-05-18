@@ -1,15 +1,18 @@
 // ============================================================
-// NotificationBell.tsx — bell icon + badge + dropdown (#162 PR C)
+// NotificationBell.tsx — dropdown rendered from the header.
 //
-// Polls /notifications every 30s. Badge shows count of unread.
-// Click opens a dropdown listing the N most recent unread events.
-// Each row has a "mark read" button; header has "mark all read".
+// Design departure from v1: the bell ICON is now part of Header.tsx
+// (so it can sit cleanly in the action row), and this file owns the
+// dropdown body itself plus the polling/state. The dropdown anchors
+// to the top-right of the viewport and dismisses on backdrop click.
 //
-// Event realtime push is tracked in issue #62 (WebSocket/SSE). Until
-// that lands, polling is the mechanism.
+// The component now accepts `open` + `onClose` from its parent so
+// the bell <-> gear <-> user-menu state can be coordinated (only one
+// open at a time).
 // ============================================================
 
-import React, { useEffect, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
+import styles from './NotificationBell.module.css';
 import {
   getNotifications,
   markNotificationRead,
@@ -19,40 +22,57 @@ import type { Notification } from '../types';
 
 const POLL_INTERVAL_MS = 30_000;
 
-function eventIcon(ev: Notification): string {
-  if (ev.event_type === 'position_exit') return '📕';
+// ─── helpers ─────────────────────────────────────────────────
+
+type Tone = 'bull' | 'warn' | 'bear' | 'info' | 'dim';
+
+function toneOf(ev: Notification): Tone {
+  if (ev.priority === 'critical') return 'bear';
+  if (ev.priority === 'warning')  return 'warn';
+  if (ev.event_type === 'signal') return 'bull';
+  if (ev.event_type === 'position_exit') return 'info';
+  return 'dim';
+}
+
+function glyphOf(ev: Notification): string {
+  if (ev.event_type === 'signal')        return '◉';
+  if (ev.event_type === 'position_exit') return '◆';
   if (ev.event_type === 'health') {
     try {
-      const payload = JSON.parse(ev.payload_json);
-      if (payload.to_state === 'PAUSED') return '🛑';
-      if (payload.to_state === 'REDUCED') return '⚠️';
-      if (payload.to_state === 'ALERT') return '⚠️';
-    } catch {
-      /* fall through */
-    }
-    return 'ℹ️';
+      const p = JSON.parse(ev.payload_json);
+      if (p.to_state === 'PAUSED')   return '⏸';
+      if (p.to_state === 'REDUCED')  return '◐';
+      if (p.to_state === 'ALERT')    return '⚠';
+    } catch { /* fall through */ }
+    return '·';
   }
-  if (ev.event_type === 'infra') {
-    if (ev.priority === 'critical') return '🚨';
-    if (ev.priority === 'warning') return '⚠️';
-    return 'ℹ️';
-  }
-  if (ev.event_type === 'signal') return '📈';
-  return 'ℹ️';
+  if (ev.event_type === 'infra')  return '⚠';
+  if (ev.event_type === 'system') return '⚙';
+  return '·';
+}
+
+interface ParsedSignal {
+  symbol?:    string;
+  score?:     number;
+  direction?: 'LONG' | 'SHORT' | string;
+}
+function parseSignal(ev: Notification): ParsedSignal | null {
+  if (ev.event_type !== 'signal') return null;
+  try { return JSON.parse(ev.payload_json) as ParsedSignal; } catch { return null; }
 }
 
 function summary(ev: Notification): string {
   try {
     const p = JSON.parse(ev.payload_json);
     if (ev.event_type === 'signal') {
-      return `${p.symbol ?? '?'} · score ${p.score ?? '?'} (${p.direction ?? ''})`;
+      return `score ${p.score ?? '?'} · LRC ${p.lrc_pct?.toFixed?.(1) ?? '?'}%`;
     }
     if (ev.event_type === 'health') {
-      return `${p.symbol ?? '?'} ${p.from_state ?? ''} → ${p.to_state ?? ''} (${p.reason ?? ''})`;
+      return `${p.from_state ?? ''} → ${p.to_state ?? ''} · ${p.reason ?? ''}`;
     }
     if (ev.event_type === 'position_exit') {
       const pnl = typeof p.pnl_usd === 'number' ? p.pnl_usd.toFixed(2) : '?';
-      return `${p.symbol ?? '?'} ${p.exit_reason ?? ''} · P&L ${pnl}`;
+      return `${p.exit_reason ?? ''} · P&L $${pnl}`;
     }
     if (ev.event_type === 'infra') {
       return `${p.component ?? '?'}: ${p.message ?? ''}`;
@@ -60,9 +80,16 @@ function summary(ev: Notification): string {
     if (ev.event_type === 'system') {
       return `${p.kind ?? '?'}: ${p.message ?? ''}`;
     }
-  } catch {
-    /* fall through */
-  }
+  } catch { /* fall through */ }
+  return ev.event_key;
+}
+
+function titleOf(ev: Notification): string {
+  if (ev.event_type === 'signal')        return 'Señal detectada';
+  if (ev.event_type === 'health')        return 'Kill-switch';
+  if (ev.event_type === 'position_exit') return 'Posición cerrada';
+  if (ev.event_type === 'infra')         return 'Infraestructura';
+  if (ev.event_type === 'system')        return 'Sistema';
   return ev.event_key;
 }
 
@@ -72,48 +99,52 @@ function formatTime(iso: string): string {
   return d.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
 }
 
-const NotificationBell: React.FC = () => {
-  const [items, setItems] = useState<Notification[]>([]);
-  const [open, setOpen] = useState(false);
+// ─── component ───────────────────────────────────────────────
+
+type FilterTab = 'all' | 'signals' | 'system';
+
+interface NotificationBellProps {
+  open:    boolean;
+  onClose: () => void;
+  /** Called whenever the unread count changes — parent uses it to
+   *  drive the bell-icon badge in the header. */
+  onUnreadChange?: (count: number) => void;
+}
+
+const NotificationBell: React.FC<NotificationBellProps> = ({ open, onClose, onUnreadChange }) => {
+  const [items, setItems]     = useState<Notification[]>([]);
   const [loading, setLoading] = useState(false);
-  const dropdownRef = useRef<HTMLDivElement>(null);
+  const [filter, setFilter]   = useState<FilterTab>('all');
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
       const resp = await getNotifications({ unread: true, limit: 50 });
-      setItems(resp.notifications ?? []);
+      const next = resp.notifications ?? [];
+      setItems(next);
+      onUnreadChange?.(next.length);
     } catch (err) {
-      // Silent: the bell should never crash the header.
+      // Silent: bell should never crash the header.
       console.warn('NotificationBell refresh failed', err);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [onUnreadChange]);
 
-  // Initial + periodic polling
   useEffect(() => {
     refresh();
     const id = setInterval(refresh, POLL_INTERVAL_MS);
     return () => clearInterval(id);
   }, [refresh]);
 
-  // Close dropdown when clicking outside
-  useEffect(() => {
-    if (!open) return;
-    const onClick = (e: MouseEvent) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', onClick);
-    return () => document.removeEventListener('mousedown', onClick);
-  }, [open]);
-
   const handleRead = async (id: number) => {
     try {
       await markNotificationRead(id);
-      setItems((prev) => prev.filter((n) => n.id !== id));
+      setItems((prev) => {
+        const next = prev.filter((n) => n.id !== id);
+        onUnreadChange?.(next.length);
+        return next;
+      });
     } catch (err) {
       console.warn('markNotificationRead failed', err);
     }
@@ -123,84 +154,130 @@ const NotificationBell: React.FC = () => {
     try {
       await markAllNotificationsRead();
       setItems([]);
+      onUnreadChange?.(0);
     } catch (err) {
       console.warn('markAllNotificationsRead failed', err);
     }
   };
 
+  if (!open) return null;
+
+  const filtered = items.filter((n) => {
+    if (filter === 'all')     return true;
+    if (filter === 'signals') return n.event_type === 'signal';
+    if (filter === 'system')  return n.event_type !== 'signal';
+    return true;
+  });
+
+  const sigCount = items.filter((n) => n.event_type === 'signal').length;
+  const sysCount = items.filter((n) => n.event_type !== 'signal').length;
   const unreadCount = items.length;
-  const hasUnread = unreadCount > 0;
 
   return (
-    <div className="notification-bell" ref={dropdownRef}>
-      <button
-        className="btn btn-icon notification-bell-btn"
-        onClick={() => setOpen((v) => !v)}
-        title={hasUnread ? `${unreadCount} notificaciones sin leer` : 'Sin notificaciones nuevas'}
-        aria-label="Notificaciones"
-      >
-        🔔
-        {hasUnread && (
-          <span className="notification-bell-badge" aria-hidden="true">
-            {unreadCount > 99 ? '99+' : unreadCount}
-          </span>
-        )}
-      </button>
+    <>
+      <div className={styles.backdrop} onClick={onClose} aria-hidden="true" />
+      <div className={styles.dd} role="dialog" aria-label="Notificaciones">
 
-      {open && (
-        <div className="notification-dropdown" role="menu">
-          <div className="notification-dropdown-header">
-            <span>Notificaciones {hasUnread ? `(${unreadCount})` : ''}</span>
-            {hasUnread && (
-              <button
-                className="notification-dropdown-clear"
-                onClick={handleReadAll}
-                title="Marcar todas como leídas"
-              >
+        <header className={styles.hd}>
+          <div className={styles.hdTitle}>
+            <span className={styles.hdName}>Notificaciones</span>
+            {unreadCount > 0 && <span className={styles.hdCount}>{unreadCount}</span>}
+          </div>
+          <div className={styles.hdActions}>
+            {unreadCount > 0 && (
+              <button className={styles.hdBtn} onClick={handleReadAll}>
                 Marcar todas leídas
               </button>
             )}
+            <button className={styles.hdClose} onClick={onClose} aria-label="Cerrar">×</button>
           </div>
+        </header>
 
-          {loading && items.length === 0 && (
-            <div className="notification-dropdown-empty">Cargando…</div>
-          )}
-
-          {!loading && items.length === 0 && (
-            <div className="notification-dropdown-empty">Sin notificaciones nuevas.</div>
-          )}
-
-          {items.length > 0 && (
-            <ul className="notification-list">
-              {items.map((ev) => (
-                <li
-                  key={ev.id}
-                  className={`notification-item notification-item--${ev.priority}`}
-                >
-                  <span className="notification-icon">{eventIcon(ev)}</span>
-                  <div className="notification-body">
-                    <div className="notification-summary">{summary(ev)}</div>
-                    <div className="notification-meta">
-                      <span className="notification-type">{ev.event_type}</span>
-                      <span className="notification-time">{formatTime(ev.sent_at)}</span>
-                    </div>
-                  </div>
-                  <button
-                    className="notification-read-btn"
-                    onClick={() => handleRead(ev.id)}
-                    title="Marcar como leída"
-                    aria-label="Marcar como leída"
-                  >
-                    ✓
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
+        <div className={styles.filter}>
+          <FilterChip active={filter === 'all'}     count={unreadCount} onClick={() => setFilter('all')}    >Todas</FilterChip>
+          <FilterChip active={filter === 'signals'} count={sigCount}    onClick={() => setFilter('signals')}>Señales</FilterChip>
+          <FilterChip active={filter === 'system'}  count={sysCount}    onClick={() => setFilter('system')} >Sistema</FilterChip>
         </div>
-      )}
-    </div>
+
+        <div className={styles.list}>
+          {loading && filtered.length === 0 && (
+            <div className={styles.empty}>Cargando…</div>
+          )}
+          {!loading && filtered.length === 0 && (
+            <div className={styles.empty}>
+              <div className={styles.emptyMark}>∅</div>
+              <div>Sin novedades aquí.</div>
+            </div>
+          )}
+          {filtered.map((ev) => {
+            const tone = toneOf(ev);
+            const sig  = parseSignal(ev);
+            return (
+              <article
+                key={ev.id}
+                className={[styles.item, styles[`item--${tone}`], styles.itemUnread].filter(Boolean).join(' ')}
+              >
+                <div className={styles.itemBar} />
+                <div className={`${styles.itemGlyph} ${styles[`itemGlyph--${tone}`]}`}>
+                  {glyphOf(ev)}
+                </div>
+                <div className={styles.itemBody}>
+                  <div className={styles.itemTitle}>
+                    {sig ? (
+                      <>
+                        <span className={styles.itemPair}>{sig.symbol}</span>
+                        <span className={styles.itemSep}>·</span>
+                        <span className={styles.itemMeta}>score <span className="num">{sig.score ?? '?'}</span></span>
+                        <span className={styles.itemSep}>·</span>
+                        <span className={`${styles.itemSide} ${sig.direction === 'SHORT' ? styles.itemSideBear : styles.itemSideBull}`}>
+                          {sig.direction === 'SHORT' ? '▼ SHORT' : '▲ LONG'}
+                        </span>
+                      </>
+                    ) : (
+                      <span>{titleOf(ev)}</span>
+                    )}
+                  </div>
+                  <div className={`${styles.itemSub} prose`}>{summary(ev)}</div>
+                </div>
+                <div className={styles.itemRight}>
+                  <span className={`${styles.itemTime} num`}>{formatTime(ev.sent_at)}</span>
+                  <button
+                    className={styles.itemAck}
+                    onClick={() => handleRead(ev.id)}
+                    title="Marcar leída"
+                    aria-label="Marcar como leída"
+                  >✓</button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+
+        <footer className={styles.ft}>
+          <span className={`${styles.ftHint} prose`}>
+            Las señales se generan cada 5 min · Telegram cuando pasan los filtros
+          </span>
+        </footer>
+      </div>
+    </>
   );
 };
+
+// ─── filter chip ───
+
+interface FilterChipProps {
+  active:   boolean;
+  count:    number;
+  children: React.ReactNode;
+  onClick:  () => void;
+}
+const FilterChip: React.FC<FilterChipProps> = ({ active, count, children, onClick }) => (
+  <button
+    className={[styles.chip, active ? styles.chipActive : ''].filter(Boolean).join(' ')}
+    onClick={onClick}
+  >
+    {children} <span className="num">{count}</span>
+  </button>
+);
 
 export default NotificationBell;

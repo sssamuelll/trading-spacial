@@ -25,6 +25,7 @@ except ImportError:
 import requests as req_lib  # tests patch btc_api.req_lib.post (test_api.py); also used directly at line 187
 from fastapi import Depends, FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # Auth (added 2026-04-29) — JWT cookie auth + CSRF + role gating.
 from api.auth import router as auth_router
@@ -290,6 +291,179 @@ def root():
     }
 
 
+# Module-level cache for the live ticker endpoint. TTL kept short so the
+# dashboard feels live, but long enough to dedupe bursts (multiple tabs,
+# remounts) into a single upstream call.
+_ticker_cache: dict = {"ts": 0.0, "data": {}}
+_TICKER_CACHE_TTL_SEC = 2.5
+
+
+@app.get("/ticker", summary="Precios spot en vivo + cambio 24h (cacheado ~2.5s)")
+def get_ticker():
+    """Return live spot price + 24h % change for the curated watchlist.
+
+    Hits Binance batch /api/v3/ticker/24hr in a single request. Same batch
+    shape as /ticker/price but the response also carries priceChangePercent
+    so the dashboard can show "BTC ▲ +0.43%" alongside the price. Cached
+    server-side ~2.5s.
+    """
+    import json as _json   # noqa: PLC0415
+    import time as _time   # noqa: PLC0415
+    now = _time.monotonic()
+    cached_payload = _ticker_cache["data"]
+    if now - _ticker_cache["ts"] < _TICKER_CACHE_TTL_SEC and cached_payload:
+        return {"prices":  cached_payload.get("prices", {}),
+                "changes": cached_payload.get("changes", {}),
+                "cached":  True}
+
+    symbols = _scanner_state.get("symbols_active") or get_active_symbols()
+    try:
+        # Binance rejects whitespace inside the symbols array. Compact JSON
+        # (no spaces) is required: `["BTC","ETH"]` not `["BTC", "ETH"]`.
+        r = req_lib.get(
+            "https://api.binance.com/api/v3/ticker/24hr",
+            params={"symbols": _json.dumps(symbols, separators=(",", ":"))},
+            timeout=5,
+        )
+        r.raise_for_status()
+        prices  = {item["symbol"]: float(item["lastPrice"])           for item in r.json()}
+        changes = {item["symbol"]: float(item["priceChangePercent"])  for item in r.json()}
+        _ticker_cache.update(ts=now, data={"prices": prices, "changes": changes})
+        return {"prices": prices, "changes": changes, "cached": False}
+    except Exception as e:
+        log.warning("ticker endpoint failed: %s", e)
+        # Serve last-known cache on failure (better stale than nothing).
+        return {"prices":  cached_payload.get("prices", {}),
+                "changes": cached_payload.get("changes", {}),
+                "error":   str(e)}
+
+
+# Module-level cache for the macro endpoint. Regime is refreshed daily,
+# F&G daily, funding 8h — slow-moving. TTL keeps fan-out cheap.
+_macro_cache: dict = {"ts": 0.0, "data": None}
+_MACRO_CACHE_TTL_SEC = 30.0
+
+
+@app.get("/macro", summary="Indicadores macro (régimen + F&G + funding + BTC 24h)")
+def get_macro():
+    """Return the macro 'weather' panel for the dashboard StatusBar.
+
+    Composes the daily regime cache (regime / score / F&G / funding) with a
+    fresh-ish BTC 24h % change from Binance. Cached server-side ~30s — the
+    underlying signals don't change faster than that.
+    """
+    import time as _time  # noqa: PLC0415
+    now = _time.monotonic()
+    if now - _macro_cache["ts"] < _MACRO_CACHE_TTL_SEC and _macro_cache["data"]:
+        return _macro_cache["data"]
+
+    try:
+        from strategy.regime import get_cached_regime  # noqa: PLC0415
+        cached = get_cached_regime() or {}
+    except Exception as e:
+        log.warning("macro: regime cache lookup failed: %s", e)
+        cached = {}
+
+    details = cached.get("details") or {}
+    sentiment = details.get("sentiment") or {}
+    funding = details.get("funding") or {}
+
+    btc_24h_pct = None
+    btc_price = None
+    try:
+        r = req_lib.get(
+            "https://api.binance.com/api/v3/ticker/24hr",
+            params={"symbol": "BTCUSDT"},
+            timeout=5,
+        )
+        r.raise_for_status()
+        d = r.json()
+        btc_24h_pct = float(d.get("priceChangePercent", 0))
+        btc_price = float(d.get("lastPrice", 0))
+    except Exception as e:
+        log.warning("macro: BTC 24h fetch failed: %s", e)
+
+    out = {
+        "regime":             cached.get("regime"),
+        "regime_score":       cached.get("score"),
+        "fear_greed_index":   sentiment.get("fear_greed_index"),
+        "fear_greed_label":   sentiment.get("classification"),
+        "funding_rate_pct":   funding.get("rate_pct"),
+        "btc_24h_pct":        btc_24h_pct,
+        "btc_price":          btc_price,
+        "ts":                 cached.get("ts"),
+    }
+    _macro_cache.update(ts=now, data=out)
+    return out
+
+
+# ── Agent chat proxy ────────────────────────────────────────────────
+# Used by the SymbolDetail copilot drawer. Thin pass-through to Anthropic
+# Messages API. No conversation history is stored — the frontend owns the
+# transcript and resends it on every turn.
+
+class _AgentMessage(BaseModel):
+    role:    str
+    content: str
+
+class _AgentRequest(BaseModel):
+    system:   str
+    messages: list[_AgentMessage]
+
+
+@app.post("/agent/chat", summary="Copilot proxy (Anthropic Messages)")
+def agent_chat(body: _AgentRequest):
+    """Proxy a single chat turn to Anthropic. Returns the assistant text only.
+
+    Requires ANTHROPIC_API_KEY in the environment. The frontend should hide
+    its input row when the feature flag is off — but in case it slips, we
+    return a 503 with a clear reason so the UI can render a graceful note.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        from fastapi import HTTPException  # noqa: PLC0415
+        raise HTTPException(
+            status_code=503,
+            detail="ANTHROPIC_API_KEY not configured. Set it in .env and restart the API.",
+        )
+
+    payload = {
+        "model":      "claude-haiku-4-5",
+        "max_tokens": 1024,
+        "system":     body.system,
+        "messages":   [{"role": m.role, "content": m.content} for m in body.messages],
+    }
+    try:
+        r = req_lib.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+        # Anthropic returns content as a list of blocks; we only care about
+        # the first text block — tool-use blocks aren't relevant here.
+        text = ""
+        for block in data.get("content", []):
+            if block.get("type") == "text":
+                text = block.get("text", "")
+                break
+        return {"text": text}
+    except req_lib.HTTPError as e:
+        log.warning("agent_chat upstream error: %s — body=%s", e, getattr(e.response, "text", ""))
+        from fastapi import HTTPException  # noqa: PLC0415
+        raise HTTPException(status_code=502, detail=f"Anthropic upstream error: {e}")
+    except Exception as e:
+        log.warning("agent_chat unexpected error: %s", e)
+        from fastapi import HTTPException  # noqa: PLC0415
+        raise HTTPException(status_code=500, detail=f"Agent error: {e}")
+
+
 @app.get("/symbols", summary="Estado actual de cada par monitoreado")
 def list_symbols():
     """Retorna el último escaneo de cada símbolo, ordenado por señal y score."""
@@ -317,6 +491,7 @@ def list_symbols():
             "lrc_pct":    row["lrc_pct"]       if row else None,
             "score":      row["score"]         if row else None,
             "señal":      bool(row["señal"])   if row else False,
+            "setup":      bool(row["setup"])   if row else False,
             "gatillo":    bool(row["gatillo"]) if row else False,
             "ts":         row["ts"]            if row else None,
         })

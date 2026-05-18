@@ -1,0 +1,186 @@
+.hdr {
+  position: relative;
+  background: var(--nbc-surface-solid);
+  border-bottom: 1px solid var(--nbc-border-dim);
+  flex-shrink: 0;
+}
+.hdrMobile {
+  border-bottom: 1px solid var(--nbc-border-dim);
+}
+
+.main {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 18px;
+  height: 52px;
+}
+.hdrMobile .main {
+  height: 48px;
+  padding: 0 12px;
+  gap: 8px;
+}
+
+/* divider — vertical hairline between header sections */
+.divider {
+  width: 1px;
+  align-self: stretch;
+  background: var(--nbc-border-dimmer);
+  margin: 10px 0;
+}
+
+/* Brand */
+.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.mark {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  color: var(--bull);
+  flex-shrink: 0;
+}
+.brandText { display: flex; flex-direction: column; line-height: 1.1; }
+.brandTitle {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--nbc-fg);
+  font-family: var(--nbc-font-mono);
+}
+.brandSlash { color: var(--nbc-secondary); margin: 0 1px; }
+.brandSub {
+  font-size: 9.5px;
+  color: var(--nbc-fg-muted);
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  margin-top: 1px;
+  white-space: nowrap;
+}
+
+/* LIVE block */
+.live {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--nbc-font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.liveMini {
+  gap: 5px;
+  padding: 4px 8px;
+  border: 1px solid var(--nbc-border-dim);
+}
+.liveLabel {
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  color: var(--bull);
+  text-transform: uppercase;
+}
+.liveTime { color: var(--nbc-fg); font-variant-numeric: tabular-nums; }
+.liveSep  { color: var(--nbc-fg-dim); }
+.liveNext {
+  color: var(--nbc-fg-muted);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.liveNext :global(.num) { color: var(--nbc-fg); margin-left: 3px; }
+
+/* Telemetry */
+.telemetry { display: flex; align-items: center; gap: 14px; }
+.tele { display: flex; flex-direction: column; line-height: 1.05; gap: 2px; }
+.teleLabel {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--nbc-fg-muted);
+}
+.teleValue {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--nbc-fg);
+}
+.tele--bull .teleValue { color: var(--bull); }
+.tele--bear .teleValue { color: var(--bear); }
+.tele--warn .teleValue { color: var(--warn); }
+.tele--dim  .teleValue { color: var(--nbc-fg-muted); }
+
+/* Actions */
+.actions { display: flex; align-items: center; gap: 6px; }
+
+.user {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 4px 8px;
+  margin-left: 4px;
+  border: 1px solid var(--nbc-border-dimmer);
+  background: var(--nbc-surface-alt);
+  cursor: pointer;
+  transition: border-color 80ms ease;
+  font-family: inherit;
+}
+.user:hover { border-color: var(--nbc-border-dim); }
+.userActive {
+  border-color: var(--bull) !important;
+  background: rgba(106, 215, 255, 0.06) !important;
+}
+.userDot {
+  width: 8px;
+  height: 8px;
+  background: var(--bull);
+  flex-shrink: 0;
+}
+.userText { display: flex; flex-direction: column; line-height: 1.05; gap: 1px; text-align: left; }
+.userEmail {
+  font-size: 11px;
+  color: var(--nbc-fg);
+  font-family: var(--nbc-font-mono);
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.userRole {
+  font-size: 9px;
+  color: var(--nbc-fg-muted);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.userChev {
+  color: var(--nbc-fg-dim);
+  font-size: 10px;
+  margin-left: 2px;
+  transition: transform 100ms ease;
+}
+.userActive .userChev { transform: rotate(180deg); color: var(--bull); }
+
+/* Notification badge — shown over bell icon */
+.badge {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  background: var(--bear);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 4px;
+  border-radius: 2px;
+  line-height: 1;
+}
+
+/* tune badge dot */
+.tuneBadge { position: relative; }
+.tuneDot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 6px;
+  height: 6px;
+  background: var(--nbc-secondary);
+  border-radius: 50%;
+  box-shadow: 0 0 4px var(--nbc-secondary);
+  animation: blink 1.6s ease-in-out infinite;
+}

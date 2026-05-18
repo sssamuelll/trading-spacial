@@ -114,6 +114,50 @@ export async function getSymbols(): Promise<SymbolsResponse> {
   return request<SymbolsResponse>('/symbols');
 }
 
+// GET /ticker — live spot prices + 24h % change (server-cached ~2.5s)
+export interface TickerResponse {
+  prices:  Record<string, number>;
+  changes: Record<string, number>;   // 24h percent change per symbol
+  cached?: boolean;
+  error?:  string;
+}
+export async function getTicker(): Promise<TickerResponse> {
+  return request<TickerResponse>('/ticker');
+}
+
+// POST /agent/chat — copilot proxy to Anthropic (Claude Haiku)
+export interface AgentMessage {
+  role:    'user' | 'assistant';
+  content: string;
+}
+export interface AgentChatResponse {
+  text: string;
+}
+export async function chatAgent(payload: {
+  system:   string;
+  messages: AgentMessage[];
+}): Promise<AgentChatResponse> {
+  return request<AgentChatResponse>('/agent/chat', {
+    method: 'POST',
+    body:   JSON.stringify(payload),
+  });
+}
+
+// GET /macro — macro "weather" (regime + F&G + funding + BTC 24h)
+export interface MacroResponse {
+  regime:           'BULL' | 'BEAR' | 'NEUTRAL' | null;
+  regime_score:     number | null;
+  fear_greed_index: number | null;
+  fear_greed_label: string | null;
+  funding_rate_pct: number | null;
+  btc_24h_pct:      number | null;
+  btc_price:        number | null;
+  ts:               string | null;
+}
+export async function getMacro(): Promise<MacroResponse> {
+  return request<MacroResponse>('/macro');
+}
+
 // GET /status
 export async function getStatus(): Promise<StatusResponse> {
   return request<StatusResponse>('/status');
@@ -304,6 +348,23 @@ export async function getKillSwitchCurrentState(
 
 export async function getHealthDashboard(): Promise<DashboardResponse> {
   return request<DashboardResponse>('/health/dashboard');
+}
+
+// POST /health/reactivate/{symbol} — manually release a PAUSED symbol back
+// to PROBATION. The `reason` field is logged by the backend for audit. The
+// KillSwitchView's negotiated-override flow funnels its conversation
+// summary here as the reason string.
+export async function releaseKillSwitch(
+  symbol: string,
+  reason: string = 'manual_override',
+): Promise<{ ok: boolean; symbol: string; state: string }> {
+  return request<{ ok: boolean; symbol: string; state: string }>(
+    `/health/reactivate/${encodeURIComponent(symbol)}`,
+    {
+      method: 'POST',
+      body:   JSON.stringify({ reason }),
+    },
+  );
 }
 
 // ---- Multi-tenant resources (Epic B #253, B.5 follow-up B) ----

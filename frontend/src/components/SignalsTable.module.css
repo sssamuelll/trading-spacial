@@ -1,0 +1,156 @@
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+.sectionHd {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 0;
+}
+.sectionLbl {
+  font-size: 11px;
+  color: var(--bull);
+  letter-spacing: 0.16em;
+}
+.sectionCount {
+  font-family: var(--nbc-font-mono);
+  font-size: 11px;
+  color: var(--nbc-fg-muted);
+  background: var(--nbc-surface-alt);
+  border: 1px solid var(--nbc-border-dimmer);
+  padding: 0 6px;
+}
+
+.loading,
+.empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--nbc-fg-muted);
+  font-size: 12px;
+  border: 1px solid var(--nbc-border-dimmer);
+  background: var(--nbc-surface-solid);
+}
+
+.tableWrap {
+  border: 1px solid var(--nbc-border-dim);
+  background: var(--nbc-surface-solid);
+}
+
+.head,
+.row {
+  display: grid;
+  grid-template-columns: 40px 70px 110px 50px 130px 80px 100px 1fr 60px 110px;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  font-size: 12px;
+}
+/* When there's no action column, the last column should not be reserved. */
+.head:not(:has(> :nth-child(10))),
+.row:not(:has(> :nth-child(10))) {
+  grid-template-columns: 40px 70px 110px 50px 130px 80px 100px 1fr 60px;
+}
+
+.head {
+  font-size: 9.5px;
+  color: var(--nbc-fg-muted);
+  background: #0c100e;
+  border-bottom: 1px solid var(--nbc-border-dim);
+}
+
+.row {
+  border-bottom: 1px solid var(--nbc-border-dimmer);
+  transition: background 80ms ease;
+}
+.row:hover { background: var(--nbc-surface-alt); }
+.row:last-child { border-bottom: none; }
+.rowFresh {
+  background: linear-gradient(90deg, #6ad7ff14, transparent 60%);
+  position: relative;
+}
+.rowFresh::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 2px;
+  background: var(--bull);
+}
+
+.idx     { color: var(--nbc-fg-dim); font-size: 11px; }
+.time    { font-size: 11.5px; color: var(--nbc-fg-muted); }
+.pair    { font-weight: 500; color: var(--nbc-fg); }
+.priceCell { color: var(--nbc-fg); }
+.dollar  { color: var(--nbc-fg-dim); font-size: 0.85em; }
+
+.lrc--bull { color: var(--bull); }
+.lrc--bear { color: var(--bear); }
+.lrc--warn { color: var(--warn); }
+
+.scoreNum {
+  font-family: var(--nbc-font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 16px;
+}
+.scoreNum--bull { color: var(--bull); }
+.scoreNum--warn { color: var(--warn); }
+.scoreNum--dim  { color: var(--nbc-fg-dim); }
+.scoreMax { font-size: 0.55em; color: var(--nbc-fg-dim); }
+
+.state {
+  font-size: 11.5px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.dot--bull { background: var(--bull); }
+.dot--warn { background: var(--warn); }
+.dot--bear { background: var(--bear); }
+.dot--dim  { background: var(--nbc-fg-dim); }
+
+.trig    { text-align: center; }
+.trigYes { color: var(--bull); font-weight: 600; }
+.trigNo  { color: var(--nbc-fg-dim); }
+
+.action  { text-align: right; }
+
+/* ─── Mobile cards ─── */
+
+.cards { display: flex; flex-direction: column; gap: 6px; }
+.card {
+  border: 1px solid var(--nbc-border-dim);
+  background: var(--nbc-surface-solid);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  position: relative;
+}
+.cardFresh::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 2px;
+  background: var(--bull);
+}
+.cardRow1 { display: flex; align-items: center; gap: 8px; }
+.cardPair  { font-weight: 600; font-size: 14px; }
+.cardPrice { font-size: 13px; color: var(--nbc-fg); margin-left: auto; }
+.cardTime  { font-size: 11px; color: var(--nbc-fg-dim); }
+.cardRow2  { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cardLrc   { font-family: var(--nbc-font-mono); font-size: 11px; }
+.cardLrc--bull { color: var(--bull); }
+.cardLrc--bear { color: var(--bear); }
+.cardLrc--warn { color: var(--warn); }
+.cardTrig {
+  font-family: var(--nbc-font-mono);
+  font-size: 10px;
+  letter-spacing: 0.10em;
+  padding: 2px 6px;
+  border: 1px solid;
+}
+.cardTrigOn  { color: var(--bull); border-color: var(--bull); }
+.cardTrigOff { color: var(--nbc-fg-dim); border-color: var(--nbc-border-dimmer); }

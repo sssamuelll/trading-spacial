@@ -24,6 +24,7 @@ data/regime_cache.json
 signals.db
 signals.db-journal
 signals.db-wal
+signals.db-shm
 backups/
 data/symbols_status.json
 data/signals_history.csv

@@ -1,0 +1,99 @@
+.focus {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  border: 1px solid var(--nbc-border-dim);
+  background:
+    linear-gradient(180deg, #14191680, #0e131080),
+    var(--nbc-surface-solid);
+  position: relative;
+}
+.focus::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: linear-gradient(180deg, var(--bull), var(--nbc-secondary));
+}
+
+.header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+.label {
+  color: var(--bull);
+  font-size: 10.5px;
+  letter-spacing: 0.16em;
+}
+.count {
+  color: var(--nbc-fg-muted);
+  font-size: 11.5px;
+}
+
+.items {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 10px;
+}
+
+.item {
+  display: grid;
+  grid-template-columns: 28px 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--nbc-surface-solid);
+  border: 1px solid var(--nbc-border-dim);
+  border-left: 2px solid;
+  transition: border-color 100ms ease;
+}
+.item--bull { border-left-color: var(--bull); }
+.item--bear { border-left-color: var(--bear); }
+.item--warn { border-left-color: var(--warn); }
+
+.glyph {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  font-size: 14px;
+  border: 1px solid;
+}
+.glyph--bull { color: var(--bull); border-color: var(--bull); }
+.glyph--bear { color: var(--bear); border-color: var(--bear); }
+.glyph--warn { color: var(--warn); border-color: var(--warn); }
+
+.title {
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--nbc-fg);
+}
+.sub {
+  font-size: 12px;
+  color: var(--nbc-fg-muted);
+  margin-top: 2px;
+}
+
+/* empty state */
+.empty {
+  flex-direction: row;
+  align-items: center;
+  gap: 16px;
+  padding: 18px 20px;
+}
+.emptyMark { font-size: 28px; color: var(--nbc-fg-dim); }
+.emptyTitle { font-size: 13px; color: var(--nbc-fg); }
+.emptyBody  { margin-top: 2px; }
+
+/* Mobile: stack action below body */
+@media (max-width: 640px) {
+  .items { grid-template-columns: 1fr; gap: 8px; }
+  .item  { grid-template-columns: 24px 1fr; }
+  .action { grid-column: 1 / -1; }
+  .action :global(.btn) { width: 100%; }
+}

@@ -1,0 +1,65 @@
+.row {
+  display: grid;
+  grid-template-columns: 90px 110px 70px 60px 110px 100px 90px 80px;
+  align-items: center;
+  gap: 12px;
+  padding: var(--d-pad-row) 14px;
+  border-bottom: 1px solid var(--nbc-border-dimmer);
+  font-size: 12px;
+  min-height: var(--d-row-height);
+  transition: background 80ms ease;
+}
+.clickable { cursor: pointer; }
+.row:hover { background: var(--nbc-surface-alt); }
+
+.pair  { min-width: 0; }
+.base  { font-weight: 600; color: var(--nbc-fg); }
+.quote { font-size: 0.7em; color: var(--nbc-fg-dim); }
+
+.price {
+  font-family: var(--nbc-font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--nbc-fg);
+}
+.dollar { color: var(--nbc-fg-dim); font-size: 0.85em; }
+
+.change {
+  font-family: var(--nbc-font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.changeBull { color: var(--bull); }
+.changeBear { color: var(--bear); }
+
+.lrc {
+  font-family: var(--nbc-font-mono);
+  font-variant-numeric: tabular-nums;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.lrc--bull { color: var(--bull); }
+.lrc--bear { color: var(--bear); }
+.lrc--warn { color: var(--warn); }
+
+.score   { /* layout container */ }
+.trigger { /* layout container */ }
+
+/* Mobile: collapse to two-row stack */
+@media (max-width: 640px) {
+  .row {
+    grid-template-columns: 1fr auto auto;
+    grid-template-areas:
+      "pair price change"
+      "lrc score trigger";
+    gap: 6px 12px;
+    row-gap: 8px;
+  }
+  .pair    { grid-area: pair; }
+  .price   { grid-area: price; }
+  .change  { grid-area: change; }
+  .lrc     { grid-area: lrc; }
+  .score   { grid-area: score; }
+  .trigger { grid-area: trigger; }
+  .row > svg, .row > button { display: none; }
+}

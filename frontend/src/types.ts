@@ -23,9 +23,15 @@ export interface SymbolStatus {
   price: number | null;
   /** Display price (5m close). Refreshes every scan. Prefer this for rendering; fall back to `price`. */
   live_price?: number | null;
+  /** Rolling buffer of recent prices for the sparkline. Populated client-side by `useLiveTicker` from successive ticker polls — empty on mount, grows over time. */
+  recent_closes?: number[];
+  /** 24h percent change. Populated client-side from /ticker (Binance 24hr endpoint). */
+  change_24h?: number | null;
   lrc_pct: number | null;
   score: number | null;
   señal: boolean;
+  /** 1H setup detected (LRC in zone + indicator conditions). Independent of gatillo. */
+  setup?: boolean;
   gatillo: boolean;
   ts: string | null;
   sizing_1h?: Sizing1h;
@@ -45,12 +51,36 @@ export interface ScannerState {
   scans_total: number;
   signals_total: number;
   errors: number;
-  symbols_active: number;
+  /** List of curated symbol IDs (e.g. ["BTCUSDT", "ETHUSDT", ...]). */
+  symbols_active: string[];
+  /** ISO timestamp when the scanner thread entered its loop. Used for uptime display. */
+  started_at: string | null;
 }
 
 export interface StatusResponse {
   scanner_state: ScannerState;
   ultimo_escaneo: string | null;
+}
+
+/** Aggregated context the AgentBrief + AgentDock consume. Composed
+ *  client-side from ScannerState + MacroResponse + a few derived fields
+ *  the backend doesn't ship yet (kill-switch count is hardcoded to 0
+ *  until /health/symbols aggregation lands — see App.tsx). */
+export interface MacroState {
+  /** Composite regime label from the daily regime detector. */
+  regime:           'BULL' | 'BEAR' | 'NEUTRAL' | null;
+  /** Fear & Greed index 0–100. */
+  fng:              number | null;
+  /** BTC perp funding rate as a decimal fraction (not percent). 0.0001 = 0.01%. */
+  funding:          number | null;
+  /** Lifetime scans (we don't yet split by day — used as a proxy). */
+  scansToday:       number;
+  /** Lifetime signals generated. */
+  signalsToday:     number;
+  /** Errors in the last cycle. */
+  errors:           number;
+  /** Number of symbols currently paused by the kill switch. */
+  killSwitchActive: number;
 }
 
 export interface Signal {

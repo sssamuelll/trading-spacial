@@ -1,8 +1,12 @@
 // ============================================================
-// ConfigPanel.tsx — Drawer lateral para filtros de señales
+// ConfigPanel.tsx — slide-out from the right with backdrop blur.
+// Sections: General, Filtros de notificación, Auto-tune.
+// Preserves existing wiring to /config (get + post) and the
+// auto_approve_tune contract.
 // ============================================================
 
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
+import styles from './ConfigPanel.module.css';
 import type { SignalFilters, AppConfig } from '../types';
 import { getConfig, updateConfigFull } from '../api';
 
@@ -18,18 +22,18 @@ const DEFAULT_FILTERS: SignalFilters = {
 };
 
 const ConfigPanel: React.FC<ConfigPanelProps> = ({ open, onClose }) => {
-  const [config, setConfig] = useState<AppConfig | null>(null);
+  const [config, setConfig]   = useState<AppConfig | null>(null);
   const [filters, setFilters] = useState<SignalFilters>(DEFAULT_FILTERS);
   const [autoApprove, setAutoApprove] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [saving, setSaving]   = useState(false);
+  const [dirty, setDirty]     = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [saved, setSaved] = useState(false);
 
-  // Cargar config cuando se abre el panel
+  // Load config when opened.
   useEffect(() => {
     if (!open) return;
     setLoadError(null);
-    setSaved(false);
+    setDirty(false);
     getConfig()
       .then((cfg) => {
         setConfig(cfg);
@@ -41,19 +45,31 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ open, onClose }) => {
       });
   }, [open]);
 
+  if (!open) return null;
+
+  const updateFilter = <K extends keyof SignalFilters>(k: K, v: SignalFilters[K]) => {
+    setFilters((prev) => ({ ...prev, [k]: v }));
+    setDirty(true);
+  };
+  const updateAutoApprove = (v: boolean) => {
+    setAutoApprove(v);
+    setDirty(true);
+  };
+
   const handleSave = async () => {
+    if (!config) return;
     setSaving(true);
-    setSaved(false);
     try {
       const res = await updateConfigFull({
-        signal_filters: filters,
+        signal_filters:    filters,
         auto_approve_tune: autoApprove,
       });
       setConfig(res.config);
       setFilters({ ...DEFAULT_FILTERS, ...res.config.signal_filters });
       setAutoApprove(res.config.auto_approve_tune ?? true);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2500);
+      setDirty(false);
+      // brief delay so the user sees the "saved" pulse, then close
+      setTimeout(onClose, 300);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : 'Error al guardar');
     } finally {
@@ -61,207 +77,223 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ open, onClose }) => {
     }
   };
 
-  const scoreLabels: Record<number, string> = {
-    0: 'Sin filtro',
-    1: '≥ 1 — Mínimo',
-    2: '≥ 2 — Bajo',
-    3: '≥ 3 — Moderado',
-    4: '≥ 4 — Bueno',
-    5: '≥ 5 — Medio',
-    6: '≥ 6 — Alto',
-    7: '≥ 7 — Muy alto',
-    8: '≥ 8 — Excelente',
-    9: '≥ 9 — Casi perfecto',
-    10: '= 10 — Solo perfecto',
-  };
+  const scoreLabel =
+    filters.min_score >= 8 ? 'Excelente' :
+    filters.min_score >= 6 ? 'Alto'      :
+    filters.min_score >= 4 ? 'Bueno'     :
+    filters.min_score >= 1 ? 'Permisivo' :
+    'Sin filtro';
 
   return (
     <>
-      {/* Overlay */}
-      <div
-        className={`config-overlay ${open ? 'config-overlay--visible' : ''}`}
-        onClick={onClose}
-        aria-hidden="true"
-      />
+      <div className={styles.backdrop} onClick={onClose} aria-hidden="true" />
+      <aside className={styles.slideout} role="dialog" aria-modal="true" aria-label="Ajustes">
 
-      {/* Drawer */}
-      <aside className={`config-panel ${open ? 'config-panel--open' : ''}`} role="dialog" aria-modal="true">
-        <div className="config-panel-header">
-          <span className="config-panel-title">⚙ Filtros de señales Telegram</span>
-          <button className="config-close-btn" onClick={onClose} aria-label="Cerrar">✕</button>
-        </div>
+        <header className={styles.hd}>
+          <div className={styles.hdTitle}>
+            <span className={styles.hdMark}>⚙</span>
+            <span>Ajustes del escáner</span>
+          </div>
+          <button className={styles.hdClose} onClick={onClose} aria-label="Cerrar">×</button>
+        </header>
 
         {loadError && (
-          <div className="config-error">{loadError}</div>
+          <div className={styles.error}>{loadError}</div>
         )}
 
         {!config && !loadError && (
-          <div className="config-loading">Cargando configuración…</div>
+          <div className={styles.loading}>Cargando configuración…</div>
         )}
 
         {config && (
-          <div className="config-body">
-            {/* Info readonly */}
-            <div className="config-info-row">
-              <span className="config-info-label">Webhook</span>
-              <span className="config-info-value config-info-value--mono">
-                {config.webhook_url || '(no configurado)'}
-              </span>
-            </div>
-            <div className="config-info-row">
-              <span className="config-info-label">Intervalo de escaneo</span>
-              <span className="config-info-value">{config.scan_interval_sec}s</span>
-            </div>
-            <div className="config-info-row">
-              <span className="config-info-label">Símbolos activos</span>
-              <span className="config-info-value">{config.num_symbols}</span>
-            </div>
+          <div className={styles.scroll}>
 
-            <div className="config-divider" />
+            {/* GENERAL */}
+            <section className={styles.sec}>
+              <header className={styles.secHd}>
+                <span className={styles.secLabel}>general</span>
+                <span className={`${styles.secHint} prose`}>parámetros del escaneo</span>
+              </header>
 
-            <p className="config-section-title">Filtros de notificación</p>
-            <p className="config-hint">
-              Solo se envían a Telegram las señales que pasen todos los filtros activos.
-            </p>
-
-            {/* Score mínimo */}
-            <div className="config-field">
-              <label className="config-label">
-                Score mínimo para notificar
-                <span className="config-badge">{scoreLabels[filters.min_score]}</span>
-              </label>
-              <div className="config-slider-row">
-                <span className="config-slider-min">0</span>
-                <input
-                  type="range"
-                  className="config-slider"
-                  min={0}
-                  max={10}
-                  step={1}
-                  value={filters.min_score}
-                  onChange={(e) =>
-                    setFilters((f) => ({ ...f, min_score: Number(e.target.value) }))
-                  }
-                />
-                <span className="config-slider-max">10</span>
+              <div className={styles.row}>
+                <div className={styles.rowLeft}>
+                  <div className={styles.rowLabel}>Webhook</div>
+                  <div className={`${styles.rowHint} prose`}>URL para recibir señales fuera de Telegram.</div>
+                </div>
+                <div className={styles.rowRight}>
+                  {config.webhook_url ? (
+                    <span className={`${styles.pill} ${styles.pillBull}`}>conectado</span>
+                  ) : (
+                    <button className={styles.dashed}>＋ Configurar</button>
+                  )}
+                </div>
               </div>
-              <div className="config-slider-ticks">
-                {[0, 2, 4, 6, 8, 10].map((v) => (
-                  <span
-                    key={v}
-                    className={`config-tick ${filters.min_score === v ? 'config-tick--active' : ''}`}
-                    onClick={() => setFilters((f) => ({ ...f, min_score: v }))}
-                  >
-                    {v}
-                  </span>
-                ))}
-              </div>
-            </div>
 
-            {/* Macro 4H requerida */}
-            <div className="config-field config-field--toggle">
-              <div className="config-toggle-info">
-                <span className="config-label">Exigir macro 4H alcista</span>
-                <span className="config-hint">
-                  Solo notifica si el precio está por encima de la SMA100 en 4H.
+              <div className={styles.row}>
+                <div className={styles.rowLeft}>
+                  <div className={styles.rowLabel}>Intervalo de escaneo</div>
+                  <div className={`${styles.rowHint} prose`}>Cada cuánto re-evalúa los pares.</div>
+                </div>
+                <div className={styles.rowRight}>
+                  <div className={styles.read}>
+                    <span className="num">{config.scan_interval_sec}</span>
+                    <span className={styles.readUnit}>s</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className={styles.row}>
+                <div className={styles.rowLeft}>
+                  <div className={styles.rowLabel}>Símbolos activos</div>
+                  <div className={`${styles.rowHint} prose`}>Pares en la watch-list.</div>
+                </div>
+                <div className={styles.rowRight}>
+                  <div className={styles.read}><span className="num">{config.num_symbols}</span></div>
+                </div>
+              </div>
+            </section>
+
+            {/* FILTROS */}
+            <section className={styles.sec}>
+              <header className={styles.secHd}>
+                <span className={styles.secLabel}>filtros de notificación</span>
+                <span className={`${styles.secHint} prose`}>
+                  solo se envían a Telegram las señales que pasen todos los filtros
                 </span>
-              </div>
-              <button
-                className={`config-toggle ${filters.require_macro_ok ? 'config-toggle--on' : ''}`}
-                onClick={() =>
-                  setFilters((f) => ({ ...f, require_macro_ok: !f.require_macro_ok }))
-                }
-                aria-pressed={filters.require_macro_ok}
-              >
-                <span className="config-toggle-thumb" />
-              </button>
-            </div>
+              </header>
 
-            {/* Notificar setups */}
-            <div className="config-field config-field--toggle">
-              <div className="config-toggle-info">
-                <span className="config-label">Notificar setups válidos</span>
-                <span className="config-hint">
-                  Enviar señales de SETUP VÁLIDO aunque no haya gatillo 5M.
-                </span>
-              </div>
-              <button
-                className={`config-toggle ${filters.notify_setup ? 'config-toggle--on' : ''}`}
-                onClick={() =>
-                  setFilters((f) => ({ ...f, notify_setup: !f.notify_setup }))
-                }
-                aria-pressed={filters.notify_setup}
-              >
-                <span className="config-toggle-thumb" />
-              </button>
-            </div>
+              <ScoreSlider
+                value={filters.min_score}
+                onChange={(v) => updateFilter('min_score', v)}
+                label={scoreLabel}
+              />
 
-            <div className="config-divider" />
+              <Toggle
+                label="Exigir macro 4H alcista"
+                hint="Solo notifica si el precio está por encima de la SMA100 en 4H."
+                value={filters.require_macro_ok}
+                onChange={(v) => updateFilter('require_macro_ok', v)}
+              />
+              <Toggle
+                label="Notificar setups válidos"
+                hint="Enviar señales de SETUP VÁLIDO aunque no haya gatillo 5M."
+                value={filters.notify_setup}
+                onChange={(v) => updateFilter('notify_setup', v)}
+              />
+            </section>
 
-            <p className="config-section-title">Auto-Tune</p>
+            {/* AUTO-TUNE */}
+            <section className={styles.sec}>
+              <header className={styles.secHd}>
+                <span className={styles.secLabel}>auto-tune</span>
+                <span className={`${styles.secHint} prose`}>recalibración mensual de parámetros</span>
+              </header>
 
-            <div className="config-field config-field--toggle">
-              <div className="config-toggle-info">
-                <span className="config-label">Aprobacion automatica</span>
-                <span className="config-hint">
-                  {autoApprove
-                    ? 'Los parametros se aplican automaticamente cada mes.'
-                    : 'Recibiras una notificacion para revisar y aprobar cambios.'}
-                </span>
-              </div>
-              <button
-                className={`config-toggle ${autoApprove ? 'config-toggle--on' : ''}`}
-                onClick={() => setAutoApprove((v) => !v)}
-                aria-pressed={autoApprove}
-              >
-                <span className="config-toggle-thumb" />
-              </button>
-            </div>
+              <Toggle
+                label="Aprobación automática"
+                hint={autoApprove
+                  ? 'Los parámetros recomendados se aplican automáticamente cada mes.'
+                  : 'Recibirás una notificación para revisar y aprobar los cambios.'}
+                value={autoApprove}
+                onChange={updateAutoApprove}
+              />
+            </section>
 
-            <div className="config-divider" />
-
-            {/* Preview */}
-            <div className="config-preview">
-              <span className="config-preview-label">Se notificará si:</span>
-              <ul className="config-preview-list">
-                <li>Señal activa (gatillo 5M confirmado)</li>
-                {filters.min_score > 0 && (
-                  <li>Score ≥ {filters.min_score}/10</li>
-                )}
-                {filters.require_macro_ok && (
-                  <li>Macro 4H alcista (precio &gt; SMA100)</li>
-                )}
-                {filters.notify_setup && (
-                  <li className="config-preview-extra">
-                    + Setups válidos sin gatillo (también se notifican)
-                  </li>
-                )}
-              </ul>
-            </div>
           </div>
         )}
 
-        <div className="config-footer">
-          <button className="btn btn-secondary" onClick={onClose}>
-            Cancelar
-          </button>
-          <button
-            className={`btn btn-primary ${saved ? 'btn--saved' : ''}`}
-            onClick={handleSave}
-            disabled={saving || !config}
-          >
-            {saving ? (
-              <><span className="btn-spinner" /> Guardando…</>
-            ) : saved ? (
-              '✓ Guardado'
+        <footer className={styles.ft}>
+          <div className={styles.ftStatus}>
+            {dirty ? (
+              <><span className={`${styles.dot} ${styles.dotDirty}`} /> Cambios sin guardar</>
             ) : (
-              'Guardar filtros'
+              <><span className={`${styles.dot} ${styles.dotOk}`} /> Sin cambios pendientes</>
             )}
-          </button>
-        </div>
+          </div>
+          <div className={styles.ftActions}>
+            <button className="btn btn--ghost btn--sm" onClick={onClose}>Cancelar</button>
+            <button
+              className={`btn btn--primary btn--sm ${!dirty || saving ? 'btn--disabled' : ''}`}
+              onClick={handleSave}
+              disabled={!dirty || saving || !config}
+            >
+              <span className="btn__caret">▸</span> {saving ? 'guardando…' : 'guardar'}
+            </button>
+          </div>
+        </footer>
       </aside>
     </>
   );
 };
+
+// ─── ScoreSlider ───
+
+interface ScoreSliderProps {
+  value:    number;
+  onChange: (v: number) => void;
+  label:    string;
+}
+const ScoreSlider: React.FC<ScoreSliderProps> = ({ value, onChange, label }) => {
+  const ticks = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+  const tone  = value >= 6 ? 'bull' : value >= 3 ? 'warn' : 'dim';
+  return (
+    <div className={styles.slider}>
+      <div className={styles.sliderHd}>
+        <div className={styles.sliderLbl}>Score mínimo para notificar</div>
+        <div className={`${styles.sliderBadge} ${styles[`sliderBadge--${tone}`]}`}>
+          ≥ <span className="num">{value}</span> · {label}
+        </div>
+      </div>
+      <div className={styles.sliderBar}>
+        <div className={styles.sliderTrack}>
+          <div className={styles.sliderZone} style={{ left: '60%', right: '0%' }} />
+        </div>
+        {ticks.map((n) => (
+          <button
+            key={n}
+            type="button"
+            className={[
+              styles.sliderTick,
+              n === value ? styles.sliderTickActive : '',
+              n < value   ? styles.sliderTickFilled : '',
+            ].filter(Boolean).join(' ')}
+            onClick={() => onChange(n)}
+            style={{ left: `${(n / 10) * 100}%` }}
+            aria-label={`Score mínimo ${n}`}
+          >
+            <span className={styles.sliderTickDot} />
+            <span className={`${styles.sliderTickLbl} num`}>{n}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// ─── Toggle ───
+
+interface ToggleProps {
+  label:    string;
+  hint?:    string;
+  value:    boolean;
+  onChange: (v: boolean) => void;
+}
+const Toggle: React.FC<ToggleProps> = ({ label, hint, value, onChange }) => (
+  <button
+    type="button"
+    role="switch"
+    aria-checked={value}
+    className={[styles.toggle, value ? styles.toggleOn : ''].filter(Boolean).join(' ')}
+    onClick={() => onChange(!value)}
+  >
+    <div className={styles.toggleText}>
+      <div className={styles.toggleLabel}>{label}</div>
+      {hint && <div className={`${styles.toggleHint} prose`}>{hint}</div>}
+    </div>
+    <div className={styles.toggleSwitch} aria-hidden="true">
+      <div className={styles.toggleThumb} />
+    </div>
+  </button>
+);
 
 export default ConfigPanel;

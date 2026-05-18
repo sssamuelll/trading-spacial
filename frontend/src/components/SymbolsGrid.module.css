@@ -1,0 +1,148 @@
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Page bar — section title + filter chips */
+.pageBar {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  padding: 6px 0 10px;
+  border-bottom: 1px solid var(--nbc-border-dimmer);
+  flex-wrap: wrap;
+}
+
+/* Slot rendered between the pageBar and the bucket grids — currently
+   holds StatusBar + FocusPanel. */
+.belowPageBar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 6px 0 4px;
+}
+.pageBarTitle { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.pageBarIndex {
+  font-family: var(--nbc-font-mono);
+  font-size: 11px;
+  color: var(--nbc-secondary);
+  letter-spacing: 0.10em;
+}
+.pageBarName {
+  font-size: 22px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--nbc-fg);
+}
+.pageBarSep { color: var(--nbc-fg-dim); font-size: 18px; }
+.pageBarHint { font-size: 11.5px; color: var(--nbc-fg-muted); }
+
+.filter { margin-left: auto; display: flex; gap: 6px; }
+
+.chip {
+  font-family: inherit;
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 4px 10px;
+  border: 1px solid var(--nbc-border-dim);
+  background: transparent;
+  color: var(--nbc-fg-muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.chip:hover { color: var(--nbc-fg); border-color: var(--nbc-border-color); }
+.chipActive { color: var(--bull); border-color: var(--bull); }
+.chip :global(.num) {
+  background: var(--nbc-surface-alt);
+  padding: 0 5px;
+  font-size: 9px;
+}
+
+/* Section headers within the grid */
+.secHd {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 0;
+  margin-top: 6px;
+}
+.secHdLabel {
+  font-size: 11px;
+  color: var(--bull);
+  letter-spacing: 0.16em;
+}
+.secHdCount {
+  font-family: var(--nbc-font-mono);
+  font-size: 11px;
+  color: var(--nbc-fg-muted);
+  background: var(--nbc-surface-alt);
+  border: 1px solid var(--nbc-border-dimmer);
+  padding: 0 6px;
+}
+.secHdHint { font-size: 11.5px; color: var(--nbc-fg-muted); }
+
+/* Grids */
+.gridFeatured {
+  display: grid;
+  gap: var(--d-gap-grid);
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+.gridStandard {
+  display: grid;
+  gap: var(--d-gap-grid);
+  grid-template-columns: repeat(auto-fit, minmax(var(--d-card-min), 1fr));
+}
+.rows { display: flex; flex-direction: column; }
+
+/* Empty state */
+.empty {
+  padding: 40px 20px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: var(--nbc-fg-muted);
+}
+.emptyMark { font-size: 32px; color: var(--nbc-fg-dim); }
+.emptyTitle { font-size: 14px; color: var(--nbc-fg); }
+.emptyBody { font-size: 12px; }
+
+/* Skeleton */
+.skel {
+  background: var(--nbc-surface-solid);
+  border: 1px solid var(--nbc-border-dimmer);
+  padding: var(--d-pad-card);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.skelLine {
+  height: 12px;
+  background: var(--nbc-surface-alt);
+  border-radius: 2px;
+  position: relative;
+  overflow: hidden;
+}
+.skelLine::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(106, 215, 255, 0.08), transparent);
+  animation: skelShimmer 1.4s ease-in-out infinite;
+}
+@keyframes skelShimmer { to { transform: translateX(100%); } }
+.skelTitle  { height: 18px; width: 60%; }
+.skelPrice  { height: 26px; width: 50%; }
+.skelBar    { height: 30px; }
+.skelFooter { height: 14px; width: 80%; }
+
+/* Mobile: stack chips below title */
+@media (max-width: 640px) {
+  .pageBar { gap: 8px; }
+  .filter  { margin-left: 0; width: 100%; flex-wrap: wrap; }
+  .gridFeatured, .gridStandard { grid-template-columns: 1fr; }
+}

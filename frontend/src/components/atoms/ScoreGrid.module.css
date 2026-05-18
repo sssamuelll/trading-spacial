@@ -1,0 +1,104 @@
+/* ============================================================
+   ScoreGrid.module.css
+   ============================================================ */
+
+/* GRID variant — 3xN grid + headline */
+.grid {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.gridCells {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 2px;
+  width: 36px;
+}
+.grid--lg .gridCells { width: 48px; }
+.grid--sm .gridCells { width: 28px; }
+
+.gridCell {
+  aspect-ratio: 1 / 1;
+  background: var(--nbc-surface-alt);
+  border: 1px solid var(--nbc-border-dimmer);
+  position: relative;
+}
+.gridCellOn.gridCell--bull { background: var(--bull);        border-color: var(--bull); }
+.gridCellOn.gridCell--warn { background: var(--warn);        border-color: var(--warn); }
+.gridCellOn.gridCell--dim  { background: var(--nbc-fg-dim);  border-color: var(--nbc-fg-dim); }
+.gridCellOff {
+  background: transparent;
+  border-color: var(--nbc-border-dimmer);
+}
+.gridOffMark {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--nbc-fg-dim);
+  font-size: 8px;
+}
+.gridNum {
+  font-family: var(--nbc-font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 28px;
+  font-weight: 500;
+  line-height: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+}
+.grid--lg .gridNum { font-size: 36px; }
+.grid--sm .gridNum { font-size: 18px; }
+.gridNum--bull { color: var(--bull); }
+.gridNum--warn { color: var(--warn); }
+.gridNum--dim  { color: var(--nbc-fg-dim); }
+.gridMax {
+  font-size: 0.5em;
+  color: var(--nbc-fg-dim);
+  font-weight: 400;
+}
+
+/* BAR variant — vertical bars */
+.bar { display: flex; align-items: flex-end; gap: 3px; }
+.barCell {
+  width: 5px;
+  height: 22px;
+  background: var(--nbc-surface-alt);
+  border: 1px solid var(--nbc-border-dimmer);
+}
+.barCellOn.barCell--bull { background: var(--bull);       border-color: var(--bull); }
+.barCellOn.barCell--warn { background: var(--warn);       border-color: var(--warn); }
+.barCellOn.barCell--dim  { background: var(--nbc-fg-dim); border-color: var(--nbc-fg-dim); }
+.barCellOff {
+  background: transparent;
+}
+.barNum {
+  font-family: var(--nbc-font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 22px;
+  font-weight: 500;
+  margin-left: 6px;
+  line-height: 1;
+}
+.barNum--bull { color: var(--bull); }
+.barNum--warn { color: var(--warn); }
+.barNum--dim  { color: var(--nbc-fg-dim); }
+.barMax { font-size: 0.5em; color: var(--nbc-fg-dim); }
+
+/* BIG variant — just the number */
+.big {
+  font-family: var(--nbc-font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 36px;
+  font-weight: 500;
+  line-height: 1;
+  display: flex;
+  align-items: baseline;
+}
+.big--lg { font-size: 44px; }
+.big--sm { font-size: 22px; }
+.bigMax  { font-size: 0.45em; color: var(--nbc-fg-dim); margin-left: 1px; }
+.big--bull .bigNum { color: var(--bull); }
+.big--warn .bigNum { color: var(--warn); }
+.big--dim  .bigNum { color: var(--nbc-fg-dim); }

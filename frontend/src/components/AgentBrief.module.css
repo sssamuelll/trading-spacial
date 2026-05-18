@@ -1,0 +1,216 @@
+/* ============================================================
+   AgentBrief — synchronous morning briefing panel.
+   Replaces FocusPanel at the top of Mercado.
+   ============================================================ */
+.ab {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--nbc-border-dim);
+  background:
+    linear-gradient(180deg, rgba(106, 215, 255, 0.04), rgba(14, 18, 19, 0.65)),
+    var(--nbc-surface-solid);
+  position: relative;
+  overflow: hidden;
+}
+.ab::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: linear-gradient(180deg, var(--bull), var(--nbc-secondary));
+}
+
+/* Header */
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--nbc-border-dimmer);
+}
+.id { display: flex; align-items: center; gap: 10px; }
+.avatar {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  background: rgba(106, 215, 255, 0.10);
+  border: 1px solid var(--bull);
+  color: var(--bull);
+  font-size: 14px;
+}
+.idText { display: flex; flex-direction: column; line-height: 1.15; }
+.name {
+  font-family: var(--nbc-font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.10em;
+  text-transform: uppercase;
+  color: var(--bull);
+}
+.sub {
+  font-size: 10px;
+  color: var(--nbc-fg-muted);
+  letter-spacing: 0.04em;
+  margin-top: 2px;
+}
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  background: var(--nbc-surface-alt);
+  border: 1px solid var(--nbc-border-dimmer);
+  font-family: var(--nbc-font-mono);
+  font-size: 10.5px;
+}
+.liveDot {
+  width: 6px;
+  height: 6px;
+  background: var(--bull);
+  border-radius: 50%;
+  box-shadow: 0 0 4px var(--bull);
+  animation: abHeartbeat 1.4s ease-in-out infinite;
+}
+.liveLbl {
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--bull);
+  font-size: 9.5px;
+}
+.liveTime { color: var(--nbc-fg); }
+@keyframes abHeartbeat {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.5; }
+}
+
+/* Body */
+.body {
+  display: grid;
+  grid-template-columns: 1fr 280px;
+  gap: 18px;
+  padding: 14px 16px;
+}
+.prose {
+  font-family: var(--nbc-font-prose);
+  font-size: 13px;
+  color: var(--nbc-fg);
+  line-height: 1.55;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.para { margin: 0 0 8px; }
+.para:last-child { margin-bottom: 0; }
+.para:first-child::first-letter {
+  font-family: var(--nbc-font-mono);
+  font-weight: 500;
+  color: var(--bull);
+}
+
+/* Highlights stack */
+.highlights {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.hi {
+  display: grid;
+  grid-template-columns: 24px 1fr 12px;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  background: var(--nbc-surface-alt);
+  border: 1px solid var(--nbc-border-dimmer);
+  border-left: 2px solid;
+  cursor: pointer;
+  transition: all 100ms ease;
+  font: inherit;
+  text-align: left;
+  width: 100%;
+}
+.hi:hover { background: var(--nbc-surface-elev); }
+.hiBull { border-left-color: var(--bull); }
+.hiBear { border-left-color: var(--bear); }
+.hiWarn { border-left-color: var(--warn); }
+.hiGlyph {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  border: 1px solid;
+}
+.hiGlyphBull { color: var(--bull); border-color: var(--bull); }
+.hiGlyphBear { color: var(--bear); border-color: var(--bear); }
+.hiGlyphWarn { color: var(--warn); border-color: var(--warn); }
+.hiBody { min-width: 0; }
+.hiTitle {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--nbc-fg);
+  letter-spacing: 0.02em;
+}
+.hiSub { font-size: 11px; color: var(--nbc-fg-muted); margin-top: 2px; }
+.hiChev { color: var(--nbc-fg-dim); font-size: 14px; }
+
+/* Footer chips + expand button */
+.ft {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--nbc-border-dimmer);
+  flex-wrap: wrap;
+}
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip {
+  font-family: inherit;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  padding: 5px 10px;
+  background: var(--nbc-surface-solid);
+  border: 1px solid var(--nbc-border-dimmer);
+  color: var(--nbc-fg-muted);
+  cursor: pointer;
+  transition: all 80ms ease;
+}
+.chip:hover { color: var(--bull); border-color: var(--bull); }
+.chipPrimary {
+  color: var(--bull);
+  border-color: var(--bull);
+  background: rgba(106, 215, 255, 0.06);
+}
+.chipPrimary:hover {
+  background: var(--bull);
+  color: var(--nbc-primary-fg);
+}
+.expand {
+  font-family: inherit;
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  background: transparent;
+  border: 1px solid var(--bull);
+  color: var(--bull);
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: all 80ms ease;
+}
+.expand:hover {
+  background: var(--bull);
+  color: var(--nbc-primary-fg);
+}
+
+@media (max-width: 768px) {
+  .body { grid-template-columns: 1fr; gap: 12px; }
+  .ft   { padding: 10px 12px; }
+  .chips  { width: 100%; }
+  .expand { width: 100%; text-align: center; }
+}
