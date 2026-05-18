@@ -74,11 +74,20 @@ jobs:
             "/tmp/bootstrap-atomic-deploy.sh $FLAG"
           echo "::endgroup::"
 
-      - name: Repair — symlink legacy .venv + restart
-        # Crea /var/www/trading/.venv → /var/www/trading/shared/.venv para que
-        # los shebangs absolutos del venv (que apuntan al path viejo) sigan
-        # resolviendo después del bootstrap. Después resetea el counter de
-        # restart-failures del service y lo arranca.
+      - name: Repair post-bootstrap
+        # Aplica dos fixes que el bootstrap inicial dejó pendientes:
+        #
+        #   1. Symlink legacy .venv: los binarios dentro de .venv/bin/ tienen
+        #      shebangs absolutos (#!/var/www/trading/.venv/bin/python). Al
+        #      mover .venv a shared/, esos shebangs apuntan a un path que ya
+        #      no existe. Creamos /var/www/trading/.venv → shared/.venv para
+        #      que los shebangs resuelvan.
+        #
+        #   2. Ensanchar ReadWritePaths: el bootstrap rewrote
+        #      `ReadWritePaths=/var/www/trading` → `.../current`. Pero systemd
+        #      resuelve symlinks antes de aplicar la sandbox, así que el DB en
+        #      shared/data/ queda fuera del whitelist (readonly). Volvemos a
+        #      `ReadWritePaths=/var/www/trading` que cubre current/ + shared/.
         if: ${{ inputs.mode == 'repair' }}
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
@@ -87,6 +96,7 @@ jobs:
             set -euo pipefail
 
             BASE=/var/www/trading
+            UNIT=/etc/systemd/system/trading-spacial.service
 
             echo "==> Estado pre-repair:"
             sudo systemctl status trading-spacial --no-pager -n 0 || true
@@ -105,14 +115,15 @@ jobs:
             echo "    OK: shared/.venv presente"
             echo
 
-            echo "==> Parando trading-spacial (estaba en restart-loop)..."
+            echo "==> Parando trading-spacial..."
             sudo systemctl stop trading-spacial || true
             sudo systemctl reset-failed trading-spacial || true
             echo
 
+            # ── Fix 1: legacy .venv symlink ─────────────────────────
             if [ -e "$BASE/.venv" ]; then
               if [ -L "$BASE/.venv" ]; then
-                echo "==> $BASE/.venv ya es un symlink — apunta a: $(readlink $BASE/.venv)"
+                echo "==> $BASE/.venv ya es un symlink → $(readlink $BASE/.venv)"
               else
                 echo "::error::$BASE/.venv existe pero NO es symlink. Resolver a mano."
                 exit 1
@@ -121,10 +132,23 @@ jobs:
               echo "==> Creando symlink $BASE/.venv → shared/.venv"
               sudo ln -s "$BASE/shared/.venv" "$BASE/.venv"
             fi
+
+            echo "==> Verificando que uvicorn sea ejecutable vía el symlink:"
+            ls -la "$BASE/.venv/bin/uvicorn"
             echo
 
-            echo "==> Verificando que el uvicorn binary sea ejecutable vía el symlink:"
-            ls -la "$BASE/.venv/bin/uvicorn"
+            # ── Fix 2: ensanchar ReadWritePaths ──────────────────────
+            CURRENT_RWP=$(grep -E "^ReadWritePaths=" "$UNIT" || true)
+            echo "==> ReadWritePaths actual: $CURRENT_RWP"
+
+            if grep -qE "^ReadWritePaths=/var/www/trading/current$" "$UNIT"; then
+              echo "==> Revirtiendo ReadWritePaths a /var/www/trading (cubre current + shared)"
+              sudo sed -i 's|^ReadWritePaths=/var/www/trading/current$|ReadWritePaths=/var/www/trading|' "$UNIT"
+              sudo systemctl daemon-reload
+              echo "==> Nuevo: $(grep -E '^ReadWritePaths=' "$UNIT")"
+            else
+              echo "==> ReadWritePaths no necesita cambio (no match con el patrón conocido)"
+            fi
             echo
 
             echo "==> Arrancando trading-spacial..."
