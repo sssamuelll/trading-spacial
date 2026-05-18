@@ -2,18 +2,17 @@
 # server vía SSH usando los mismos secrets que deploy.yml. Es de disparo
 # manual (workflow_dispatch) — NO se ejecuta automáticamente.
 #
+# Modos:
+#   dry-run = preview de qué haría el bootstrap sin ejecutarlo
+#   apply   = ejecuta el bootstrap (migración del layout)
+#   repair  = post-bootstrap fix: crea symlink legacy /var/www/trading/.venv
+#             → shared/.venv para que los shebangs del venv resuelvan.
+#             También resetea el restart-counter del service y lo restartea.
+#
 # Uso:
-#   1. Desde el web UI: Actions → Bootstrap atomic deploy → Run workflow
-#      → seleccionar mode = "dry-run" o "apply"
-#   2. Desde CLI:
-#        gh workflow run "Bootstrap atomic deploy" -f mode=dry-run
-#        gh workflow run "Bootstrap atomic deploy" -f mode=apply
-#
-# El primer paso recomendado es siempre "dry-run" para ver el diff del
-# systemd unit y la lista de archivos que se moverían. Después, "apply".
-#
-# Es idempotente: si el bootstrap ya corrió, el script detecta /current
-# y sale limpio sin tocar nada.
+#   gh workflow run "Bootstrap atomic deploy" -f mode=dry-run
+#   gh workflow run "Bootstrap atomic deploy" -f mode=apply
+#   gh workflow run "Bootstrap atomic deploy" -f mode=repair
 
 name: Bootstrap atomic deploy
 
@@ -21,17 +20,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'dry-run = preview sin aplicar; apply = ejecuta el bootstrap'
+        description: 'dry-run = preview; apply = ejecuta el bootstrap; repair = fix post-bootstrap (symlink legacy .venv)'
         required: true
         type: choice
         default: dry-run
         options:
           - dry-run
           - apply
-
-# Sin concurrency group: queremos que cada dispatch corra independiente.
-# Si alguien dispara dos al hilo, GitHub los serializa por defecto pero
-# tampoco hay riesgo (script es idempotente).
+          - repair
 
 jobs:
   bootstrap:
@@ -52,6 +48,7 @@ jobs:
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Upload bootstrap script to server
+        if: ${{ inputs.mode != 'repair' }}
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
@@ -61,7 +58,8 @@ jobs:
           ssh -i ~/.ssh/deploy_key ubuntu@${HOST} \
             "chmod +x /tmp/bootstrap-atomic-deploy.sh"
 
-      - name: Run bootstrap (${{ inputs.mode }})
+      - name: Run bootstrap (dry-run or apply)
+        if: ${{ inputs.mode == 'dry-run' || inputs.mode == 'apply' }}
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
           MODE: ${{ inputs.mode }}
@@ -76,8 +74,77 @@ jobs:
             "/tmp/bootstrap-atomic-deploy.sh $FLAG"
           echo "::endgroup::"
 
+      - name: Repair — symlink legacy .venv + restart
+        # Crea /var/www/trading/.venv → /var/www/trading/shared/.venv para que
+        # los shebangs absolutos del venv (que apuntan al path viejo) sigan
+        # resolviendo después del bootstrap. Después resetea el counter de
+        # restart-failures del service y lo arranca.
+        if: ${{ inputs.mode == 'repair' }}
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh -i ~/.ssh/deploy_key ubuntu@${HOST} 'bash -s' << 'REMOTE_SCRIPT'
+            set -euo pipefail
+
+            BASE=/var/www/trading
+
+            echo "==> Estado pre-repair:"
+            sudo systemctl status trading-spacial --no-pager -n 0 || true
+            echo
+
+            echo "==> Verificando que el bootstrap haya corrido..."
+            if [ ! -L "$BASE/current" ]; then
+              echo "::error::$BASE/current no existe — ¿bootstrap no ejecutado?"
+              exit 1
+            fi
+            if [ ! -d "$BASE/shared/.venv" ]; then
+              echo "::error::$BASE/shared/.venv no existe"
+              exit 1
+            fi
+            echo "    OK: current → $(readlink $BASE/current)"
+            echo "    OK: shared/.venv presente"
+            echo
+
+            echo "==> Parando trading-spacial (estaba en restart-loop)..."
+            sudo systemctl stop trading-spacial || true
+            sudo systemctl reset-failed trading-spacial || true
+            echo
+
+            if [ -e "$BASE/.venv" ]; then
+              if [ -L "$BASE/.venv" ]; then
+                echo "==> $BASE/.venv ya es un symlink — apunta a: $(readlink $BASE/.venv)"
+              else
+                echo "::error::$BASE/.venv existe pero NO es symlink. Resolver a mano."
+                exit 1
+              fi
+            else
+              echo "==> Creando symlink $BASE/.venv → shared/.venv"
+              sudo ln -s "$BASE/shared/.venv" "$BASE/.venv"
+            fi
+            echo
+
+            echo "==> Verificando que el uvicorn binary sea ejecutable vía el symlink:"
+            ls -la "$BASE/.venv/bin/uvicorn"
+            echo
+
+            echo "==> Arrancando trading-spacial..."
+            sudo systemctl start trading-spacial
+
+            echo "==> Esperando 8s y health check..."
+            sleep 8
+
+            if curl -fsS http://localhost:8100/health > /dev/null; then
+              echo "==> ✓ Repair completado. Service activo:"
+              sudo systemctl status trading-spacial --no-pager -n 5
+            else
+              echo "::error::Health check falló post-repair."
+              sudo journalctl -u trading-spacial -n 40 --no-pager
+              exit 1
+            fi
+          REMOTE_SCRIPT
+
       - name: Cleanup remote script
-        if: always()
+        if: always() && inputs.mode != 'repair'
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
