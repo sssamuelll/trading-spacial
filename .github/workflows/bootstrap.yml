@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'dry-run = preview; apply = ejecuta el bootstrap; repair = fix post-bootstrap; rollback = revierte al layout viejo'
+        description: 'dry-run = preview; apply = ejecuta; repair = fix post-apply; rollback = revierte; diagnose = print server state'
         required: true
         type: choice
         default: dry-run
@@ -29,6 +29,7 @@ on:
           - apply
           - repair
           - rollback
+          - diagnose
 
 jobs:
   bootstrap:
@@ -49,7 +50,7 @@ jobs:
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Upload bootstrap script to server
-        if: ${{ inputs.mode != 'repair' }}
+        if: ${{ inputs.mode == 'dry-run' || inputs.mode == 'apply' }}
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
@@ -166,6 +167,81 @@ jobs:
               sudo journalctl -u trading-spacial -n 40 --no-pager
               exit 1
             fi
+          REMOTE_SCRIPT
+
+      - name: Diagnose — print server state
+        # No tocar nada — solo printar info útil para entender el estado actual
+        # y planificar el siguiente intento de bootstrap. Filtra secrets del .env.
+        if: ${{ inputs.mode == 'diagnose' }}
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh -i ~/.ssh/deploy_key ubuntu@${HOST} 'bash -s' << 'REMOTE_SCRIPT'
+            set -euo pipefail
+            BASE=/var/www/trading
+            UNIT=/etc/systemd/system/trading-spacial.service
+
+            echo "=========================================="
+            echo "  Layout actual de $BASE"
+            echo "=========================================="
+            ls -la "$BASE" | head -30
+            echo
+
+            echo "=========================================="
+            echo "  systemd unit"
+            echo "=========================================="
+            sudo cat "$UNIT"
+            echo
+
+            echo "=========================================="
+            echo "  systemctl status"
+            echo "=========================================="
+            sudo systemctl status trading-spacial --no-pager -n 5 || true
+            echo
+
+            echo "=========================================="
+            echo "  .env (sólo claves con path, valores ocultos)"
+            echo "=========================================="
+            # Imprime cada línea KEY=VALUE pero solo muestra VALUE si parece path
+            # (empieza con / o . y NO contiene `=` después). Maskea tokens.
+            if [ -f "$BASE/.env" ]; then
+              while IFS= read -r line; do
+                case "$line" in
+                  ''|\#*) continue ;;
+                esac
+                key="${line%%=*}"
+                val="${line#*=}"
+                # Solo printar valores que parezcan paths
+                case "$val" in
+                  /*|\./*|~/*)
+                    echo "  $key = $val"
+                    ;;
+                  *)
+                    echo "  $key = <hidden> (len=${#val})"
+                    ;;
+                esac
+              done < <(sudo cat "$BASE/.env")
+            else
+              echo "  ::warning::$BASE/.env no existe"
+            fi
+            echo
+
+            echo "=========================================="
+            echo "  Permissions de directorios críticos"
+            echo "=========================================="
+            for d in "$BASE/.env" "$BASE/.venv" "$BASE/data" "$BASE/shared" "$BASE/current" "$BASE/releases"; do
+              if [ -e "$d" ] || [ -L "$d" ]; then
+                ls -lad "$d"
+              else
+                echo "  $d → NO EXISTE"
+              fi
+            done
+            echo
+
+            echo "=========================================="
+            echo "  Tail de journalctl"
+            echo "=========================================="
+            sudo journalctl -u trading-spacial -n 20 --no-pager 2>&1 | tail -20
           REMOTE_SCRIPT
 
       - name: Rollback — revertir al layout viejo
@@ -291,7 +367,7 @@ jobs:
           REMOTE_SCRIPT
 
       - name: Cleanup remote script
-        if: always() && inputs.mode != 'repair' && inputs.mode != 'rollback'
+        if: always() && inputs.mode != 'repair' && inputs.mode != 'rollback' && inputs.mode != 'diagnose'
         env:
           HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
