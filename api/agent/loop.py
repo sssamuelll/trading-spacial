@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, AsyncIterator, Optional
 
 from api.agent.prompts import build_system_blocks
@@ -90,9 +91,24 @@ LoopEvent = TextDelta | ToolUseStart | ToolUseResult | MessageEnd | ErrorEvent
 # ── Tool schema builder (registry → Anthropic tools array) ──────────────
 
 
-def _build_anthropic_tools(surface: str) -> list[dict]:
+@lru_cache(maxsize=8)
+def _build_anthropic_tools(surface: str) -> tuple[dict, ...]:
     """Convert the per-surface tool subset into the JSON Schema shape the
-    Messages API expects."""
+    Messages API expects.
+
+    Cached on `surface` because Pydantic's model_json_schema() is not
+    free and the tool catalog is immutable at runtime (any catalog edit
+    requires a process restart). maxsize=8 comfortably covers the 5
+    declared surfaces + headroom (PR #404 review pickup).
+
+    Returns a tuple wrapper so callers can't reassign list elements.
+    NOTE: the inner dicts remain mutable; callers MUST treat the return
+    value as read-only — mutating any nested schema (e.g.
+    `tools[0]["input_schema"]["properties"]["foo"] = ...`) corrupts the
+    cache for every subsequent request. We don't deepcopy on every call
+    because that would defeat the cache; the discipline lives at the
+    call sites (PR #405 review issue 3).
+    """
     specs = tools_for_surface(surface)
     out = []
     for spec in specs:
@@ -108,7 +124,7 @@ def _build_anthropic_tools(surface: str) -> list[dict]:
             "description": spec.description,
             "input_schema": schema,
         })
-    return out
+    return tuple(out)
 
 
 def _strip_titles(node: Any) -> None:
