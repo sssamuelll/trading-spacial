@@ -12,10 +12,11 @@
 // buttons) returns in Phase 3 via signed proposal events.
 // ============================================================
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import styles from './AgentDock.module.css';
 import type { SymbolStatus, Position, MacroState } from '../types';
 import { useAgentStream } from '../agent/useAgentStream';
+import type { ProposalChip, ToolChip } from '../agent/types';
 
 interface AgentDockProps {
   open:           boolean;
@@ -45,13 +46,20 @@ const AgentDock: React.FC<AgentDockProps> = ({
 }) => {
   const [input, setInput] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
-  const greetedRef = useRef(false);
 
-  const { msgs, loading, sendTurn } = useAgentStream({ surface: 'dock' });
-  // We render a synthetic welcome bubble before the first real turn so
-  // the dock isn't an empty void on open. It lives outside the stream
-  // hook because it never goes on the wire — purely UI.
-  const [welcome, setWelcome] = useState<string | null>(null);
+  const { msgs, loading, sendTurn, confirmProposal } = useAgentStream({ surface: 'dock' });
+  // Synthetic welcome bubble before the first real turn so the dock
+  // isn't an empty void on open. Lives outside the stream hook because
+  // it never goes on the wire — purely UI. Derived (useMemo) instead
+  // of stored, so it reflects current watchlist counts even after a
+  // conversation reset (PR #405 review nit).
+  const welcome = useMemo<string | null>(() => {
+    if (!open || msgs.length > 0 || initialPrompt) return null;
+    return (
+      `Hola. Estoy mirando tus ${symbols.length} pares y ${positions.length} posiciones. ` +
+      `Pregúntame lo que quieras.`
+    );
+  }, [open, msgs.length, initialPrompt, symbols.length, positions.length]);
 
   // Close on Escape
   useEffect(() => {
@@ -60,19 +68,6 @@ const AgentDock: React.FC<AgentDockProps> = ({
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [open, onClose]);
-
-  // Welcome message on first open. Only shown until the first real
-  // exchange — once msgs.length > 0 we hide it to avoid duplicate
-  // bubbles.
-  useEffect(() => {
-    if (open && !greetedRef.current && !initialPrompt) {
-      setWelcome(
-        `Hola. Estoy mirando tus ${symbols.length} pares y ${positions.length} posiciones. ` +
-        `Pregúntame lo que quieras.`,
-      );
-      greetedRef.current = true;
-    }
-  }, [open, initialPrompt, symbols.length, positions.length]);
 
   // Auto-send the initial prompt when one is passed in.
   useEffect(() => {
@@ -134,6 +129,8 @@ const AgentDock: React.FC<AgentDockProps> = ({
                 role={m.role}
                 text={m.text}
                 toolChips={m.tool_chips}
+                proposals={m.proposals}
+                onConfirmProposal={confirmProposal}
                 showTyping={
                   m.role === 'assistant' && loading && i === msgs.length - 1 && m.text === ''
                 }
@@ -175,11 +172,15 @@ const AgentDock: React.FC<AgentDockProps> = ({
 interface DockMessageProps {
   role:       'user' | 'assistant';
   text:       string;
-  toolChips?: Array<{ tool: string; status: 'pending' | 'ok' | 'error' }>;
+  toolChips?: ToolChip[];
+  proposals?: ProposalChip[];
+  onConfirmProposal?: (proposal_id: string) => void;
   showTyping?: boolean;
 }
 
-const DockMessage: React.FC<DockMessageProps> = ({ role, text, toolChips, showTyping }) => {
+const DockMessage: React.FC<DockMessageProps> = ({
+  role, text, toolChips, proposals, onConfirmProposal, showTyping,
+}) => {
   if (role === 'user') {
     return (
       <div className={`${styles.msg} ${styles.msgUser}`}>
@@ -221,7 +222,56 @@ const DockMessage: React.FC<DockMessageProps> = ({ role, text, toolChips, showTy
             ))}
           </div>
         )}
+        {proposals && proposals.length > 0 && proposals.map((p) => (
+          <ProposalConfirm
+            key={p.proposal_id}
+            proposal={p}
+            onConfirm={onConfirmProposal}
+          />
+        ))}
       </div>
+    </div>
+  );
+};
+
+// ── Proposal confirm row ────────────────────────────────────────────
+
+interface ProposalConfirmProps {
+  proposal: ProposalChip;
+  onConfirm?: (proposal_id: string) => void;
+}
+
+const ProposalConfirm: React.FC<ProposalConfirmProps> = ({ proposal, onConfirm }) => {
+  // Button copy reflects the state machine. Terminal states freeze the
+  // button (disabled + colored) so the user sees what happened without
+  // a toast / popover layer.
+  const labelByState: Record<ProposalChip['state'], string> = {
+    pending:   'Confirmar',
+    in_flight: 'Procesando…',
+    ok:        'Confirmado ✓',
+    expired:   'Expirado',
+    drift:     'Estado cambió — re-pregunta',
+    error:     'Falló — re-pregunta',
+  };
+  const stateClass =
+    proposal.state === 'in_flight' ? styles.toolConfirmInFlight :
+    proposal.state === 'ok'        ? styles.toolConfirmOk :
+    (proposal.state === 'expired' || proposal.state === 'drift' || proposal.state === 'error')
+                                   ? styles.toolConfirmError :
+    '';
+  const isInteractive = proposal.state === 'pending';
+
+  return (
+    <div className={styles.proposalRow}>
+      <div className={styles.proposalSummary}>{proposal.summary}</div>
+      <button
+        type="button"
+        className={[styles.toolConfirm, stateClass].join(' ')}
+        disabled={!isInteractive}
+        onClick={() => isInteractive && onConfirm?.(proposal.proposal_id)}
+      >
+        {labelByState[proposal.state]}
+      </button>
     </div>
   );
 };

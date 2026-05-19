@@ -9,10 +9,11 @@
 // Phase 2B of epic #400.
 // ============================================================
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import {
   AgentStreamError,
+  confirmAgentProposal,
   newConversationId,
   streamAgentTurn,
 } from './client';
@@ -21,6 +22,9 @@ import type {
   AgentContextHints,
   AgentStreamEvent,
   AgentSurface,
+  ProposalChip,
+  ProposalState,
+  ToolChip,
 } from './types';
 
 export interface ChatMsg {
@@ -28,7 +32,10 @@ export interface ChatMsg {
   text:    string;
   // Inline tool-use chips that render below the bubble while the turn
   // is in flight. The hook clears this on the next user turn.
-  tool_chips?: Array<{ tool: string; status: 'pending' | 'ok' | 'error' }>;
+  tool_chips?: ToolChip[];
+  // Phase 3: signed proposal envelopes attached to this assistant
+  // message. The dock renders an amber confirm button per chip.
+  proposals?:  ProposalChip[];
 }
 
 export interface UseAgentStreamOptions {
@@ -36,10 +43,11 @@ export interface UseAgentStreamOptions {
 }
 
 export interface UseAgentStreamReturn {
-  msgs:           ChatMsg[];
-  loading:        boolean;
-  sendTurn:       (text: string, hints?: AgentContextHints) => Promise<void>;
+  msgs:              ChatMsg[];
+  loading:           boolean;
+  sendTurn:          (text: string, hints?: AgentContextHints) => Promise<void>;
   resetConversation: () => void;
+  confirmProposal:   (proposal_id: string) => Promise<void>;
 }
 
 /**
@@ -52,36 +60,42 @@ export function useAgentStream(opts: UseAgentStreamOptions): UseAgentStreamRetur
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
   const [loading, setLoading] = useState(false);
   const conversationIdRef = useRef<string>(newConversationId());
+  // Parallel ref kept in sync with msgs so sendTurn can read the latest
+  // transcript without depending on closure freshness across renders.
+  // Phase 2B review issue 4: avoids the StrictMode double-invocation
+  // trap of assigning into a closed-over variable from inside a
+  // functional setState. Verified by test_send_turn_second_turn_carries_full_transcript.
+  const msgsRef = useRef<ChatMsg[]>([]);
+  useEffect(() => {
+    msgsRef.current = msgs;
+  }, [msgs]);
 
   const resetConversation = useCallback(() => {
     conversationIdRef.current = newConversationId();
     setMsgs([]);
+    msgsRef.current = [];
   }, []);
 
   const sendTurn = useCallback(
     async (text: string, hints?: AgentContextHints) => {
       if (!text.trim() || loading) return;
-      // Snapshot the transcript-up-to-now and append the user turn +
-      // an empty assistant placeholder atomically. The placeholder is
-      // what the streaming text appends to.
-      let prevMsgs: ChatMsg[] = [];
-      setMsgs((cur) => {
-        prevMsgs = cur;
-        return [
-          ...cur,
-          { role: 'user', text },
-          { role: 'assistant', text: '', tool_chips: [] },
-        ];
-      });
-      setLoading(true);
-
-      // Build the API request from the snapshot we just took. The
-      // backend rebuilds the system prompt server-side; we only ship
-      // the user/assistant transcript.
+      // Read the transcript from the ref (always fresh across re-renders);
+      // build the API messages BEFORE we append the user turn so the
+      // request payload mirrors the on-screen state at submit-time.
+      const transcriptSoFar = msgsRef.current;
       const apiMessages: AgentApiMessage[] = [
-        ...prevMsgs.map((m) => ({ role: m.role, content: m.text })),
+        ...transcriptSoFar.map((m) => ({ role: m.role, content: m.text })),
         { role: 'user' as const, content: text },
       ];
+
+      // Now append the user turn + empty assistant placeholder. The
+      // placeholder is what the streaming text appends to.
+      setMsgs((cur) => [
+        ...cur,
+        { role: 'user', text },
+        { role: 'assistant', text: '', tool_chips: [] },
+      ]);
+      setLoading(true);
 
       try {
         for await (const ev of streamAgentTurn({
@@ -114,7 +128,60 @@ export function useAgentStream(opts: UseAgentStreamOptions): UseAgentStreamRetur
     [loading, opts.surface, resetConversation],
   );
 
-  return { msgs, loading, sendTurn, resetConversation };
+  const confirmProposal = useCallback(async (proposal_id: string) => {
+    // Find the proposal across all messages (Phase 3: one proposal per
+    // tool call, but the loop could in theory emit several in one turn).
+    let found: ProposalChip | null = null;
+    for (const m of msgsRef.current) {
+      const p = m.proposals?.find((q) => q.proposal_id === proposal_id);
+      if (p) {
+        found = p;
+        break;
+      }
+    }
+    if (!found || found.state !== 'pending') return;
+
+    setMsgs((cur) => updateProposalState(cur, proposal_id, 'in_flight'));
+
+    try {
+      const res = await confirmAgentProposal({
+        proposal_id,
+        signed_payload: found.signed_payload,
+      });
+      const nextState: ProposalState =
+        res.result === 'ok'          ? 'ok'      :
+        res.result === 'expired'     ? 'expired' :
+        res.result === 'state_drift' ? 'drift'   :
+        'error';
+      setMsgs((cur) => updateProposalState(cur, proposal_id, nextState));
+    } catch {
+      // Network / fetch-level failure. Drop the chip into the error
+      // terminal state — the user can re-ask the model to try again,
+      // which produces a fresh signed envelope.
+      setMsgs((cur) => updateProposalState(cur, proposal_id, 'error'));
+    }
+  }, []);
+
+  return { msgs, loading, sendTurn, resetConversation, confirmProposal };
+}
+
+/**
+ * Replace one proposal's state across the transcript. Pure (returns a
+ * new array) so it composes with setMsgs.
+ */
+function updateProposalState(
+  cur: ChatMsg[],
+  proposal_id: string,
+  next: ProposalState,
+): ChatMsg[] {
+  return cur.map((m) => {
+    if (!m.proposals?.length) return m;
+    const idx = m.proposals.findIndex((p) => p.proposal_id === proposal_id);
+    if (idx < 0) return m;
+    const updated = [...m.proposals];
+    updated[idx] = { ...updated[idx], state: next };
+    return { ...m, proposals: updated };
+  });
 }
 
 // ── pure-ish reducer for one event ─────────────────────────────────────
@@ -164,6 +231,32 @@ function applyEvent(
               : c,
           );
           updated[updated.length - 1] = { ...last, tool_chips: chips };
+        }
+        return updated;
+      });
+      break;
+
+    case 'proposal':
+      // Phase 3: a propose_* tool ran. Attach the signed envelope to
+      // the current assistant message. The dock will render an amber
+      // confirm button driven by the proposal's state.
+      setMsgs((cur) => {
+        const updated = [...cur];
+        const last = updated[updated.length - 1];
+        if (last && last.role === 'assistant') {
+          const chip: ProposalChip = {
+            proposal_id:    ev.proposal_id,
+            signed_payload: ev.signed_payload,
+            action:         ev.action,
+            args:           ev.args,
+            expires_at:     ev.expires_at,
+            summary:        ev.summary,
+            state:          'pending',
+          };
+          updated[updated.length - 1] = {
+            ...last,
+            proposals: [...(last.proposals ?? []), chip],
+          };
         }
         return updated;
       });
