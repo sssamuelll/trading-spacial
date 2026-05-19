@@ -404,16 +404,25 @@ def _decrement_probation_counter(symbol: str) -> None:
 
 
 def _is_portfolio_normal(cfg: dict[str, Any]) -> bool:
-    """Return True if portfolio aggregate tier is NORMAL.
+    """Return True iff EVERY active tenant's portfolio aggregate tier is NORMAL.
 
     Reuses kill_switch_v2 helpers. Defensive: any failure → False (block
-    auto-recovery in unclear state).
+    auto-recovery in unclear state). Per multi-tenant policy: a single tenant
+    in non-NORMAL is enough to suppress auto-recovery for the symbol (the
+    decision is system-wide and we want to err conservatively).
     """
     try:
         from strategy.kill_switch_v2 import evaluate_portfolio_tier
         from strategy.kill_switch_v2_calibrator import _compute_current_portfolio_dd
-        portfolio_dd = _compute_current_portfolio_dd(cfg)
-        # Concurrent failures count: use existing health rows.
+        from db.capital import db_list_active_tenant_ids
+
+        tenant_ids = db_list_active_tenant_ids()
+        if not tenant_ids:
+            # No onboarded tenants yet — treat as NORMAL (no portfolio to gate).
+            return True
+
+        # Concurrent failures: a property of symbol_health (system-wide), so
+        # we read it once and reuse it across the per-tenant loop.
         conn = _conn()
         try:
             n_failures = conn.execute(
@@ -422,8 +431,13 @@ def _is_portfolio_normal(cfg: dict[str, Any]) -> bool:
             ).fetchone()[0]
         finally:
             conn.close()
-        portfolio = evaluate_portfolio_tier(portfolio_dd, int(n_failures), cfg)
-        return portfolio.get("tier") == "NORMAL"
+
+        for tid in tenant_ids:
+            portfolio_dd = _compute_current_portfolio_dd(cfg, tenant_id=tid)
+            portfolio = evaluate_portfolio_tier(portfolio_dd, int(n_failures), cfg)
+            if portfolio.get("tier") != "NORMAL":
+                return False
+        return True
     except Exception as e:  # noqa: BLE001
         log.warning("_is_portfolio_normal failed: %s — treating as not-normal", e)
         return False
@@ -1036,12 +1050,26 @@ def recent_portfolio_transitions(limit: int = 5) -> list[dict[str, Any]]:
     ]
 
 
-def get_dashboard_state(cfg: dict[str, Any]) -> dict[str, Any]:
+def get_dashboard_state(
+    cfg: dict[str, Any],
+    *,
+    tenant_id: int,
+) -> dict[str, Any]:
     """B6 orchestrator: assemble per-symbol + portfolio + alerts response.
 
     Reads from DB; computes next_conditions; builds the full DashboardResponse
     shape consumed by the frontend.
+
+    Args:
+        cfg: loaded config dict.
+        tenant_id: caller's tenant id (required per multi-tenant policy —
+            epic B #253). Portfolio equity is computed against this tenant's
+            capital row and positions; if the tenant has no capital row yet,
+            falls back to cfg["capital_usd"] for display while still
+            tenant-scoping the position queries.
     """
+    from db.capital import db_get_capital
+    capital = db_get_capital(tenant_id)
     from btc_scanner import DEFAULT_SYMBOLS
 
     ks_cfg = (cfg.get("kill_switch") or {})
@@ -1139,25 +1167,95 @@ def get_dashboard_state(cfg: dict[str, Any]) -> dict[str, Any]:
                 "next_conditions": next_conditions,
             })
 
-        # Portfolio
+        # Portfolio equity & DD.
+        #
+        # Two paths depending on capital source:
+        #
+        # (a) Tenant capital row present (multi-tenant): the ledger is the single
+        #     source of truth for realized PnL — `apply_pnl_to_capital` already
+        #     folded every closed trade into `balance`. Re-applying the closed
+        #     trades on top of `balance` (via compute_portfolio_equity_curve)
+        #     would double-count. We display `balance + open_mtm` instead.
+        #     `peak_equity` honors the monotonic ledger peak, lifted only if the
+        #     current snapshot already exceeds it (intraday gain not yet closed).
+        #
+        # (b) No capital row (legacy single-tenant): preserve pre-fix behavior —
+        #     simulate from cfg.capital_usd × (1 + simulated_dd). Suitable for
+        #     pre-onboarding tenants and the single-tenant default install.
+        if capital is not None and capital.get("balance") is not None:
+            realized_balance = float(capital["balance"])
+            peak_raw = capital.get("peak_balance")
+            ledger_peak = float(peak_raw) if peak_raw is not None else realized_balance
+
+            # MTM of open positions: (price_now - entry) × qty, signed by direction.
+            # Tenant-scoped per multi-tenant policy (epic B #253).
+            try:
+                from strategy.kill_switch_v2_shadow import (
+                    _load_open_positions, _snapshot_prices,
+                )
+                open_positions = _load_open_positions(tenant_id=tenant_id)
+                prices = _snapshot_prices()
+                open_mtm = 0.0
+                for pos in open_positions:
+                    sym = pos.get("symbol")
+                    if not sym or sym not in prices:
+                        continue
+                    entry = float(pos.get("entry_price") or 0)
+                    qty = float(pos.get("qty") or 0)
+                    direction = pos.get("direction", "LONG")
+                    price_now = float(prices[sym])
+                    if direction == "SHORT":
+                        open_mtm += (entry - price_now) * qty
+                    else:
+                        open_mtm += (price_now - entry) * qty
+            except Exception:
+                log.warning(
+                    "get_dashboard_state open-MTM computation failed; "
+                    "treating open_mtm as 0", exc_info=True,
+                )
+                open_mtm = 0.0
+
+            current_equity = realized_balance + open_mtm
+            peak_equity = max(ledger_peak, current_equity)
+            portfolio_dd = (
+                (peak_equity - current_equity) / peak_equity
+                if peak_equity > 0 else 0.0
+            )
+            # Sign convention: kill_switch_v2.compute_portfolio_dd returns a
+            # negative number when in drawdown; match it so evaluate_portfolio_tier
+            # interprets the threshold the same way.
+            portfolio_dd = -portfolio_dd
+        else:
+            # No capital row for this tenant — pre-onboarding / fresh user.
+            # Display cfg.capital_usd as a neutral base. We still tenant-scope
+            # the DD computation: with zero positions for this tenant the
+            # calibrator returns 0.0, so the legacy "$1000 × (1 + 0)" output
+            # is preserved without leaking other tenants' history.
+            tenant_balance = float(cfg.get("capital_usd", 1000.0))
+            try:
+                from strategy.kill_switch_v2_calibrator import _compute_current_portfolio_dd
+                portfolio_dd = _compute_current_portfolio_dd(cfg, tenant_id=tenant_id)
+            except Exception:
+                log.warning(
+                    "get_dashboard_state legacy DD computation failed", exc_info=True,
+                )
+                portfolio_dd = 0.0
+            current_equity = tenant_balance * (1.0 + portfolio_dd)
+            peak_equity = tenant_balance
+
         try:
             from strategy.kill_switch_v2 import evaluate_portfolio_tier
-            from strategy.kill_switch_v2_calibrator import _compute_current_portfolio_dd
-            portfolio_dd = _compute_current_portfolio_dd(cfg)
             n_failures = conn.execute(
                 """SELECT COUNT(*) FROM symbol_health
                    WHERE state IN ('ALERT', 'REDUCED', 'PAUSED', 'PROBATION')"""
             ).fetchone()[0]
             portfolio_tier = evaluate_portfolio_tier(portfolio_dd, int(n_failures), cfg)
-            current_equity = float(cfg.get("capital_usd", 1000.0)) * (1.0 + portfolio_dd)
-            peak_equity = float(cfg.get("capital_usd", 1000.0))
         except Exception:
-            log.warning("get_dashboard_state portfolio computation failed", exc_info=True)
+            log.warning(
+                "get_dashboard_state portfolio tier evaluation failed", exc_info=True,
+            )
             portfolio_tier = {"tier": "NORMAL", "dd": 0.0, "concurrent_failures": 0}
-            portfolio_dd = 0.0
             n_failures = 0
-            current_equity = float(cfg.get("capital_usd", 1000.0))
-            peak_equity = current_equity
 
         portfolio_out = {
             "tier": portfolio_tier["tier"],

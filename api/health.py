@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from api.config import load_config
 from api.deps import verify_api_key
-from auth.dependencies import require_role
+from auth.dependencies import get_current_tenant_id, require_role
 from db.connection import get_db
 
 log = logging.getLogger("api.health")
@@ -80,16 +80,20 @@ def get_health_events(
 
 
 @router.get("/health/dashboard", dependencies=[Depends(verify_api_key)])
-def get_health_dashboard():
+def get_health_dashboard(tenant_id: int = Depends(get_current_tenant_id)):
     """B6: single-shot consolidated state for the kill switch dashboard.
 
     Returns per-symbol full state + portfolio aggregate + 24h alert summary.
     Read-only; safe even when kill_switch.enabled=False (returns last-evaluated
     snapshot).
+
+    Portfolio equity + positions are tenant-scoped (epic B #253). The dashboard
+    state is computed against the caller's tenant only; cross-tenant
+    aggregates are never produced.
     """
     from health import get_dashboard_state
     cfg = load_config()
-    return get_dashboard_state(cfg)
+    return get_dashboard_state(cfg, tenant_id=tenant_id)
 
 
 @router.post(

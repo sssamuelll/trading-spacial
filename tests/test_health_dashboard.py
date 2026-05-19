@@ -98,8 +98,8 @@ def _insert_closed_position(conn, symbol, pnl, exit_ts):
     conn.execute(
         """INSERT INTO positions
            (symbol, direction, status, entry_price, entry_ts,
-            exit_price, exit_ts, exit_reason, pnl_usd, pnl_pct)
-           VALUES (?, 'LONG', 'closed', 100.0, ?, 110.0, ?, 'TP', ?, ?)""",
+            exit_price, exit_ts, exit_reason, pnl_usd, pnl_pct, tenant_id)
+           VALUES (?, 'LONG', 'closed', 100.0, ?, 110.0, ?, 'TP', ?, ?, 1)""",
         (symbol, exit_ts, exit_ts, pnl, pnl / 100.0),
     )
 
@@ -288,12 +288,27 @@ def test_recent_portfolio_transitions_returns_last_5(tmp_db):
 def client(tmp_path, monkeypatch):
     import btc_api
     from fastapi.testclient import TestClient
+    from auth.dependencies import get_current_tenant_id
     db_path = str(tmp_path / "signals.db")
     monkeypatch.setattr(btc_api, "DB_FILE", db_path)
     if hasattr(btc_api, "_db_conn"):
         delattr(btc_api, "_db_conn")
     btc_api.init_db()
-    return TestClient(btc_api.app)
+    # /health/dashboard now resolves capital per-tenant. In tests there's no
+    # JWT, so override the dependency to a fixed tenant id (1). With no capital
+    # row seeded for tenant 1, the endpoint falls back to cfg.capital_usd
+    # (preserves pre-fix behavior in tests that don't seed capital).
+    #
+    # NOTE for future test authors: downstream tests in this file implicitly
+    # rely on `tenant_id=1` having NO capital row unless they explicitly seed
+    # one via db_upsert_capital. The fixture rebuilds the DB on each test, so
+    # state does not leak across tests — but within a single test, any seed
+    # changes the portfolio branch (multi-tenant vs. legacy).
+    btc_api.app.dependency_overrides[get_current_tenant_id] = lambda: 1
+    try:
+        yield TestClient(btc_api.app)
+    finally:
+        btc_api.app.dependency_overrides.pop(get_current_tenant_id, None)
 
 
 def test_get_health_dashboard_empty_db_returns_default_shape(client):
@@ -329,8 +344,8 @@ def test_get_health_dashboard_seeded_symbol_returns_full_state(client):
             conn.execute(
                 """INSERT INTO positions
                    (symbol, direction, status, entry_price, entry_ts,
-                    exit_price, exit_ts, exit_reason, pnl_usd, pnl_pct)
-                   VALUES ('BTC', 'LONG', 'closed', 100.0, ?, 110.0, ?, 'TP', 10.0, 0.10)""",
+                    exit_price, exit_ts, exit_reason, pnl_usd, pnl_pct, tenant_id)
+                   VALUES ('BTC', 'LONG', 'closed', 100.0, ?, 110.0, ?, 'TP', 10.0, 0.10, 1)""",
                 (f"2026-04-2{1+i}T12:00:00+00:00", f"2026-04-2{1+i}T13:00:00+00:00"),
             )
         # Seed an event
@@ -380,6 +395,160 @@ def test_get_health_dashboard_disabled_kill_switch_still_returns(client, monkeyp
     monkeypatch.setattr(btc_api, "load_config", lambda: {"kill_switch": {"enabled": False}})
     resp = client.get("/health/dashboard")
     assert resp.status_code == 200
+
+
+def test_get_health_dashboard_uses_tenant_capital_when_present(client):
+    """Epic B #253 wire (issue #382): the dashboard reports the tenant's real
+    capital, not the legacy cfg.capital_usd default.
+
+    With balance=$10K + peak=$12K (a prior drawdown stamped into the ledger)
+    and zero open positions, the dashboard should show current=$10K (no MTM
+    to add) and peak=$12K (ledger monotonic peak), with dd ≈ -16.67%.
+    """
+    from db.capital import db_upsert_capital
+    # tenant_id=1 matches the override in the client fixture above.
+    db_upsert_capital(1, balance=10_000.0, peak_balance=12_000.0)
+    resp = client.get("/health/dashboard")
+    assert resp.status_code == 200
+    portfolio = resp.json()["portfolio"]
+    assert portfolio["current_equity"] == pytest.approx(10_000.0)
+    assert portfolio["peak_equity"] == pytest.approx(12_000.0)
+    # Sign convention matches kill_switch_v2.compute_portfolio_dd: negative in DD.
+    assert portfolio["dd_pct"] == pytest.approx(-(12_000.0 - 10_000.0) / 12_000.0)
+
+
+def test_get_health_dashboard_falls_back_when_tenant_has_no_capital(client):
+    """When the tenant has no capital row yet, the dashboard preserves the
+    legacy single-tenant behavior: cfg.capital_usd (default $1000)."""
+    resp = client.get("/health/dashboard")
+    assert resp.status_code == 200
+    portfolio = resp.json()["portfolio"]
+    assert portfolio["current_equity"] == pytest.approx(1000.0)
+    assert portfolio["peak_equity"] == pytest.approx(1000.0)
+
+
+def test_get_health_dashboard_no_double_count_on_realized_pnl_history(client):
+    """Regression for #382 review: when the tenant has a non-trivial trade
+    history already folded into `capital.balance` via apply_pnl_to_capital,
+    the dashboard MUST NOT re-apply those PnLs by also walking the closed
+    trades in compute_portfolio_equity_curve.
+
+    Seed five non-monotonic trades (+200, +200, -300, +200, -100) → final
+    balance = $10,200 with a peak of $10,400. Insert matching `positions`
+    rows so _load_closed_trades sees them too. The dashboard should report
+    current_equity=$10,200 (from the ledger, not 10,200 + 200 inflation)
+    and peak_equity=$10,400.
+    """
+    from db.capital import apply_pnl_to_capital
+    import btc_api
+
+    pnl_sequence = [200.0, 200.0, -300.0, 200.0, -100.0]
+    # Stamp each trade into the capital ledger.
+    for pnl in pnl_sequence:
+        apply_pnl_to_capital(1, pnl)
+
+    # Also insert the closed positions so the (now-removed) equity-curve
+    # path would see them — if regression returns, the curve would double-
+    # count and inflate current_equity past $10,200.
+    conn = btc_api.get_db()
+    try:
+        for i, pnl in enumerate(pnl_sequence):
+            reason = "TP" if pnl > 0 else "SL"
+            conn.execute(
+                """INSERT INTO positions
+                   (symbol, direction, status, entry_price, entry_ts,
+                    exit_price, exit_ts, exit_reason, pnl_usd, pnl_pct,
+                    tenant_id)
+                   VALUES ('BTC', 'LONG', 'closed', 100.0, ?, ?, ?, ?, ?, ?, 1)""",
+                (
+                    f"2026-04-2{i + 1}T12:00:00+00:00",
+                    100.0 + pnl / 10.0,
+                    f"2026-04-2{i + 1}T13:00:00+00:00",
+                    reason,
+                    pnl,
+                    pnl / 100.0,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    resp = client.get("/health/dashboard")
+    assert resp.status_code == 200
+    portfolio = resp.json()["portfolio"]
+    assert portfolio["current_equity"] == pytest.approx(10_200.0), (
+        f"Double-counting regression: expected $10,200 from ledger, got "
+        f"${portfolio['current_equity']}"
+    )
+    assert portfolio["peak_equity"] == pytest.approx(10_400.0)
+    expected_dd = -(10_400.0 - 10_200.0) / 10_400.0
+    assert portfolio["dd_pct"] == pytest.approx(expected_dd, abs=1e-6)
+
+
+def test_get_health_dashboard_isolates_tenants(client):
+    """Multi-tenant isolation (per "todo tiene que ser multitenant" policy):
+    tenant 1's dashboard MUST NOT reflect tenant 2's positions, regardless
+    of who has the bigger drawdown. Each tenant sees only their own ledger.
+
+    Covers both leak vectors:
+      (a) Closed trades for tenant 2 must not show in tenant 1's realized
+          balance — `_load_closed_trades(tenant_id=...)` filter is exercised
+          via the apply_pnl_to_capital ledger.
+      (b) Open positions for tenant 2 must not show in tenant 1's MTM —
+          `_load_open_positions(tenant_id=...)` filter is exercised by
+          seeding a price-cache MTM gain and asserting it stays absent.
+    """
+    from db.capital import db_upsert_capital, apply_pnl_to_capital
+    from strategy.kill_switch_v2_shadow import update_price
+    import btc_api
+
+    # Tenant 1 (active in fixture): balance $10K, no closed trades.
+    db_upsert_capital(1, balance=10_000.0, peak_balance=10_000.0)
+
+    # Tenant 2 (NOT the request tenant): seed a -$1000 loss → balance $9K, peak $10K.
+    apply_pnl_to_capital(2, -1_000.0)
+    conn = btc_api.get_db()
+    try:
+        # (a) Tenant 2 has a closed losing trade for ETH.
+        conn.execute(
+            """INSERT INTO positions
+               (symbol, direction, status, entry_price, entry_ts,
+                exit_price, exit_ts, exit_reason, pnl_usd, pnl_pct, tenant_id)
+               VALUES ('ETH', 'LONG', 'closed', 1000.0, '2026-04-20T12:00:00+00:00',
+                       900.0, '2026-04-20T15:00:00+00:00', 'SL', -1000.0, -0.10, 2)"""
+        )
+        # (b) Tenant 2 has an OPEN long BTC position with a large unrealized
+        # gain. If _load_open_positions ignored tenant_id, the dashboard for
+        # tenant 1 would pick up this +$5,000 MTM and report current_equity
+        # of $15,000 instead of $10,000.
+        # Note: SQLite (Python 3.11) does not accept numeric underscores in
+        # SQL literals, so we write 50000.0 instead of 50_000.0 here.
+        conn.execute(
+            """INSERT INTO positions
+               (symbol, direction, status, entry_price, entry_ts,
+                qty, tenant_id)
+               VALUES ('BTC', 'LONG', 'open', 50000.0,
+                       '2026-04-20T12:00:00+00:00', 1.0, 2)"""
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # Make the price cache see BTC at $55K so the leak (if it existed) would
+    # surface a +$5,000 MTM on the tenant-2 position above.
+    update_price("BTC", 55_000.0)
+
+    # Request runs as tenant 1 (fixture override). Should see clean $10K equity,
+    # NOT a -10% drawdown from tenant 2's loss, NOT a +$5K MTM gain from
+    # tenant 2's open position.
+    resp = client.get("/health/dashboard")
+    assert resp.status_code == 200
+    portfolio = resp.json()["portfolio"]
+    assert portfolio["current_equity"] == pytest.approx(10_000.0), (
+        f"Open-position leak: tenant 2's +$5K BTC MTM bled into tenant 1's "
+        f"dashboard (got ${portfolio['current_equity']})"
+    )
+    assert portfolio["peak_equity"] == pytest.approx(10_000.0)
+    assert portfolio["dd_pct"] == pytest.approx(0.0, abs=1e-9)
 
 
 # ── Portfolio transition recording integration ──────────────────────────────
