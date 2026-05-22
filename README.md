@@ -1,40 +1,68 @@
-# Crypto Trading Scanner — Ultimate Macro & Order Flow V6.0
+# trading-spacial
 
 [![CI](https://github.com/sssimon/trading-spacial/actions/workflows/ci.yml/badge.svg)](https://github.com/sssimon/trading-spacial/actions/workflows/ci.yml)
 
-Automated signal system for the top 20 crypto pairs by market cap. Uses multi-timeframe technical analysis (4H macro context → 1H signal → 5M entry trigger) to generate scored entry alerts delivered to Telegram.
+> A research-grade laboratory for evaluating systematic crypto-trading strategies, with a working signal scanner + dashboard on top.
+
+The surface is a Bitcoin / altcoin signal scanner: multi-timeframe technical analysis (4H macro → 1H signal → 5M entry), scored signals delivered to Telegram per-user, React dashboard with position tracking and an in-app LLM copilot.
+
+The substance is the methodology underneath: pre-registered hypotheses, a locked holdout dataset with two-layer access guards, explicit structural-fix ledger (bug fixes vs. modeling decisions), and honest closure of failed hypotheses. **See [`METHODOLOGY.md`](METHODOLOGY.md)** for what makes this different from the 50,000 other crypto bots on GitHub.
+
+**Status (2026-05-22):** the LRC strategy class has been re-baselined post-PR #223 and returned `EDGE_WEAK`. The only confirmed edge is operator-discretion exit timing (Direction A Q2). Two structurally distinct strategy directions have been explored and closed: (1) regime-allocation pivot (epic [#338](https://github.com/sssimon/trading-spacial/issues/338)) closed 2026-05-15 with verdict `PHASE_3_INSUFFICIENT_DATA`, and (2) trend-pullback (R3) closed earlier with FAIL verdict. Current active work is operator-tooling (multi-tenant production [#253](https://github.com/sssimon/trading-spacial/issues/253), per-user copilot history [#428](https://github.com/sssimon/trading-spacial/issues/428), onboarding wizard [#427](https://github.com/sssimon/trading-spacial/issues/427)). Do not trade this system live.
 
 ---
 
 ## Architecture
 
-```
+```text
 Binance API (Bybit fallback)
-  └─ btc_scanner.py     — fetch OHLCV, calculate indicators, score signals
-       └─ btc_api.py    — FastAPI server, SQLite storage, notification filters
-            └─ trading_webhook.py  →  Telegram (via OpenClaw CLI)
-               n8n workflow        →  Telegram (alternative)
+  └─ btc_scanner.py      — fetch OHLCV, compute indicators (LRC, RSI, BB, SMA, ATR, ADX),
+     |                     score signals (0–9), gate by regime detector
+     ├─ strategy/         — modular indicators, regime detection, sizing, vol-targeting
+     ├─ strategies/       — ⚠️ legacy ADX-based router (kept until consolidation; see strategies/router.py)
+     └─ backtest.py       — simulator with K-cap overshoot bound + bankruptcy halt
+            ↓
+  └─ btc_api.py            — FastAPI server (port 8000), SQLite storage, scanner thread
+     ├─ api/                 — REST endpoints (signals, positions, prefs, agent)
+     ├─ auth/                — JWT auth, per-user setup, password reset by shell only
+     ├─ db/                  — SQLite schema + migrations + capital tracker
+     └─ notifier/            — per-user signal dispatch (multi-tenant since epic #253)
+            ↓
+  └─ Telegram (per-user)   — each operator configures their own bot + chat_id
+                              via dashboard → UserMenu → Conexiones (since #421)
 
-frontend/               — React 18 dashboard (Vite + TypeScript)
-watchdog.py             — Windows process supervisor (keeps API alive)
+frontend/                    — React 18 dashboard (Vite + TypeScript)
+                              symbols grid, signals table, positions, copilot dock
+infra/                       — deploy configs (Caddy, GitHub Actions)
 ```
 
 ### Signal Logic
 
 | Timeframe | Role | Indicators |
-|-----------|------|-----------|
+|-----------|------|------------|
 | 4H | Macro context | SMA100, trend direction |
 | 1H | Main signal | LRC (100-bar), RSI, Bollinger Bands |
 | 5M | Entry trigger | Reversal candle confirmation |
 
-**Entry zone:** price within 25% of the lower Linear Regression Channel band (`LRC% ≤ 25`)
+**Entry zone:** `LRC_LONG_MAX = 25%` (long), `LRC_SHORT_MIN = 75%` (short, gated by `regime=BEAR`).
 
-**Score tiers:**
+**Score tiers (operator-chosen partition, stable from inception):**
 - `0–1` → 50% position size
 - `2–3` → standard size
 - `≥ 4` → premium signal (+50% size)
 
-**Default TP/SL:** 4% take profit / 2% stop loss
+**Risk per trade:** fixed 1% of capital. Per-symbol volatility adaptation is handled by tuned `atr_sl_mult / tp / be` values in `config.json["symbol_overrides"]` (epic #121). Do not add multiplicative scalers on top.
+
+**Regime detection** (`detect_regime`, once daily, cached in `data/regime_cache.json`):
+Composite score = 40% price (SMA50/200, 30d momentum) + 30% Fear & Greed + 30% Binance Futures funding rate. Score >60 = BULL/LONG, <40 = BEAR/SHORT-enabled, 40–60 = NEUTRAL/LONG-only.
+
+**Structural bounds (post-#223 simulator):**
+- **K-cap (#309)**: `abs(pnl_usd) ≤ 10 × risk_amount` per trade. Bounds the catastrophic-bar mechanism.
+- **Bankruptcy halt (#313)**: symbol stops new entries when equity drops below `0.1 × INITIAL_CAPITAL`. Existing positions close naturally.
+
+For the why behind these bounds, see [`METHODOLOGY.md`](METHODOLOGY.md) § Structural fixes shipped.
+
+**Curated symbols (static, 10):** BTC, ETH, ADA, AVAX, DOGE, UNI, XLM, PENDLE, JUP, RUNE. Static since epic #135 confirmed via 768+ backtest combinations that the 13 removed tokens (BNB, SOL, XRP, DOT, MATIC, LINK, LTC, ATOM, NEAR, FIL, APT, OP, ARB) are not profitable with this strategy regardless of parameters.
 
 ---
 
@@ -44,8 +72,12 @@ watchdog.py             — Windows process supervisor (keeps API alive)
 |-------|------|
 | Backend | Python 3.12, FastAPI, SQLite |
 | Frontend | React 18, TypeScript, Vite, lightweight-charts |
-| Alerts | Telegram (via n8n or OpenClaw CLI) |
-| Infrastructure | Docker, Windows Task Scheduler |
+| LLM copilot | Anthropic Claude + DeepSeek (multi-provider, epic #400) |
+| Alerts | Telegram (per-user, configured by each operator via dashboard) |
+| Auth | JWT, per-user setup, password reset by shell only |
+| Data sources | Binance Futures (primary), Bybit (fallback), CoinGecko (symbol metadata), Alternative.me (Fear & Greed) |
+| Production | Linux EC2 (`trading.sdar.dev`), Caddy reverse proxy, GitHub Actions deploy |
+| Local dev | Windows or Linux/macOS, Docker for frontend + n8n |
 
 ---
 
@@ -262,25 +294,58 @@ python -m pytest tests/test_api.py -v
 
 ## Project Structure
 
-```
-├── btc_api.py              # FastAPI server (port 8000)
-├── btc_scanner.py          # Signal engine (indicators + scoring)
-├── btc_report.py           # Standalone HTML market report generator
-├── trading_webhook.py      # Webhook receiver → Telegram (port 9000)
-├── watchdog.py             # Process supervisor (Windows)
-├── docker-compose.yml      # Frontend + n8n containers
-├── requirements_scanner.txt
-├── frontend/               # React 18 dashboard
-│   └── src/
-│       ├── components/     # SymbolsGrid, SignalsTable, PositionsPanel, ...
-│       ├── api.ts          # Typed fetch wrapper
-│       └── types.ts        # TypeScript interfaces
-├── tests/
-│   ├── test_scanner.py
-│   └── test_api.py
-├── scripts/                # Windows automation (PS1 + BAT)
-├── Backtesting_BTCUSDT/    # Backtesting results and charts (V6)
-└── data/                   # Position sizing calculator, trade tracker
+```text
+├── README.md                  # You are here
+├── METHODOLOGY.md             # The moat: pre-registration, holdout guards, structural fixes
+├── CLAUDE.md                  # Current-state truth (architecture, configs, known limitations)
+├── docs/                      # Specs, plans, research notes — see docs/README.md
+│   ├── README.md              # Documentation index
+│   └── superpowers/
+│       ├── specs/es/          # ~40 pre-registration documents
+│       ├── plans/             # ~35 implementation plans (active + archive/)
+│       └── research/          # Research notes (K-cap study, exit benchmarks)
+│
+│  # — Entry points —
+├── btc_api.py                 # FastAPI server (port 8000), scanner thread
+├── btc_scanner.py             # Signal engine: indicators, scoring, regime detection
+├── btc_report.py              # Standalone HTML market report generator
+├── trading_webhook.py         # Webhook receiver → Telegram (legacy path, port 9000)
+├── watchdog.py                # Process supervisor — ⚠️ Windows-only; Linux prod
+│                              #   supervises via systemd (not yet in repo, tracked
+│                              #   in audit follow-ups)
+│
+│  # — Modular code —
+├── api/                       # REST endpoints split by domain
+├── auth/                      # JWT auth + setup paths
+├── db/                        # SQLite schema + migrations + capital
+├── notifier/                  # Per-user signal dispatch (multi-tenant)
+├── strategy/                  # Indicators, regime, sizing, kill-switch, vol-targeting
+├── strategies/                # ⚠️ Legacy ADX router — being consolidated (tracked)
+├── scanner/                   # HTTP helpers
+├── cli/                       # CLI commands
+├── tools/                     # Operator scripts
+│
+│  # — Backtest + tuning —
+├── backtest.py                # Simulator (post-#309 K-cap + #313 bankruptcy halt)
+├── backtest_costs.py          # Cost model v2 (sqrt-participation + funding)
+├── auto_tune.py               # Parameter sweep harness
+├── grid_search_tf.py          # Timeframe grid search
+├── optimize_new_tokens.py     # New-token evaluation
+│
+│  # — Frontend + infra —
+├── frontend/                  # React 18 + Vite + TypeScript dashboard
+│   └── src/                   # Components, hooks, types, copilot dock
+├── infra/                     # Deploy configs (Caddy, GitHub Actions)
+├── scripts/                   # Windows automation (PS1 + BAT) + Linux setup
+│
+│  # — Tests + data —
+├── tests/                     # pytest (api, scanner, backtest, multi-tenant, holdout)
+├── data/                      # Operational data
+│   ├── holdout/               # 🔒 Locked holdout dataset — data/holdout/ (read-only, guard-protected)
+│   ├── regime_cache.json
+│   ├── symbols_status.json
+│   └── signals_history.csv
+└── logs/                      # Runtime logs (signals, webhook, watchdog)
 ```
 
 ---
@@ -299,58 +364,70 @@ python -m pytest tests/test_api.py -v
 
 ## Troubleshooting
 
-### El scanner no genera señales
-1. Verificar conexion a Binance: `curl -s https://api.binance.com/api/v3/ping`
-2. Revisar logs: `tail -f logs/btc_api.log`
-3. Verificar que `config.json` existe y tiene formato valido
-4. Forzar scan manual: `curl -X POST http://localhost:8000/scan`
-5. Revisar el endpoint de salud: `curl http://localhost:8000/health`
+### Scanner generates no signals
+1. Verify Binance connectivity: `curl -s https://api.binance.com/api/v3/ping`
+2. Check the API log: `tail -f logs/btc_api.log`
+3. Confirm `config.json` exists and is valid JSON
+4. Force a manual scan: `curl -X POST http://localhost:8000/scan`
+5. Hit the health endpoint: `curl http://localhost:8000/health`
 
-### Telegram no envia mensajes
-1. Verificar `telegram_bot_token` y `telegram_chat_id` en `config.json`
-2. Probar envio: `curl http://localhost:8000/webhook/test`
-3. Verificar que `signal_filters.min_score` no es demasiado alto (default: 4)
-4. Revisar logs para errores de Telegram: `grep -i telegram logs/btc_api.log`
-5. Si usa proxy: verificar formato `socks5://127.0.0.1:1080`
+### Telegram is silent
+1. Confirm `telegram_bot_token` and `telegram_chat_id` are set — note: since [#421](https://github.com/sssimon/trading-spacial/pull/421) these are **per-user** in `user_preferences`, not in `config.json`. Configure via the dashboard → avatar → Conexiones.
+2. Test delivery: dashboard → Conexiones → "Probar envío" button, or `curl http://localhost:8000/webhook/test`
+3. Check `signal_filters.min_score` isn't too restrictive (default: 4)
+4. Search the API log for Telegram errors: `grep -i telegram logs/btc_api.log`
+5. If using a proxy: confirm format `socks5://127.0.0.1:1080`
 
-### El dashboard no carga datos
-1. Verificar que `btc_api.py` esta corriendo: `curl http://localhost:8000/status`
-2. Si usa Docker: verificar que el container esta activo: `docker ps`
-3. Verificar proxy en nginx: `curl http://localhost:3000/api/status`
-4. Revisar la consola del navegador para errores CORS
+### Dashboard shows no data
+1. Confirm `btc_api.py` is running: `curl http://localhost:8000/status`
+2. If running under Docker: `docker ps`
+3. Verify the nginx / Caddy proxy: `curl http://localhost:3000/api/status`
+4. Check the browser console for CORS errors
 
-### Errores de base de datos
-1. Verificar que `signals.db` existe y no esta corrupto
-2. Si esta corrupto, restaurar desde backup: `cp backups/signals_YYYYMMDD.db signals.db`
-3. Para recrear la DB: eliminar `signals.db` y reiniciar `btc_api.py`
+### Database errors
+1. Confirm `signals.db` exists and isn't corrupt
+2. To restore from backup: `cp backups/signals_YYYYMMDD.db signals.db`
+3. To recreate from scratch: delete `signals.db` and restart `btc_api.py`
 
-### El watchdog no inicia (Windows)
-1. Verificar que Python esta en PATH: `python --version`
-2. Ejecutar como administrador: `powershell -ExecutionPolicy Bypass -File scripts/INSTALAR_AUTOSTART.ps1`
-3. Verificar tarea en Task Scheduler: buscar "BTCScannerWatchdog"
-4. Revisar logs: `type logs\watchdog.log`
+### Watchdog won't start (Windows local dev only)
+1. Check Python is on PATH: `python --version`
+2. Run the installer as administrator: `powershell -ExecutionPolicy Bypass -File scripts/INSTALAR_AUTOSTART.ps1`
+3. Verify the scheduled task exists: open Task Scheduler, look for `BTCScannerWatchdog`
+4. Check the log: `type logs\watchdog.log`
+
+> **Production note:** `watchdog.py` is Windows-only and is *not* what supervises production. Production runs on Linux EC2 (`trading.sdar.dev`) where supervision is via systemd. The systemd unit files are not yet checked into the repo — tracked in the audit punch list. If you're deploying to a Linux server, do not rely on `watchdog.py`.
 
 ## Deployment Checklist
 
-- [ ] Crear `config.json` con credenciales (copiar template del README)
-- [ ] Configurar `telegram_bot_token` y `telegram_chat_id`
-- [ ] Opcional: configurar `api_key` para proteger endpoints sensibles
-- [ ] Verificar conectividad a Binance: `curl https://api.binance.com/api/v3/ping`
-- [ ] Instalar dependencias: `pip install -r requirements.txt`
-- [ ] Iniciar API: `python btc_api.py`
-- [ ] Verificar salud: `curl http://localhost:8000/health`
-- [ ] Probar Telegram: `curl http://localhost:8000/webhook/test`
-- [ ] Iniciar frontend: `cd frontend && npm install && npm run dev`
-- [ ] Verificar dashboard en `http://localhost:5173`
-- [ ] Para produccion: `docker compose up --build`
-- [ ] Configurar autostart (Windows): ejecutar `scripts/INSTALAR_AUTOSTART.ps1`
-- [ ] Verificar logs se generan en `logs/`
+- [ ] Create `config.json` with credentials (copy template from this README)
+- [ ] Configure system-level Telegram only if you want a fallback channel — otherwise each user configures their own via the dashboard (since #421)
+- [ ] Optional: set `api_key` to protect sensitive endpoints
+- [ ] Verify Binance connectivity: `curl https://api.binance.com/api/v3/ping`
+- [ ] Install dependencies: `pip install -r requirements.txt`
+- [ ] Start the API: `python btc_api.py`
+- [ ] Health check: `curl http://localhost:8000/health`
+- [ ] Test legacy Telegram (if configured): `curl http://localhost:8000/webhook/test`
+- [ ] Start the frontend: `cd frontend && npm install && npm run dev`
+- [ ] Open the dashboard: `http://localhost:5173`
+- [ ] For production: see `infra/` + GitHub Actions deploy workflow (`.github/workflows/deploy.yml`)
+- [ ] Configure autostart:
+  - **Windows local dev:** `scripts/INSTALAR_AUTOSTART.ps1`
+  - **Linux production:** systemd unit (see ops docs — not yet in repo)
+- [ ] Confirm logs are landing in `logs/`
+- [ ] Confirm `data/regime_cache.json` populates after the first daily-bar fetch
 
 ---
 
 ## Notes
 
-- `config.json` is git-ignored — contains sensitive credentials
-- `watchdog.py` is Windows-only (uses `tasklist`, `taskkill`, `wmic`)
-- Symbols list is dynamically fetched from CoinGecko every hour with fallback to a hardcoded top-20 list
-- Binance Futures API is the primary data source; Bybit is the fallback
+- `config.json` is git-ignored — contains credentials. Use the template in this README to bootstrap.
+- `watchdog.py` is Windows-only (uses `tasklist`, `taskkill`, `wmic`). Linux production is supervised by systemd; the unit files are not yet in the repo (tracked).
+- The curated symbol list is **static** (10 coins) since epic #135 — see Signal Logic section above.
+- Binance Futures is the primary data source; Bybit is the fallback.
+- The locked holdout dataset at `data/holdout/` is read-only and guard-protected. See [`METHODOLOGY.md`](METHODOLOGY.md) § Holdout dataset isolation before writing any new code that touches it.
+
+## Research methodology
+
+This isn't just a trading scanner. The methodology underneath — pre-registration, holdout isolation, structural-fix ledger, honest closure of failed hypotheses — is what makes this repo different from the generic crypto-bot landscape.
+
+→ **Read [`METHODOLOGY.md`](METHODOLOGY.md)**, then [`docs/README.md`](docs/README.md) for the full spec index.
