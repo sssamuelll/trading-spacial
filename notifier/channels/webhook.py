@@ -29,6 +29,7 @@ from typing import Any
 
 import requests
 
+from api.security.url_validation import validate_outbound_url
 from notifier.channels.base import Channel, DeliveryReceipt
 
 
@@ -44,6 +45,12 @@ class WebhookChannel(Channel):
         ch_cfg = ((notif_cfg.get("channels") or {}).get("webhook") or {})
         self._enabled = bool(ch_cfg.get("enabled", False))
         self._endpoints: list[dict[str, Any]] = list(ch_cfg.get("endpoints") or [])
+        # SSRF opt-in (#127): operators running trusted internal webhooks can
+        # set cfg.security.webhook_allow_private_ips=True. Link-local / IMDS
+        # is always blocked regardless of this flag.
+        self._allow_private = bool(
+            (cfg.get("security") or {}).get("webhook_allow_private_ips", False)
+        )
 
     def _filter_endpoints_for(self, event_type: str) -> list[dict[str, Any]]:
         matched: list[dict[str, Any]] = []
@@ -70,6 +77,15 @@ class WebhookChannel(Channel):
             url = ep.get("url", "").strip()
             if not url:
                 errors.append("endpoint has empty url")
+                continue
+            # SSRF guard #127: any operator-configurable webhook URL is a potential
+            # SSRF sink. Validate before each send (defense in depth + TOCTOU).
+            try:
+                url = validate_outbound_url(url, allow_private=self._allow_private)
+            except ValueError as e:
+                err_msg = f"{url}: rechazado por SSRF guard — {e}"
+                log.warning("Endpoint bloqueado: %s", err_msg)
+                errors.append(err_msg)
                 continue
             ok, err = self._post_with_retry(url, message, max_retries=max_retries)
             if ok:
