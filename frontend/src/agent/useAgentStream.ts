@@ -14,15 +14,19 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AgentStreamError,
   confirmAgentProposal,
+  getConversationMessages,
   newConversationId,
   streamAgentTurn,
 } from './client';
 import type {
   AgentApiMessage,
   AgentContextHints,
+  AgentProposalEvent,
   AgentStreamEvent,
   AgentSurface,
+  MessageRecord,
   ProposalChip,
+  ProposalRecord,
   ProposalState,
   ToolChip,
 } from './types';
@@ -50,9 +54,19 @@ export interface UseAgentStreamOptions {
 export interface UseAgentStreamReturn {
   msgs:              ChatMsg[];
   loading:           boolean;
+  /** True while loadConversation's fetch is in flight. The dock gates
+   *  its input on (loading || hydrating) so a 2-second history fetch
+   *  doesn't let the user fire a sendTurn into a transcript that's
+   *  about to be replaced. PR #436 review issue #2. */
+  hydrating:         boolean;
   sendTurn:          (text: string, hints?: AgentContextHints) => Promise<void>;
   resetConversation: () => void;
   confirmProposal:   (proposal_id: string) => Promise<void>;
+  /** H.5 rehydration: pull a past conversation from the REST history
+   *  endpoint, replace the local transcript with its messages, and
+   *  point conversationIdRef at the loaded id so the next sendTurn
+   *  continues the conversation instead of starting a new one. */
+  loadConversation:  (conversation_id: string) => Promise<void>;
 }
 
 /**
@@ -64,6 +78,7 @@ export interface UseAgentStreamReturn {
 export function useAgentStream(opts: UseAgentStreamOptions): UseAgentStreamReturn {
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
   const [loading, setLoading] = useState(false);
+  const [hydrating, setHydrating] = useState(false);
   const conversationIdRef = useRef<string>(newConversationId());
   // Parallel ref kept in sync with msgs so sendTurn can read the latest
   // transcript without depending on closure freshness across renders.
@@ -75,6 +90,20 @@ export function useAgentStream(opts: UseAgentStreamOptions): UseAgentStreamRetur
     msgsRef.current = msgs;
   }, [msgs]);
 
+  // PR #436 review issue #1: refs mirror loading / hydrating so the
+  // gating in loadConversation + sendTurn can read fresh state across
+  // callback re-creations without forcing dep arrays to track them
+  // (which would cause the callback to re-create on every state flip).
+  const loadingRef   = useRef(false);
+  const hydratingRef = useRef(false);
+  useEffect(() => { loadingRef.current   = loading;   }, [loading]);
+  useEffect(() => { hydratingRef.current = hydrating; }, [hydrating]);
+
+  // Load preemption token: each loadConversation invocation increments
+  // this ref before the fetch and re-checks after; if a newer load
+  // started in the interim, the stale fetch's result is discarded.
+  const loadTokenRef = useRef(0);
+
   const resetConversation = useCallback(() => {
     conversationIdRef.current = newConversationId();
     setMsgs([]);
@@ -83,7 +112,12 @@ export function useAgentStream(opts: UseAgentStreamOptions): UseAgentStreamRetur
 
   const sendTurn = useCallback(
     async (text: string, hints?: AgentContextHints) => {
-      if (!text.trim() || loading) return;
+      // PR #436 review issue #1: hydratingRef.current short-circuits a
+      // type-and-Enter that races with a sidebar hydration fetch. Without
+      // it, the sendTurn captures the pre-hydration msgs + conversationId
+      // and the SSE bleed into the hydrated transcript when the fetch
+      // resolves mid-stream.
+      if (!text.trim() || loading || hydratingRef.current) return;
       // Read the transcript from the ref (always fresh across re-renders);
       // build the API messages BEFORE we append the user turn so the
       // request payload mirrors the on-screen state at submit-time.
@@ -167,7 +201,91 @@ export function useAgentStream(opts: UseAgentStreamOptions): UseAgentStreamRetur
     }
   }, []);
 
-  return { msgs, loading, sendTurn, resetConversation, confirmProposal };
+  const loadConversation = useCallback(async (conversation_id: string) => {
+    // PR #436 review issue #1: refuse to hydrate during an in-flight
+    // turn. Otherwise the resolving SSE text_delta events would
+    // continue to append to msgs[length-1] of the just-replaced
+    // hydrated transcript, mixing two unrelated conversations.
+    if (loadingRef.current) return;
+
+    // Preemption token: any newer loadConversation call invalidates this
+    // one's setMsgs at resolve time. Without it, two clicks in quick
+    // succession on rows A then B would race and either order could win.
+    const token = ++loadTokenRef.current;
+    setHydrating(true);
+    try {
+      const detail = await getConversationMessages(conversation_id);
+      if (token !== loadTokenRef.current) return;   // newer load preempted
+      const hydrated: ChatMsg[] = detail.messages.map(_recordToChatMsg);
+      conversationIdRef.current = conversation_id;
+      setMsgs(hydrated);
+      msgsRef.current = hydrated;
+    } catch (err) {
+      if (typeof console !== 'undefined') {
+        console.warn('loadConversation failed', conversation_id, err);
+      }
+    } finally {
+      // Only clear hydrating if we're still the latest token — otherwise
+      // a newer load is still in flight and should keep the flag set.
+      if (token === loadTokenRef.current) setHydrating(false);
+    }
+  }, []);
+
+  return { msgs, loading, hydrating, sendTurn, resetConversation, confirmProposal, loadConversation };
+}
+
+// ── REST → transcript shape ─────────────────────────────────────────────
+
+function _recordToChatMsg(rec: MessageRecord): ChatMsg {
+  return {
+    role:       rec.role,
+    text:       rec.content,
+    reasoning:  rec.reasoning ?? undefined,
+    tool_chips: rec.tool_chips ?? [],
+    proposals:  (rec.proposals ?? [])
+      .map(_proposalRecordToChipOrNull)
+      .filter((c): c is ProposalChip => c !== null),
+  };
+}
+
+const _KNOWN_PROPOSAL_ACTIONS: ReadonlySet<AgentProposalEvent['action']> =
+  new Set(['close_position', 'reactivate_symbol', 'apply_tune']);
+
+function _proposalRecordToChipOrNull(p: ProposalRecord): ProposalChip | null {
+  // PR #436 review issue #3: ProposalRecord.action is `string` (open)
+  // → ProposalChip.action is a closed Literal. A naive `as` cast would
+  // lie if the backend adds a new action without bumping frontend
+  // types. Filter unknown actions out + log a warning so the gap is
+  // visible in dev/staging telemetry. The dock just won't show a chip
+  // for that proposal — better than rendering a button that switches
+  // on the closed enum and silently misses the case.
+  if (!_KNOWN_PROPOSAL_ACTIONS.has(p.action as AgentProposalEvent['action'])) {
+    if (typeof console !== 'undefined') {
+      console.warn(
+        'loadConversation: unknown proposal action — chip skipped',
+        p.action, p.proposal_id,
+      );
+    }
+    return null;
+  }
+
+  // The REST shape doesn't carry signed_payload (HMAC TTL minutes vs
+  // 90-day retention — it'd be storing an expired credential). The
+  // confirm button is disabled for every state except 'pending', and
+  // REST rehydration never returns 'pending' (it returns 'stale' for
+  // the never-confirmed-not-yet-expired case — pre-reg D.6 + #434
+  // review issue #6). So signed_payload is unreachable from the UI
+  // and we put an empty string. If a future code path tries to use
+  // it, the HMAC verify on the backend will reject — defense in depth.
+  return {
+    proposal_id:    p.proposal_id,
+    signed_payload: '',
+    action:         p.action as AgentProposalEvent['action'],
+    args:           p.args,
+    expires_at:     p.expires_at,
+    summary:        p.summary,
+    state:          p.state,
+  };
 }
 
 /**

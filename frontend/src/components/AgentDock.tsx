@@ -51,7 +51,8 @@ const AgentDock: React.FC<AgentDockProps> = ({
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const { msgs, loading, sendTurn, confirmProposal } = useAgentStream({ surface: SURFACE_DOCK });
+  const { msgs, loading, hydrating, sendTurn, confirmProposal, loadConversation } =
+    useAgentStream({ surface: SURFACE_DOCK });
   // Synthetic welcome bubble before the first real turn so the dock
   // isn't an empty void on open. Lives outside the stream hook because
   // it never goes on the wire — purely UI. Derived (useMemo) instead
@@ -133,6 +134,7 @@ const AgentDock: React.FC<AgentDockProps> = ({
                 type="button"
                 className={styles.historyOpen}
                 onClick={() => setHistoryOpen(true)}
+                disabled={loading || hydrating}
                 aria-label="Abrir historial"
               >Historial</button>
               <button className={styles.close} onClick={onClose} aria-label="Cerrar">×</button>
@@ -175,22 +177,33 @@ const AgentDock: React.FC<AgentDockProps> = ({
             <input
               ref={inputRef}
               className={styles.input}
-              placeholder={loading ? 'pensando…' : 'pregúntame algo sobre el mercado, tus posiciones, un par…'}
+              placeholder={
+                hydrating ? 'cargando historial…' :
+                loading   ? 'pensando…' :
+                            'pregúntame algo sobre el mercado, tus posiciones, un par…'
+              }
               value={input}
               onChange={(e) => setInput(e.target.value)}
+              disabled={hydrating}
               autoFocus
             />
-            <button className={styles.send} type="submit" disabled={loading || !input.trim()}>↵</button>
+            <button
+              className={styles.send}
+              type="submit"
+              disabled={loading || hydrating || !input.trim()}
+            >↵</button>
           </form>
         </aside>
       )}
 
-      {/* H.4 sidebar — slides in on top of the dock. H.5 will wire
-          onSelectConversation through useAgentStream to rehydrate the
-          transcript; for H.4 it just closes the sidebar (no-op load). */}
+      {/* History sidebar (H.4 UI + H.5 rehydration). loadConversation
+          replaces the dock transcript with the picked conversation's
+          messages and aligns conversationIdRef so the next user turn
+          continues that thread. */}
       <AgentHistorySidebar
         open={open && historyOpen}
         onClose={() => setHistoryOpen(false)}
+        onSelectConversation={(id) => { void loadConversation(id); }}
       />
     </>
   );
@@ -301,12 +314,16 @@ const ProposalConfirm: React.FC<ProposalConfirmProps> = ({ proposal, onConfirm }
     // copy distinguishes "TTL passed" from "you saw this in a previous
     // session and the signed_payload wasn't persisted".
     stale:     'Propuesta ya no activa',
+    // #428 H.3: surfaced when agent_side_effects recorded a conflict
+    // (idempotency collision) at the original confirm time.
+    conflict:  'Conflicto al confirmar',
   };
   const stateClass =
     proposal.state === 'in_flight' ? styles.toolConfirmInFlight :
     proposal.state === 'ok'        ? styles.toolConfirmOk :
     (proposal.state === 'expired' || proposal.state === 'drift' ||
-     proposal.state === 'error' || proposal.state === 'stale')
+     proposal.state === 'error' || proposal.state === 'stale' ||
+     proposal.state === 'conflict')
                                    ? styles.toolConfirmError :
     '';
   const isInteractive = proposal.state === 'pending';

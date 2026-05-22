@@ -637,4 +637,316 @@ describe('useAgentStream', () => {
       await firstPromise!;
     });
   });
+
+  // ── H.5: loadConversation hydration ────────────────────────────────
+
+  function stubHistoryJson(body: object, status = 200) {
+    // @ts-expect-error — overriding global for the test
+    global.fetch = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+  }
+
+  it('loadConversation replaces msgs with the hydrated transcript', async () => {
+    stubHistoryJson({
+      conversation_id: 'conv-hydrate',
+      title:           'past chat',
+      surface:         'dock',
+      pinned:          false,
+      messages: [
+        { role: 'user',      ts: '2026-05-22T08:00:00Z', content: 'hola',
+          reasoning: null, tool_chips: [], proposals: [] },
+        { role: 'assistant', ts: '2026-05-22T08:00:01Z', content: 'qué tal',
+          reasoning: '<think>razonamiento</think>',
+          tool_chips: [{ tool: 'get_positions', status: 'ok' }],
+          proposals: [] },
+      ],
+    });
+
+    const { result } = renderHook(() => useAgentStream({ surface: 'dock' }));
+    await act(async () => {
+      await result.current.loadConversation('conv-hydrate');
+    });
+
+    expect(result.current.msgs).toHaveLength(2);
+    expect(result.current.msgs[0]).toMatchObject({ role: 'user', text: 'hola' });
+    expect(result.current.msgs[1]).toMatchObject({
+      role:      'assistant',
+      text:      'qué tal',
+      reasoning: '<think>razonamiento</think>',
+    });
+    expect(result.current.msgs[1].tool_chips).toEqual([
+      { tool: 'get_positions', status: 'ok' },
+    ]);
+  });
+
+  it('loadConversation aligns conversation_id so the next sendTurn continues it', async () => {
+    // Hydrate first
+    stubHistoryJson({
+      conversation_id: 'continue-me',
+      title: 'old chat', surface: 'dock', pinned: false,
+      messages: [
+        { role: 'user',      ts: '2026-05-22T08:00:00Z', content: 'q1',
+          reasoning: null, tool_chips: [], proposals: [] },
+        { role: 'assistant', ts: '2026-05-22T08:00:01Z', content: 'a1',
+          reasoning: null, tool_chips: [], proposals: [] },
+      ],
+    });
+    const { result } = renderHook(() => useAgentStream({ surface: 'dock' }));
+    await act(async () => {
+      await result.current.loadConversation('continue-me');
+    });
+
+    // Now stub the streaming POST and capture the URL the hook hits.
+    const fetchSpy = vi.fn().mockResolvedValueOnce(
+      new Response(
+        sseReadable([
+          { type: 'text_delta', text: 'ok' },
+          {
+            type: 'message_end',
+            usage: { input_tokens: 0, output_tokens: 0,
+                     cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+            stop_reason: 'end_turn', cost_usd: 0,
+          },
+        ]),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+      ),
+    );
+    // @ts-expect-error — overriding global for the test
+    global.fetch = fetchSpy;
+
+    await act(async () => {
+      await result.current.sendTurn('q2');
+    });
+
+    // The streaming POST URL must reference the hydrated conversation_id,
+    // NOT a fresh UUID — the continuation invariant.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toContain('/agent/conversations/continue-me/turn');
+  });
+
+  it('loadConversation maps stale ProposalRecord to ProposalChip without signed_payload', async () => {
+    stubHistoryJson({
+      conversation_id: 'conv-with-proposal',
+      title: 't', surface: 'dock', pinned: false,
+      messages: [
+        { role: 'user', ts: '2026-05-22T08:00:00Z', content: 'cerra btc',
+          reasoning: null, tool_chips: [], proposals: [] },
+        { role: 'assistant', ts: '2026-05-22T08:00:01Z',
+          content: 'propongo cerrar',
+          reasoning: null, tool_chips: [], proposals: [
+            { proposal_id: 'prop-x',
+              action: 'close_position',
+              args: { position_id: 42 },
+              expires_at: '2026-08-22T08:00:00Z',
+              summary: 'Cerrar #42',
+              state: 'stale' },
+          ] },
+      ],
+    });
+
+    const { result } = renderHook(() => useAgentStream({ surface: 'dock' }));
+    await act(async () => {
+      await result.current.loadConversation('conv-with-proposal');
+    });
+
+    const assistant = result.current.msgs[1];
+    expect(assistant.proposals).toHaveLength(1);
+    const chip = assistant.proposals![0];
+    expect(chip.state).toBe('stale');
+    expect(chip.proposal_id).toBe('prop-x');
+    // signed_payload is intentionally empty (REST never persists it);
+    // the dock disables the confirm button for any non-'pending' state.
+    expect(chip.signed_payload).toBe('');
+    expect(chip.action).toBe('close_position');
+    expect(chip.summary).toBe('Cerrar #42');
+  });
+
+  it('loadConversation is a no-op during an in-flight sendTurn (#436 review #1)', async () => {
+    // Start a sendTurn that won't complete until we release it.
+    let releaseStream: () => void = () => {};
+    const streamPromise = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    const blockedStream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        controller.enqueue(encode('data: ' + JSON.stringify({
+          type: 'text_delta', text: 'partial',
+        }) + '\n\n'));
+        await streamPromise;
+        controller.enqueue(encode('data: ' + JSON.stringify({
+          type: 'message_end',
+          usage: { input_tokens: 0, output_tokens: 0,
+                   cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+          stop_reason: 'end_turn', cost_usd: 0,
+        }) + '\n\n'));
+        controller.close();
+      },
+    });
+    // @ts-expect-error — overriding global for the test
+    global.fetch = vi.fn().mockResolvedValueOnce(new Response(blockedStream, {
+      status: 200, headers: { 'Content-Type': 'text/event-stream' },
+    }));
+
+    const { result } = renderHook(() => useAgentStream({ surface: 'dock' }));
+    let sendPromise: Promise<void>;
+    act(() => { sendPromise = result.current.sendTurn('hi'); });
+    await waitFor(() => expect(result.current.loading).toBe(true));
+
+    // Attempt to hydrate while loading=true. Should refuse silently.
+    const historySpy = vi.fn();
+    // @ts-expect-error — overriding global
+    global.fetch = historySpy;
+    await act(async () => {
+      await result.current.loadConversation('would-corrupt');
+    });
+    // The history endpoint was NEVER called because the gate fired
+    // before any fetch.
+    expect(historySpy).not.toHaveBeenCalled();
+    expect(result.current.hydrating).toBe(false);
+
+    // Let the streaming turn finish cleanly.
+    releaseStream();
+    await act(async () => { await sendPromise!; });
+  });
+
+  it('sendTurn is a no-op while a loadConversation is hydrating (#436 review #1)', async () => {
+    // Block the history fetch's response until we release it.
+    let releaseFetch: (value: Response) => void = () => {};
+    const blockedFetchPromise = new Promise<Response>((resolve) => {
+      releaseFetch = resolve;
+    });
+    // @ts-expect-error — overriding global
+    global.fetch = vi.fn().mockReturnValueOnce(blockedFetchPromise);
+
+    const { result } = renderHook(() => useAgentStream({ surface: 'dock' }));
+    let loadPromise: Promise<void>;
+    act(() => { loadPromise = result.current.loadConversation('slow-load'); });
+    await waitFor(() => expect(result.current.hydrating).toBe(true));
+
+    // Try to send during the hydration. Must no-op.
+    const sendSpy = vi.fn();
+    // @ts-expect-error — overriding global (would be used by sendTurn fetch)
+    global.fetch = sendSpy;
+    await act(async () => {
+      await result.current.sendTurn('mid-hydration');
+    });
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(result.current.msgs).toEqual([]);  // no user message appended
+
+    // Release the history fetch.
+    releaseFetch(new Response(JSON.stringify({
+      conversation_id: 'slow-load', title: 't',
+      surface: 'dock', pinned: false,
+      messages: [{ role: 'user', ts: 'T', content: 'preloaded',
+                   reasoning: null, tool_chips: [], proposals: [] }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    await act(async () => { await loadPromise!; });
+    expect(result.current.msgs).toHaveLength(1);
+    expect(result.current.msgs[0].text).toBe('preloaded');
+  });
+
+  it('rapid loadConversation invocations: the latest one wins (#436 review #1)', async () => {
+    // First load takes a while; second load fires before it returns.
+    let releaseFirst: (value: Response) => void = () => {};
+    const firstFetch = new Promise<Response>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const fetchMock = vi.fn()
+      .mockReturnValueOnce(firstFetch)
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        conversation_id: 'B', title: 'segunda', surface: 'dock', pinned: false,
+        messages: [{ role: 'user', ts: 'T', content: 'desde B',
+                     reasoning: null, tool_chips: [], proposals: [] }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    // @ts-expect-error — overriding global
+    global.fetch = fetchMock;
+
+    const { result } = renderHook(() => useAgentStream({ surface: 'dock' }));
+    let firstPromise: Promise<void>;
+    let secondPromise: Promise<void>;
+    act(() => { firstPromise = result.current.loadConversation('A'); });
+    act(() => { secondPromise = result.current.loadConversation('B'); });
+    // Second one resolves first (its promise is already-resolved); the
+    // first one's resolution must be discarded by the token check.
+    await act(async () => { await secondPromise!; });
+    expect(result.current.msgs[0].text).toBe('desde B');
+
+    // Now release the first — it must NOT clobber B's state.
+    releaseFirst(new Response(JSON.stringify({
+      conversation_id: 'A', title: 'primera', surface: 'dock', pinned: false,
+      messages: [{ role: 'user', ts: 'T', content: 'desde A',
+                   reasoning: null, tool_chips: [], proposals: [] }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    await act(async () => { await firstPromise!; });
+    // B's content is still in place — A's late arrival was preempted.
+    expect(result.current.msgs[0].text).toBe('desde B');
+  });
+
+  it('unknown proposal action is filtered out + warned (#436 review #3)', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    stubHistoryJson({
+      conversation_id: 'conv-unknown-action',
+      title: 't', surface: 'dock', pinned: false,
+      messages: [
+        { role: 'assistant', ts: 'T', content: 'algo',
+          reasoning: null, tool_chips: [],
+          proposals: [
+            { proposal_id: 'p-good', action: 'close_position',
+              args: {}, expires_at: 'T2', summary: 'cerrar', state: 'stale' },
+            { proposal_id: 'p-bad',  action: 'future_unknown_action',
+              args: {}, expires_at: 'T2', summary: 'hmm', state: 'stale' },
+          ] },
+      ],
+    });
+
+    const { result } = renderHook(() => useAgentStream({ surface: 'dock' }));
+    await act(async () => {
+      await result.current.loadConversation('conv-unknown-action');
+    });
+
+    const proposals = result.current.msgs[0].proposals;
+    expect(proposals).toHaveLength(1);
+    expect(proposals![0].proposal_id).toBe('p-good');
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('unknown proposal action'),
+      'future_unknown_action',
+      'p-bad',
+    );
+    warnSpy.mockRestore();
+  });
+
+  it('loadConversation failure leaves the existing transcript intact', async () => {
+    // Seed the hook with a turn so msgs is non-empty.
+    stubFetchOnce(sseReadable([
+      { type: 'text_delta', text: 'pre-existing' },
+      {
+        type: 'message_end',
+        usage: { input_tokens: 1, output_tokens: 1,
+                 cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        stop_reason: 'end_turn', cost_usd: 0,
+      },
+    ]));
+    const { result } = renderHook(() => useAgentStream({ surface: 'dock' }));
+    await act(async () => { await result.current.sendTurn('hola'); });
+    const before = result.current.msgs;
+
+    // Now stub a failed history load.
+    // @ts-expect-error — overriding global for the test
+    global.fetch = vi.fn().mockResolvedValueOnce(
+      new Response('{"detail":"boom"}', {
+        status: 500, headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    await act(async () => {
+      await result.current.loadConversation('bad-conv');
+    });
+
+    // Transcript untouched on failure (best-effort hydration).
+    expect(result.current.msgs).toEqual(before);
+  });
 });
