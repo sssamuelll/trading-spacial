@@ -25,8 +25,16 @@ from typing import Literal, Optional
 
 from db import transaction as _tx_module  # imported as module so tests can
                                             # patch `transaction` on it
-from db.transaction import read_only_connection
+from db.transaction import precheck_connection
 from db.positions import db_get_position_by_id, db_close_position_sql, _calc_pnl
+from operators.precheck import (
+    PositionSnapshot,
+    PrecheckNotFound,
+    PrecheckAlreadyClosed,
+    PrecheckOkToProceed,
+    PrecheckRejectedState,
+    PrecheckResult,
+)
 from db import capital as _capital_module  # imported as module so tests can
                                             # patch `apply_pnl_to_capital` on it
 from api.positions import _write_position_event_log, update_positions_json
@@ -41,7 +49,7 @@ _VALID_EXIT_REASONS = frozenset({"MANUAL", "MANUAL_AGENT", "SL_HIT", "TP_HIT", "
 
 @dataclass(frozen=True)
 class CloseOutcome:
-    status: Literal["closed", "not_found", "already_closed"]
+    status: Literal["closed", "not_found", "already_closed", "rejected_unexpected_state"]
     position: Optional[dict]
     pnl_usd: Optional[float]
     pnl_pct: Optional[float]
@@ -84,104 +92,164 @@ class PositionClosure:
         self._now = now or datetime.now(timezone.utc)
 
         self._state: Literal["INIT", "NOT_FOUND", "ALREADY_CLOSED", "OK_TO_PROCEED"] = "INIT"
-        self._pre_row: Optional[dict] = None
         self._result_row: Optional[dict] = None
         self._result_pnl: tuple[Optional[float], Optional[float]] = (None, None)
         self._consumed = False
+        self._precheck_result: PrecheckResult | None = None
 
     def __enter__(self) -> "PositionClosure":
         if self._consumed:
             raise RuntimeError("PositionClosure is single-use; construct a new one")
-        # Pre-validation read outside any write transaction (no lock contention).
-        # Invariant 2: USER-mode ownership mismatch must NOT open a write tx.
-        with read_only_connection() as con:
-            self._pre_row = db_get_position_by_id(con, self._pos_id)
-        if self._pre_row is None:
-            self._state = "NOT_FOUND"
-            return self
-        if self._mode == "USER":
-            if self._pre_row.get("tenant_id") != self._caller_tenant_id:
-                # IDOR-safe collapse: report identical to NOT_FOUND.
-                self._state = "NOT_FOUND"
-                return self
-        if self._pre_row.get("status") != "open":
-            self._state = "ALREADY_CLOSED"
-            return self
-        self._state = "OK_TO_PROCEED"
+        self._precheck_result = self._run_precheck()
         return self
+
+    def _run_precheck(self) -> PrecheckResult:
+        """Read outside any transaction; return one of the 3 PrecheckResult variants.
+
+        Implements ownership-before-lock (USER mode): a row whose tenant_id does
+        not match caller_tenant_id collapses to PrecheckNotFound (IDOR-safe).
+        """
+        with precheck_connection() as con:
+            row = db_get_position_by_id(con, self._pos_id)
+
+        if row is None:
+            return PrecheckNotFound()
+
+        snapshot = PositionSnapshot(
+            pos_id=row["id"],
+            tenant_id=row["tenant_id"],
+            status=row["status"],
+            symbol=row["symbol"],
+            direction=row["direction"],
+            entry_price=row["entry_price"],
+            qty=row["qty"],
+        )
+
+        if self._mode == "USER":
+            if snapshot.tenant_id != self._caller_tenant_id:
+                return PrecheckNotFound()  # IDOR-safe collapse
+
+        if snapshot.status == "closed":
+            return PrecheckAlreadyClosed(snapshot=snapshot)
+        if snapshot.status != "open":
+            # F2 fix per Voronov: status not in {open, closed} (e.g., "cancelled")
+            # MUST be reported distinctly, not collapsed to already_closed.
+            return PrecheckRejectedState(snapshot=snapshot)
+
+        return PrecheckOkToProceed(snapshot=snapshot)
+
+    @staticmethod
+    def _snapshot_to_dict(snapshot: PositionSnapshot) -> dict:
+        """Convert a PositionSnapshot back to dict for the CloseOutcome.position
+        field (which existing callers expect as a dict)."""
+        return {
+            "id": snapshot.pos_id,
+            "tenant_id": snapshot.tenant_id,
+            "status": snapshot.status,
+            "symbol": snapshot.symbol,
+            "direction": snapshot.direction,
+            "entry_price": snapshot.entry_price,
+            "qty": snapshot.qty,
+        }
 
     def execute(self) -> CloseOutcome:
         if self._consumed:
             raise RuntimeError("PositionClosure already executed; single-use")
         self._consumed = True
 
-        if self._state == "NOT_FOUND":
-            return CloseOutcome(
-                status="not_found", position=None, pnl_usd=None, pnl_pct=None,
-            )
-        if self._state == "ALREADY_CLOSED":
+        result = self._precheck_result
+
+        if isinstance(result, PrecheckNotFound):
+            return CloseOutcome(status="not_found", position=None, pnl_usd=None, pnl_pct=None)
+
+        if isinstance(result, PrecheckAlreadyClosed):
             return CloseOutcome(
                 status="already_closed",
-                position=self._pre_row,
+                position=self._snapshot_to_dict(result.snapshot),
                 pnl_usd=None,
                 pnl_pct=None,
             )
-        # OK_TO_PROCEED — one transaction wraps the read + close + capital
-        # roll-in. Raises (e.g. capital UPSERT failure) trigger ROLLBACK,
-        # which is the atomicity guarantee invariant 1 / 2 anchor.
+
+        if isinstance(result, PrecheckRejectedState):
+            return CloseOutcome(
+                status="rejected_unexpected_state",
+                position=self._snapshot_to_dict(result.snapshot),
+                pnl_usd=None,
+                pnl_pct=None,
+            )
+
+        # PrecheckOkToProceed: write-tx must re-validate snapshot's mutable fields.
+        snapshot = result.snapshot
         with _tx_module.transaction() as con:
-            # Re-select inside the write tx to cover the race window between
-            # pre-validation and BEGIN IMMEDIATE.
             row = db_get_position_by_id(con, self._pos_id)
             if row is None:
-                return CloseOutcome(
-                    status="not_found", position=None, pnl_usd=None, pnl_pct=None,
+                return CloseOutcome(status="not_found", position=None, pnl_usd=None, pnl_pct=None)
+            # #461 closure: tenant_id re-validation is obligatory by construction.
+            if row["tenant_id"] != snapshot.tenant_id:
+                # Tenant reassigned between precheck and write-tx. IDOR-safe collapse.
+                return CloseOutcome(status="not_found", position=None, pnl_usd=None, pnl_pct=None)
+            if row["status"] == "closed":
+                # Race: another caller closed this position between precheck and BEGIN IMMEDIATE.
+                # Do NOT set self._result_row — the other caller already fired side-effects.
+                # F1 fix per Voronov: normalize CloseOutcome.position shape to snapshot
+                # shape (same as precheck-detected already_closed branch). Consumers
+                # needing exit_* fields must read the row directly via a separate query.
+                race_snapshot = PositionSnapshot(
+                    pos_id=row["id"],
+                    tenant_id=row["tenant_id"],
+                    status=row["status"],
+                    symbol=row["symbol"],
+                    direction=row["direction"],
+                    entry_price=row["entry_price"],
+                    qty=row["qty"],
                 )
-            if row.get("status") != "open":
-                self._result_row = None  # suppress post-commit side-effects
                 return CloseOutcome(
                     status="already_closed",
-                    position=row,
+                    position=self._snapshot_to_dict(race_snapshot),
+                    pnl_usd=None,
+                    pnl_pct=None,
+                )
+            if row["status"] != "open":
+                # F2 fix per Voronov: status != "open" AND != "closed" (e.g., "cancelled")
+                # MUST NOT collapse to already_closed. The consumer needs to know the real
+                # state to decide retry vs notify vs log-skip.
+                rejected_snapshot = PositionSnapshot(
+                    pos_id=row["id"],
+                    tenant_id=row["tenant_id"],
+                    status=row["status"],
+                    symbol=row["symbol"],
+                    direction=row["direction"],
+                    entry_price=row["entry_price"],
+                    qty=row["qty"],
+                )
+                return CloseOutcome(
+                    status="rejected_unexpected_state",
+                    position=self._snapshot_to_dict(rejected_snapshot),
                     pnl_usd=None,
                     pnl_pct=None,
                 )
 
-            qty = row.get("qty") or 0
+            # Snapshot's immutable fields trusted; consume directly.
+            # qty may be NULL in legacy rows (schema allows; some fixtures set
+            # only size_usd). Match the previous behavior of defaulting to 0.
+            qty = snapshot.qty or 0
             pnl_usd, pnl_pct = _calc_pnl(
-                row["direction"], row["entry_price"], self._exit_price, qty,
+                snapshot.direction, snapshot.entry_price, self._exit_price, qty,
             )
             exit_ts = self._now.isoformat()
             closed_row = db_close_position_sql(
-                con,
-                self._pos_id,
-                self._exit_price,
-                self._exit_reason,
-                exit_ts,
-                pnl_usd,
-                pnl_pct,
+                con, self._pos_id, self._exit_price, self._exit_reason,
+                exit_ts, pnl_usd, pnl_pct,
             )
-            tenant_id = closed_row.get("tenant_id")
-            if tenant_id is not None and pnl_usd is not None:
-                # Invariant 1 / 2: capital roll-in joins the same tx. Any
-                # raise inside aborts the close via context-manager rollback.
-                # Task 5 (#446): `apply_pnl_to_capital` now has
-                # `con` as mandatory positional first arg — matches the
-                # 3-positional mock `boom(con, tenant_id, pnl_usd)` used in
-                # tests.
-                _capital_module.apply_pnl_to_capital(
-                    con,
-                    int(tenant_id),
-                    float(pnl_usd),
-                )
-            elif tenant_id is None:
+            if snapshot.tenant_id is not None and pnl_usd is not None:
+                _capital_module.apply_pnl_to_capital(con, snapshot.tenant_id, pnl_usd)
+            elif snapshot.tenant_id is None:
                 log.warning(
-                    "PositionClosure: skipping capital roll-in for legacy "
-                    "tenant_id=NULL pos_id=%s",
+                    "PositionClosure: skipping capital roll-in for legacy tenant_id=NULL pos_id=%s",
                     self._pos_id,
                 )
             self._result_row = closed_row
             self._result_pnl = (pnl_usd, pnl_pct)
-        # Transaction committed here.
         return CloseOutcome(
             status="closed",
             position=self._result_row,
