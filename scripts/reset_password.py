@@ -90,7 +90,9 @@ def main() -> None:
     parser.add_argument("--email", default=None, help="User email")
     args = parser.parse_args()
 
-    init_auth_db()
+    from db.transaction import transaction  # noqa: PLC0415
+    with transaction() as con:
+        init_auth_db(con)
     email = _prompt_email(args.email)
     found = _find_user(email)
     if found is None:
@@ -103,7 +105,8 @@ def main() -> None:
     new_pwd = _prompt_new_password()
     pwd_hash = hash_password(new_pwd)
     _update_password(user_id, pwd_hash)
-    revoked = revoke_all_for_user(user_id)
+    with transaction() as con:
+        revoked = revoke_all_for_user(con, user_id)
 
     log_auth_event(
         event_type="password_reset_via_cli",

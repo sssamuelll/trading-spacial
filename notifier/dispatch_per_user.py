@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from typing import Any, Optional
+from typing import Any
 
-from db.transaction import _tx_or_use
+from db.transaction import transaction
 from db.user_preferences import db_get_user_preferences
 from notifier import notify
 from notifier.channels.base import DeliveryReceipt
@@ -29,10 +29,7 @@ _DEFAULT_MIN_SCORE = 4
 _DEFAULT_SYMBOL_FILTER: list[str] | None = None  # None = all symbols allowed
 
 
-def _list_active_users(
-    *,
-    con: Optional[sqlite3.Connection] = None,
-) -> list[dict]:
+def _list_active_users(con: sqlite3.Connection) -> list[dict]:
     """Return active users (id + email) for fan-out.
 
     Pre-bootstrap case: if the `users` table doesn't exist yet (auth schema
@@ -40,10 +37,9 @@ def _list_active_users(
     so callers fall back to the legacy broadcast path.
     """
     try:
-        with _tx_or_use(con) as con:
-            rows = con.execute(
-                "SELECT id, email FROM users WHERE is_active = 1 ORDER BY id"
-            ).fetchall()
+        rows = con.execute(
+            "SELECT id, email FROM users WHERE is_active = 1 ORDER BY id"
+        ).fetchall()
     except sqlite3.OperationalError as e:
         if "no such table" in str(e).lower():
             return []
@@ -69,8 +65,6 @@ def _user_passes_filter(
 def dispatch_signal_to_users(
     event: SignalEvent,
     base_cfg: dict[str, Any],
-    *,
-    con: Optional[sqlite3.Connection] = None,
 ) -> dict[int, list[DeliveryReceipt]]:
     """Fan a SignalEvent out to each active user, honoring their preferences.
 
@@ -79,11 +73,12 @@ def dispatch_signal_to_users(
     Users who pass the filter but have no channels configured still appear
     (with empty receipts) — useful for observability.
 
-    Per Task 8.5: optional `con` is threaded through to `_list_active_users`
-    and `db_get_user_preferences`. The downstream `notify()` call still owns
-    its own transactions (file/network I/O — must not extend the DB lock).
+    Cat. 2 hidden operator: owns its own transaction() calls directly.
+    The downstream `notify()` call still owns its own transactions
+    (file/network I/O — must not extend the DB lock).
     """
-    users = _list_active_users(con=con)
+    with transaction() as _users_con:
+        users = _list_active_users(_users_con)
     if not users:
         log.debug("dispatch_signal_to_users: no active users — broadcast skipped")
         return {}
@@ -91,7 +86,8 @@ def dispatch_signal_to_users(
     out: dict[int, list[DeliveryReceipt]] = {}
 
     for user in users:
-        prefs = db_get_user_preferences(user["id"], con=con)
+        with transaction() as inner_con:
+            prefs = db_get_user_preferences(inner_con, user["id"])
         if prefs is None:
             symbol_filter = _DEFAULT_SYMBOL_FILTER
             min_score = _DEFAULT_MIN_SCORE

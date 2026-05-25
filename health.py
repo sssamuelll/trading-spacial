@@ -414,14 +414,15 @@ def _is_portfolio_normal(cfg: dict[str, Any]) -> bool:
         from strategy.kill_switch_v2_calibrator import _compute_current_portfolio_dd
         from db.capital import db_list_active_tenant_ids
 
-        tenant_ids = db_list_active_tenant_ids()
-        if not tenant_ids:
-            # No onboarded tenants yet — treat as NORMAL (no portfolio to gate).
-            return True
-
         # Concurrent failures: a property of symbol_health (system-wide), so
         # we read it once and reuse it across the per-tenant loop.
+        # Task 5 (#446): `db_list_active_tenant_ids` now takes mandatory
+        # `con` — fold the read into the same transaction.
         with transaction() as conn:
+            tenant_ids = db_list_active_tenant_ids(conn)
+            if not tenant_ids:
+                # No onboarded tenants yet — treat as NORMAL (no portfolio to gate).
+                return True
             n_failures = conn.execute(
                 """SELECT COUNT(*) FROM symbol_health
                    WHERE state IN ('ALERT', 'REDUCED', 'PAUSED', 'PROBATION')"""
@@ -450,7 +451,8 @@ def _maybe_auto_reactivate(
       - paused-duration < threshold_days
       - portfolio aggregate tier ≠ NORMAL
     """
-    row = _get_symbol_health_row(symbol)
+    with transaction() as conn:
+        row = _get_symbol_health_row(conn, symbol)
     if row is None or row["state"] != "PAUSED":
         return
 
@@ -677,28 +679,21 @@ def apply_transition(
 
 
 def _get_symbol_health_row(
+    conn,
     symbol: str,
-    *,
-    conn=None,
 ) -> dict[str, Any] | None:
     """Return the symbol_health row for `symbol`, or None if absent.
 
     Selected columns: state, state_since, manual_override,
     probation_trades_remaining, probation_started_at, paused_days_at_entry.
-
-    Per Task 8.5: optional `conn` lets a caller (e.g. get_dashboard_state)
-    reuse its outer transaction instead of opening a nested one that would
-    deadlock on BEGIN IMMEDIATE.
     """
-    from db.transaction import _tx_or_use  # local import to avoid module-init churn
-    with _tx_or_use(conn) as conn:
-        row = conn.execute(
-            """SELECT state, state_since, manual_override,
-                      probation_trades_remaining, probation_started_at,
-                      paused_days_at_entry
-               FROM symbol_health WHERE symbol=?""",
-            (symbol,),
-        ).fetchone()
+    row = conn.execute(
+        """SELECT state, state_since, manual_override,
+                  probation_trades_remaining, probation_started_at,
+                  paused_days_at_entry
+           FROM symbol_health WHERE symbol=?""",
+        (symbol,),
+    ).fetchone()
     if row is None:
         return None
     return {
@@ -725,7 +720,8 @@ def reactivate_symbol(
 
     No-ops with a warning when the symbol is not currently PAUSED.
     """
-    row = _get_symbol_health_row(symbol)
+    with transaction() as conn:
+        row = _get_symbol_health_row(conn, symbol)
     current = row["state"] if row else "NORMAL"
 
     if current != "PAUSED":
@@ -830,7 +826,8 @@ def evaluate_and_record(symbol: str, cfg: dict[str, Any], now: datetime | None =
 
     # B5: inject current probation_trades_remaining into metrics so evaluate_state
     # can apply the PROBATION branch. Read from the symbol_health row.
-    row = _get_symbol_health_row(symbol)
+    with transaction() as conn:
+        row = _get_symbol_health_row(conn, symbol)
     current = row["state"] if row else "NORMAL"
     override = bool(row["manual_override"]) if row else False
     if row is not None:
@@ -978,50 +975,39 @@ def health_monitor_loop(cfg_fn, stop_event=None) -> None:
 
 
 def record_portfolio_transition(
+    conn,
     from_tier: str,
     to_tier: str,
     reason: str,
     dd_pct: float = 0.0,
     concurrent: int = 0,
-    *,
-    conn=None,
 ) -> None:
     """B6: Append a portfolio-tier transition row.
 
     Idempotency / dedup is the caller's responsibility — fires only when a
     transition actually happens (from_tier != to_tier).
-
-    Per Task 8.5: optional `conn` for caller-controlled transaction composition.
     """
     if from_tier == to_tier:
         return
-    from db.transaction import _tx_or_use  # local import
-    with _tx_or_use(conn) as conn:
-        conn.execute(
-            """INSERT INTO portfolio_health_events
-               (from_tier, to_tier, reason, dd_pct, concurrent, ts)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (from_tier, to_tier, reason, float(dd_pct), int(concurrent), _now_iso()),
-        )
+    conn.execute(
+        """INSERT INTO portfolio_health_events
+           (from_tier, to_tier, reason, dd_pct, concurrent, ts)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (from_tier, to_tier, reason, float(dd_pct), int(concurrent), _now_iso()),
+    )
 
 
 def recent_portfolio_transitions(
+    conn,
     limit: int = 5,
-    *,
-    conn=None,
 ) -> list[dict[str, Any]]:
-    """B6: Last N portfolio-tier transitions, newest first.
-
-    Per Task 8.5: optional `conn` for caller-controlled transaction composition.
-    """
-    from db.transaction import _tx_or_use  # local import
-    with _tx_or_use(conn) as conn:
-        rows = conn.execute(
-            """SELECT from_tier, to_tier, reason, dd_pct, concurrent, ts
-               FROM portfolio_health_events
-               ORDER BY ts DESC LIMIT ?""",
-            (limit,),
-        ).fetchall()
+    """B6: Last N portfolio-tier transitions, newest first."""
+    rows = conn.execute(
+        """SELECT from_tier, to_tier, reason, dd_pct, concurrent, ts
+           FROM portfolio_health_events
+           ORDER BY ts DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
     return [
         {
             "from_tier": r[0], "to_tier": r[1], "reason": r[2],
@@ -1060,7 +1046,7 @@ def get_dashboard_state(
     # serializes against any concurrent capital write.
     with transaction() as conn:
         from db.capital import db_get_capital
-        capital = db_get_capital(tenant_id, con=conn)
+        capital = db_get_capital(conn, tenant_id)
         # Build symbol list: union of DEFAULT_SYMBOLS + any DB rows. This way
         # the dashboard always shows the curated 10 (as NORMAL placeholders if
         # not yet evaluated) AND any historical/legacy rows in symbol_health.
@@ -1079,7 +1065,7 @@ def get_dashboard_state(
         # Symbols
         symbols_out: list[dict[str, Any]] = []
         for sym in symbols_iter:
-            row = _get_symbol_health_row(sym, conn=conn)  # Task 8.5: share outer tx
+            row = _get_symbol_health_row(conn, sym)  # Task 8.5: share outer tx
             if row is None:
                 # No row → NORMAL placeholder, empty metrics
                 state = "NORMAL"
@@ -1177,7 +1163,7 @@ def get_dashboard_state(
                 from strategy.kill_switch_v2_shadow import (
                     _load_open_positions, _snapshot_prices,
                 )
-                open_positions = _load_open_positions(tenant_id=tenant_id, conn=conn)
+                open_positions = _load_open_positions(conn, tenant_id=tenant_id)
                 prices = _snapshot_prices()
                 open_mtm = 0.0
                 for pos in open_positions:
@@ -1247,7 +1233,7 @@ def get_dashboard_state(
             "peak_equity": peak_equity,
             "current_equity": current_equity,
             "concurrent_failures": int(n_failures),
-            "recent_transitions": recent_portfolio_transitions(limit=5, conn=conn),
+            "recent_transitions": recent_portfolio_transitions(conn, limit=5),
         }
 
         # Alerts (24h window) — append portfolio_dd item if non-NORMAL

@@ -96,7 +96,7 @@ from db.schema import init_db  # used in lifespan() at line 67; also btc_api.ini
 # get_latest_signal, get_scans, save_scan: called as btc_api.<name> in test_api.py
 from db.signals import get_latest_scan, get_latest_signal, get_scans, get_signals_summary, save_scan  # noqa: F401
 # db_*: called as btc_api.db_* in test_api.py (position CRUD, lines 827–1088)
-from db.positions import db_close_position, db_create_position, db_get_positions, db_update_position  # noqa: F401
+from db.positions import db_create_position, db_get_positions, db_update_position  # noqa: F401
 from notifier import notify, SystemEvent  # used directly at line 171
 from scanner.runtime import (
     _scanner_state, execute_scan_for_symbol, check_pending_signal_outcomes,
@@ -127,8 +127,9 @@ def _bootstrap_first_user() -> None:
     skip this entire function.
     """
     # Already done — the most common case after first boot.
-    if has_any_user() or is_setup_completed():
-        return
+    with transaction() as con:
+        if has_any_user(con) or is_setup_completed(con):
+            return
 
     init_email = os.environ.get("AUTH_INITIAL_ADMIN_EMAIL", "").strip()
     init_pwd = os.environ.get("AUTH_INITIAL_ADMIN_PASSWORD", "")
@@ -161,7 +162,7 @@ def _bootstrap_first_user() -> None:
                 (init_email.lower(), pwd_hash, now, now),
             )
             uid = int(cur.lastrowid or 0)
-        mark_setup_completed(ip=None, method="env_vars")
+            mark_setup_completed(con, ip=None, method="env_vars")
         log_auth_event(
             event_type="initial_setup_completed",
             success=True,
@@ -241,8 +242,9 @@ async def lifespan(app: FastAPI):
 
     log.info("Initializing DB schema…")
     init_db()
-    init_auth_db()
-    init_system_state()
+    with transaction() as con:
+        init_auth_db(con)
+        init_system_state(con)
 
     # First-time setup gate. Picks one of three paths (env / cli / web)
     # or no-ops if a user already exists.
@@ -422,7 +424,8 @@ def list_symbols():
     """Retorna el último escaneo de cada símbolo, ordenado por señal y score."""
     import json as _json  # noqa: PLC0415 — local import keeps the module-level surface unchanged
     symbols = _scanner_state.get("symbols_active") or get_active_symbols()
-    rows    = get_signals_summary()
+    with transaction() as con:
+        rows    = get_signals_summary(con)
     by_sym  = {r["symbol"]: r for r in rows}
     result  = []
     for sym in symbols:
@@ -454,7 +457,8 @@ def list_symbols():
 @app.get("/status", summary="Estado detallado del scanner",
          dependencies=[Depends(verify_api_key)])
 def status():
-    latest = get_latest_scan()
+    with transaction() as con:
+        latest = get_latest_scan(con)
     return {
         "scanner_state": _scanner_state,
         "ultimo_escaneo": {

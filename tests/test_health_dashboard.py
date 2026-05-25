@@ -217,10 +217,12 @@ def test_init_db_creates_portfolio_health_events_table(tmp_db):
 def test_record_portfolio_transition_inserts_row(tmp_db):
     import btc_api
     from health import record_portfolio_transition
-    record_portfolio_transition(
-        from_tier="NORMAL", to_tier="WARNED",
-        reason="3_concurrent_failures", dd_pct=-0.02, concurrent=3,
-    )
+    with transaction() as conn:
+        record_portfolio_transition(
+            conn,
+            from_tier="NORMAL", to_tier="WARNED",
+            reason="3_concurrent_failures", dd_pct=-0.02, concurrent=3,
+        )
     with transaction() as conn:
         row = conn.execute(
             """SELECT from_tier, to_tier, reason, dd_pct, concurrent
@@ -237,13 +239,16 @@ def test_recent_portfolio_transitions_returns_last_5(tmp_db):
     """Helper to fetch last 5 transitions for the dashboard panel."""
     import btc_api
     from health import record_portfolio_transition, recent_portfolio_transitions
-    for i in range(7):
-        record_portfolio_transition(
-            from_tier="NORMAL" if i % 2 else "WARNED",
-            to_tier="WARNED" if i % 2 else "NORMAL",
-            reason=f"reason_{i}", dd_pct=0.0, concurrent=i,
-        )
-    transitions = recent_portfolio_transitions(limit=5)
+    with transaction() as conn:
+        for i in range(7):
+            record_portfolio_transition(
+                conn,
+                from_tier="NORMAL" if i % 2 else "WARNED",
+                to_tier="WARNED" if i % 2 else "NORMAL",
+                reason=f"reason_{i}", dd_pct=0.0, concurrent=i,
+            )
+    with transaction() as conn:
+        transitions = recent_portfolio_transitions(conn, limit=5)
     assert len(transitions) == 5
     # Newest first
     assert transitions[0]["reason"] == "reason_6"
@@ -378,7 +383,8 @@ def test_get_health_dashboard_uses_tenant_capital_when_present(client):
     """
     from db.capital import db_upsert_capital
     # tenant_id=1 matches the override in the client fixture above.
-    db_upsert_capital(1, balance=10_000.0, peak_balance=12_000.0)
+    with transaction() as con:
+        db_upsert_capital(con, 1, balance=10_000.0, peak_balance=12_000.0)
     resp = client.get("/health/dashboard")
     assert resp.status_code == 200
     portfolio = resp.json()["portfolio"]
@@ -416,7 +422,8 @@ def test_get_health_dashboard_no_double_count_on_realized_pnl_history(client):
     pnl_sequence = [200.0, 200.0, -300.0, 200.0, -100.0]
     # Stamp each trade into the capital ledger.
     for pnl in pnl_sequence:
-        apply_pnl_to_capital(1, pnl)
+        with transaction() as _cap_con:
+            apply_pnl_to_capital(_cap_con, 1, pnl)
 
     # Also insert the closed positions so the (now-removed) equity-curve
     # path would see them — if regression returns, the curve would double-
@@ -470,10 +477,12 @@ def test_get_health_dashboard_isolates_tenants(client):
     import btc_api
 
     # Tenant 1 (active in fixture): balance $10K, no closed trades.
-    db_upsert_capital(1, balance=10_000.0, peak_balance=10_000.0)
+    with transaction() as _cap_con:
+        db_upsert_capital(_cap_con, 1, balance=10_000.0, peak_balance=10_000.0)
 
     # Tenant 2 (NOT the request tenant): seed a -$1000 loss → balance $9K, peak $10K.
-    apply_pnl_to_capital(2, -1_000.0)
+    with transaction() as _cap_con:
+        apply_pnl_to_capital(_cap_con, 2, -1_000.0)
     with transaction() as conn:
         # (a) Tenant 2 has a closed losing trade for ETH.
         conn.execute(
@@ -527,12 +536,15 @@ def test_portfolio_tier_change_records_transition(tmp_db, monkeypatch):
     # shadow path. We invoke the helper directly (the integration via
     # kill_switch_v2_shadow is wired in step 4 below).
     from health import record_portfolio_transition
-    record_portfolio_transition("NORMAL", "WARNED", reason="3_concurrent",
-                                 dd_pct=-0.01, concurrent=3)
-    record_portfolio_transition("WARNED", "REDUCED", reason="dd_threshold",
-                                 dd_pct=-0.04, concurrent=3)
+    with transaction() as conn:
+        record_portfolio_transition(conn, "NORMAL", "WARNED", reason="3_concurrent",
+                                     dd_pct=-0.01, concurrent=3)
+    with transaction() as conn:
+        record_portfolio_transition(conn, "WARNED", "REDUCED", reason="dd_threshold",
+                                     dd_pct=-0.04, concurrent=3)
 
-    transitions = recent_portfolio_transitions(limit=5)
+    with transaction() as conn:
+        transitions = recent_portfolio_transitions(conn, limit=5)
     assert len(transitions) == 2
     assert transitions[0]["to_tier"] == "REDUCED"
     assert transitions[1]["to_tier"] == "WARNED"

@@ -32,6 +32,34 @@ def initialized_db(tmp_path, monkeypatch):
     yield db_path
 
 
+def _tx_create_position(data: dict, tenant_id=None):
+    from db.positions import db_create_position
+    from db.transaction import transaction
+    with transaction() as con:
+        return db_create_position(con, data, tenant_id=tenant_id)
+
+
+def _tx_get_positions(status=None, tenant_id=None):
+    from db.positions import db_get_positions
+    from db.transaction import transaction
+    with transaction() as con:
+        return db_get_positions(con, status=status, tenant_id=tenant_id)
+
+
+def _tx_update_position(pos_id: int, data: dict, tenant_id=None):
+    from db.positions import db_update_position
+    from db.transaction import transaction
+    with transaction() as con:
+        return db_update_position(con, pos_id, data, tenant_id=tenant_id)
+
+
+def _tx_last_exit_ts(symbol: str, tenant_id=None):
+    from db.positions import db_last_exit_ts
+    from db.transaction import transaction
+    with transaction() as con:
+        return db_last_exit_ts(con, symbol, tenant_id=tenant_id)
+
+
 def _make_user(user_id: int, role: str = "admin"):
     """Build a minimal User dataclass instance for dependency tests."""
     from auth.models import User
@@ -70,7 +98,7 @@ class TestGetCurrentTenantId:
 class TestDbCreatePosition:
     def test_with_tenant_id_persists(self, initialized_db):
         from db.positions import db_create_position
-        pos = db_create_position(
+        pos = _tx_create_position(
             {"symbol": "BTCUSDT", "entry_price": 80000, "size_usd": 500},
             tenant_id=42,
         )
@@ -79,7 +107,7 @@ class TestDbCreatePosition:
     def test_without_tenant_id_is_null(self, initialized_db):
         """Legacy callers (no tenant_id) insert NULL — preserves pre-multi-tenant behavior."""
         from db.positions import db_create_position
-        pos = db_create_position(
+        pos = _tx_create_position(
             {"symbol": "BTCUSDT", "entry_price": 80000, "size_usd": 500},
         )
         assert pos["tenant_id"] is None
@@ -93,12 +121,12 @@ class TestDbCreatePosition:
 class TestDbGetPositions:
     def test_filters_by_tenant_id(self, initialized_db):
         from db.positions import db_create_position, db_get_positions
-        db_create_position({"symbol": "BTC", "entry_price": 80000}, tenant_id=1)
-        db_create_position({"symbol": "ETH", "entry_price": 2300}, tenant_id=2)
-        db_create_position({"symbol": "RUNE", "entry_price": 0.5}, tenant_id=1)
+        _tx_create_position({"symbol": "BTC", "entry_price": 80000}, tenant_id=1)
+        _tx_create_position({"symbol": "ETH", "entry_price": 2300}, tenant_id=2)
+        _tx_create_position({"symbol": "RUNE", "entry_price": 0.5}, tenant_id=1)
 
-        user1 = db_get_positions(tenant_id=1)
-        user2 = db_get_positions(tenant_id=2)
+        user1 = _tx_get_positions(tenant_id=1)
+        user2 = _tx_get_positions(tenant_id=2)
 
         assert len(user1) == 2
         assert {p["symbol"] for p in user1} == {"BTC", "RUNE"}
@@ -108,77 +136,88 @@ class TestDbGetPositions:
     def test_legacy_no_tenant_returns_all(self, initialized_db):
         """When tenant_id=None (legacy/internal), returns all rows including NULL."""
         from db.positions import db_create_position, db_get_positions
-        db_create_position({"symbol": "BTC", "entry_price": 80000}, tenant_id=1)
-        db_create_position({"symbol": "ETH", "entry_price": 2300})  # NULL
+        _tx_create_position({"symbol": "BTC", "entry_price": 80000}, tenant_id=1)
+        _tx_create_position({"symbol": "ETH", "entry_price": 2300})  # NULL
 
-        all_positions = db_get_positions()
+        all_positions = _tx_get_positions()
         assert len(all_positions) == 2
 
     def test_status_and_tenant_combined(self, initialized_db):
-        from db.positions import db_create_position, db_close_position, db_get_positions
-        db_create_position({"symbol": "BTC", "entry_price": 80000, "size_usd": 500}, tenant_id=1)
-        db_create_position({"symbol": "ETH", "entry_price": 2300, "size_usd": 500}, tenant_id=1)
+        from db.positions import db_create_position, db_get_positions
+        from operators.position_closure import PositionClosure
+        _tx_create_position({"symbol": "BTC", "entry_price": 80000, "size_usd": 500}, tenant_id=1)
+        _tx_create_position({"symbol": "ETH", "entry_price": 2300, "size_usd": 500}, tenant_id=1)
         # Close one for user 1
-        all_pos = db_get_positions(tenant_id=1)
+        all_pos = _tx_get_positions(tenant_id=1)
         first_id = all_pos[0]["id"]
-        db_close_position(first_id, 81000, "MANUAL", tenant_id=1)
+        with PositionClosure(first_id, 81000, "MANUAL", mode="USER", caller_tenant_id=1) as c:
+            c.execute()
 
-        open_for_1 = db_get_positions(status="open", tenant_id=1)
-        closed_for_1 = db_get_positions(status="closed", tenant_id=1)
+        open_for_1 = _tx_get_positions(status="open", tenant_id=1)
+        closed_for_1 = _tx_get_positions(status="closed", tenant_id=1)
         assert len(open_for_1) == 1
         assert len(closed_for_1) == 1
 
     def test_pre_backfill_data_invisible(self, initialized_db):
         """Existing positions with tenant_id=NULL must NOT show up when filtering by tenant."""
         from db.positions import db_create_position, db_get_positions
-        db_create_position({"symbol": "BTC", "entry_price": 80000})  # NULL tenant
-        db_create_position({"symbol": "ETH", "entry_price": 2300}, tenant_id=1)
+        _tx_create_position({"symbol": "BTC", "entry_price": 80000})  # NULL tenant
+        _tx_create_position({"symbol": "ETH", "entry_price": 2300}, tenant_id=1)
 
-        user1 = db_get_positions(tenant_id=1)
+        user1 = _tx_get_positions(tenant_id=1)
         assert len(user1) == 1
         assert user1[0]["symbol"] == "ETH"
 
 
 # ---------------------------------------------------------------------------
-# db_close_position — ownership enforced
+# PositionClosure — ownership enforced (migrated from db_close_position, Task 7)
 # ---------------------------------------------------------------------------
 
 
 class TestDbClosePosition:
     def test_owner_can_close(self, initialized_db):
-        from db.positions import db_create_position, db_close_position
-        pos = db_create_position(
+        from db.positions import db_create_position
+        from operators.position_closure import PositionClosure
+        pos = _tx_create_position(
             {"symbol": "BTC", "entry_price": 80000, "size_usd": 500},
             tenant_id=1,
         )
-        closed = db_close_position(pos["id"], 81000, "MANUAL", tenant_id=1)
-        assert closed is not None
-        assert closed["status"] == "closed"
+        with PositionClosure(pos["id"], 81000, "MANUAL", mode="USER", caller_tenant_id=1) as c:
+            outcome = c.execute()
+        assert outcome.status == "closed"
+        assert outcome.position is not None
+        assert outcome.position["status"] == "closed"
 
     def test_non_owner_returns_none(self, initialized_db):
-        """IDOR protection: user 2 tries to close user 1's position → None."""
-        from db.positions import db_create_position, db_close_position
-        pos = db_create_position(
+        """IDOR protection: user 2 tries to close user 1's position → not_found."""
+        from db.positions import db_create_position
+        from operators.position_closure import PositionClosure
+        pos = _tx_create_position(
             {"symbol": "BTC", "entry_price": 80000, "size_usd": 500},
             tenant_id=1,
         )
-        closed = db_close_position(pos["id"], 81000, "MANUAL", tenant_id=2)
-        assert closed is None
+        with PositionClosure(pos["id"], 81000, "MANUAL", mode="USER", caller_tenant_id=2) as c:
+            outcome = c.execute()
+        assert outcome.status == "not_found"
+        assert outcome.position is None
 
         # Verify position still open
         from db.positions import db_get_positions
-        all_pos = db_get_positions(tenant_id=1)
+        all_pos = _tx_get_positions(tenant_id=1)
         assert all_pos[0]["status"] == "open"
 
     def test_legacy_no_tenant_works(self, initialized_db):
-        """tenant_id=None preserves legacy: any position closeable."""
-        from db.positions import db_create_position, db_close_position
-        pos = db_create_position(
+        """SYSTEM mode (no tenant_id) can close any position."""
+        from db.positions import db_create_position
+        from operators.position_closure import PositionClosure
+        pos = _tx_create_position(
             {"symbol": "BTC", "entry_price": 80000, "size_usd": 500},
             tenant_id=1,
         )
-        closed = db_close_position(pos["id"], 81000, "MANUAL")  # no tenant_id
-        assert closed is not None
+        with PositionClosure(pos["id"], 81000, "MANUAL", mode="SYSTEM") as c:
+            outcome = c.execute()
+        assert outcome.status == "closed"
+        assert outcome.position is not None
 
 
 # ---------------------------------------------------------------------------
@@ -189,27 +228,27 @@ class TestDbClosePosition:
 class TestDbUpdatePosition:
     def test_owner_can_update(self, initialized_db):
         from db.positions import db_create_position, db_update_position
-        pos = db_create_position(
+        pos = _tx_create_position(
             {"symbol": "BTC", "entry_price": 80000},
             tenant_id=1,
         )
-        updated = db_update_position(pos["id"], {"sl_price": 79000}, tenant_id=1)
+        updated = _tx_update_position(pos["id"], {"sl_price": 79000}, tenant_id=1)
         assert updated is not None
         assert updated["sl_price"] == 79000
 
     def test_non_owner_returns_none(self, initialized_db):
         """IDOR: user 2 can't update user 1's position."""
         from db.positions import db_create_position, db_update_position
-        pos = db_create_position(
+        pos = _tx_create_position(
             {"symbol": "BTC", "entry_price": 80000},
             tenant_id=1,
         )
-        updated = db_update_position(pos["id"], {"sl_price": 79000}, tenant_id=2)
+        updated = _tx_update_position(pos["id"], {"sl_price": 79000}, tenant_id=2)
         assert updated is None
 
         # Verify SL not changed
         from db.positions import db_get_positions
-        all_pos = db_get_positions(tenant_id=1)
+        all_pos = _tx_get_positions(tenant_id=1)
         assert all_pos[0]["sl_price"] is None
 
 
@@ -220,25 +259,27 @@ class TestDbUpdatePosition:
 
 class TestDbLastExitTs:
     def test_filter_by_tenant(self, initialized_db):
-        from db.positions import db_create_position, db_close_position, db_last_exit_ts
+        from db.positions import db_create_position, db_last_exit_ts
+        from operators.position_closure import PositionClosure
         # User 1 closes a BTC position
-        pos1 = db_create_position(
+        pos1 = _tx_create_position(
             {"symbol": "BTC", "entry_price": 80000, "size_usd": 500}, tenant_id=1,
         )
-        db_close_position(pos1["id"], 81000, "MANUAL", tenant_id=1)
+        with PositionClosure(pos1["id"], 81000, "MANUAL", mode="USER", caller_tenant_id=1) as c:
+            c.execute()
         # User 2 also has a BTC trade, but never closed
-        db_create_position(
+        _tx_create_position(
             {"symbol": "BTC", "entry_price": 79000, "size_usd": 500}, tenant_id=2,
         )
 
         # User 1 sees their own exit
-        last_user1 = db_last_exit_ts("BTC", tenant_id=1)
+        last_user1 = _tx_last_exit_ts("BTC", tenant_id=1)
         assert last_user1 is not None
         # User 2 has no exit
-        last_user2 = db_last_exit_ts("BTC", tenant_id=2)
+        last_user2 = _tx_last_exit_ts("BTC", tenant_id=2)
         assert last_user2 is None
         # Legacy (no tenant) sees user 1's exit (most recent)
-        last_legacy = db_last_exit_ts("BTC")
+        last_legacy = _tx_last_exit_ts("BTC")
         assert last_legacy is not None
 
 
@@ -278,7 +319,7 @@ class TestTamperingResistance:
             "symbol": "BTC", "entry_price": 80000, "size_usd": 500,
             "tenant_id": 999,  # attacker tries to set this
         }
-        pos = db_create_position(malicious_body, tenant_id=1)
+        pos = _tx_create_position(malicious_body, tenant_id=1)
         # tenant_id reflects the explicit arg (1), NOT the body value (999)
         assert pos["tenant_id"] == 1
 
@@ -295,17 +336,19 @@ class TestBackfillRestoresVisibility:
         from db.schema import backfill_tenant
 
         # Pre-migration: legacy create (no tenant_id)
-        db_create_position({"symbol": "BTC", "entry_price": 80000})
+        _tx_create_position({"symbol": "BTC", "entry_price": 80000})
 
         # User 1 queries, sees nothing
-        assert db_get_positions(tenant_id=1) == []
+        assert _tx_get_positions(tenant_id=1) == []
 
         # Run backfill assigning everything to user 1
-        affected = backfill_tenant(user_id=1)
+        from db.transaction import transaction
+        with transaction() as con:
+            affected = backfill_tenant(con, user_id=1)
         assert affected["positions"] == 1
 
         # Now user 1 sees the row
-        results = db_get_positions(tenant_id=1)
+        results = _tx_get_positions(tenant_id=1)
         assert len(results) == 1
         assert results[0]["symbol"] == "BTC"
 
@@ -318,12 +361,15 @@ class TestBackfillRestoresVisibility:
 class TestNotifierStorageTenantEnforcement:
     def test_record_delivery_persists_tenant_id(self, initialized_db):
         from notifier._storage import record_delivery
+        from db.transaction import transaction
         import sqlite3
-        nid = record_delivery(
-            event_type="signal", event_key="signal:BTC", priority="info",
-            payload={"symbol": "BTC"}, channels_sent=["telegram"],
-            delivery_status="ok", tenant_id=42,
-        )
+        with transaction() as con:
+            nid = record_delivery(
+                con,
+                event_type="signal", event_key="signal:BTC", priority="info",
+                payload={"symbol": "BTC"}, channels_sent=["telegram"],
+                delivery_status="ok", tenant_id=42,
+            )
         con = sqlite3.connect(initialized_db)
         row = con.execute(
             "SELECT tenant_id FROM notifications_sent WHERE id=?", (nid,)
@@ -333,18 +379,23 @@ class TestNotifierStorageTenantEnforcement:
 
     def test_list_unread_filters_by_tenant(self, initialized_db):
         from notifier._storage import list_unread, record_delivery
-        record_delivery(
-            event_type="signal", event_key="signal:BTC", priority="info",
-            payload={}, channels_sent=["telegram"], delivery_status="ok",
-            tenant_id=1,
-        )
-        record_delivery(
-            event_type="signal", event_key="signal:ETH", priority="info",
-            payload={}, channels_sent=["telegram"], delivery_status="ok",
-            tenant_id=2,
-        )
-        user1_notifs = list_unread(tenant_id=1)
-        user2_notifs = list_unread(tenant_id=2)
+        from db.transaction import transaction
+        with transaction() as con:
+            record_delivery(
+                con,
+                event_type="signal", event_key="signal:BTC", priority="info",
+                payload={}, channels_sent=["telegram"], delivery_status="ok",
+                tenant_id=1,
+            )
+            record_delivery(
+                con,
+                event_type="signal", event_key="signal:ETH", priority="info",
+                payload={}, channels_sent=["telegram"], delivery_status="ok",
+                tenant_id=2,
+            )
+        with transaction() as con:
+            user1_notifs = list_unread(con, tenant_id=1)
+            user2_notifs = list_unread(con, tenant_id=2)
         assert len(user1_notifs) == 1
         assert user1_notifs[0]["event_key"] == "signal:BTC"
         assert len(user2_notifs) == 1
@@ -353,64 +404,84 @@ class TestNotifierStorageTenantEnforcement:
     def test_mark_read_idor_returns_false(self, initialized_db):
         """User 2 cannot mark user 1's notification as read."""
         from notifier._storage import mark_read, record_delivery, list_unread
-        nid = record_delivery(
-            event_type="signal", event_key="signal:BTC", priority="info",
-            payload={}, channels_sent=["telegram"], delivery_status="ok",
-            tenant_id=1,
-        )
+        from db.transaction import transaction
+        with transaction() as con:
+            nid = record_delivery(
+                con,
+                event_type="signal", event_key="signal:BTC", priority="info",
+                payload={}, channels_sent=["telegram"], delivery_status="ok",
+                tenant_id=1,
+            )
         # User 2 tries to mark user 1's notification
-        ok = mark_read(nid, tenant_id=2)
+        with transaction() as con:
+            ok = mark_read(con, nid, tenant_id=2)
         assert ok is False
         # Verify notif is still unread for user 1
-        user1_unread = list_unread(tenant_id=1)
+        with transaction() as con:
+            user1_unread = list_unread(con, tenant_id=1)
         assert len(user1_unread) == 1
 
     def test_mark_read_owner_succeeds(self, initialized_db):
         from notifier._storage import mark_read, record_delivery
-        nid = record_delivery(
-            event_type="signal", event_key="signal:BTC", priority="info",
-            payload={}, channels_sent=["telegram"], delivery_status="ok",
-            tenant_id=1,
-        )
-        ok = mark_read(nid, tenant_id=1)
+        from db.transaction import transaction
+        with transaction() as con:
+            nid = record_delivery(
+                con,
+                event_type="signal", event_key="signal:BTC", priority="info",
+                payload={}, channels_sent=["telegram"], delivery_status="ok",
+                tenant_id=1,
+            )
+        with transaction() as con:
+            ok = mark_read(con, nid, tenant_id=1)
         assert ok is True
 
     def test_mark_all_read_scope_limited_to_tenant(self, initialized_db):
         """mark_all_read affects only current tenant's notifications."""
         from notifier._storage import mark_all_read, record_delivery, list_unread
+        from db.transaction import transaction
         # 2 unread for user 1
-        for i in range(2):
+        with transaction() as con:
+            for i in range(2):
+                record_delivery(
+                    con,
+                    event_type="signal", event_key=f"signal:U1_{i}", priority="info",
+                    payload={}, channels_sent=["telegram"], delivery_status="ok",
+                    tenant_id=1,
+                )
+            # 1 unread for user 2
             record_delivery(
-                event_type="signal", event_key=f"signal:U1_{i}", priority="info",
+                con,
+                event_type="signal", event_key="signal:U2", priority="info",
                 payload={}, channels_sent=["telegram"], delivery_status="ok",
-                tenant_id=1,
+                tenant_id=2,
             )
-        # 1 unread for user 2
-        record_delivery(
-            event_type="signal", event_key="signal:U2", priority="info",
-            payload={}, channels_sent=["telegram"], delivery_status="ok",
-            tenant_id=2,
-        )
 
-        marked_for_user1 = mark_all_read(tenant_id=1)
+        with transaction() as con:
+            marked_for_user1 = mark_all_read(con, tenant_id=1)
         assert marked_for_user1 == 2
 
         # User 2's notification still unread
-        user2_unread = list_unread(tenant_id=2)
+        with transaction() as con:
+            user2_unread = list_unread(con, tenant_id=2)
         assert len(user2_unread) == 1
         assert user2_unread[0]["event_key"] == "signal:U2"
 
     def test_legacy_null_tenant_invisible_to_filter(self, initialized_db):
         """Notifications without tenant_id (system broadcasts) invisible to per-user filter."""
         from notifier._storage import list_unread, record_delivery
-        record_delivery(
-            event_type="signal", event_key="system:broadcast", priority="info",
-            payload={}, channels_sent=["telegram"], delivery_status="ok",
-            # No tenant_id → NULL
-        )
+        from db.transaction import transaction
+        with transaction() as con:
+            record_delivery(
+                con,
+                event_type="signal", event_key="system:broadcast", priority="info",
+                payload={}, channels_sent=["telegram"], delivery_status="ok",
+                # No tenant_id → NULL
+            )
         # User 1 sees nothing (strict filter)
-        user1_unread = list_unread(tenant_id=1)
+        with transaction() as con:
+            user1_unread = list_unread(con, tenant_id=1)
         assert user1_unread == []
         # Legacy unfiltered listing sees it
-        all_unread = list_unread()
+        with transaction() as con:
+            all_unread = list_unread(con)
         assert len(all_unread) == 1

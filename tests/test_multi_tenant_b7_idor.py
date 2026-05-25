@@ -3,9 +3,11 @@
 Pre-reg: docs/superpowers/specs/es/2026-05-16-multi-tenant-threat-model.md
 
 Strategy:
-- TestClient operates as synthetic test user (id=0 per auth.middleware._synthetic_test_user)
+- TestClient operates as synthetic test user (id=99 per auth.middleware._synthetic_test_user;
+  updated from 0 → 99 by #446 Task 6 fix — PositionClosure USER mode requires
+  caller_tenant_id > 0 to match production semantics)
 - Cross-tenant data is seeded directly via DB (user_id=999 = "other user")
-- Verify TestClient (acting as user 0) cannot see / mutate user 999's data
+- Verify TestClient (acting as user 99) cannot see / mutate user 999's data
 - Verify tampering vectors (query/header/body manipulation) are silently dropped
 
 Coverage:
@@ -25,7 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 
-OTHER_USER_ID = 999  # synthetic "other user" — not the TestClient's identity (0)
+OTHER_USER_ID = 999  # synthetic "other user" — not the TestClient's identity (99)
 
 
 @pytest.fixture
@@ -51,20 +53,26 @@ def client(tmp_path, monkeypatch):
 def _seed_other_user_position(symbol: str = "BTCUSDT") -> int:
     """Insert position owned by OTHER_USER_ID. Returns pos_id."""
     from db.positions import db_create_position
-    pos = db_create_position(
-        {"symbol": symbol, "entry_price": 80000, "size_usd": 500, "direction": "LONG"},
-        tenant_id=OTHER_USER_ID,
-    )
+    from db.transaction import transaction
+    with transaction() as con:
+        pos = db_create_position(
+            con,
+            {"symbol": symbol, "entry_price": 80000, "size_usd": 500, "direction": "LONG"},
+            tenant_id=OTHER_USER_ID,
+        )
     return pos["id"]
 
 
 def _seed_own_position(symbol: str = "ETHUSDT") -> int:
-    """Insert position owned by TestClient (user_id=0)."""
+    """Insert position owned by TestClient (user_id=99)."""
     from db.positions import db_create_position
-    pos = db_create_position(
-        {"symbol": symbol, "entry_price": 2300, "size_usd": 300, "direction": "LONG"},
-        tenant_id=0,
-    )
+    from db.transaction import transaction
+    with transaction() as con:
+        pos = db_create_position(
+            con,
+            {"symbol": symbol, "entry_price": 2300, "size_usd": 300, "direction": "LONG"},
+            tenant_id=99,
+        )
     return pos["id"]
 
 
@@ -137,10 +145,12 @@ class TestPositionsIDOR:
             headers={"X-API-Key": "test-key"},
         )
         assert resp.status_code == 200
-        # Verify the position was created under user 0, not 999
+        # Verify the position was created under user 99, not 999
         from db.positions import db_get_positions
-        own_positions = db_get_positions(tenant_id=0)
-        other_positions = db_get_positions(tenant_id=OTHER_USER_ID)
+        from db.transaction import transaction
+        with transaction() as con:
+            own_positions = db_get_positions(con, tenant_id=99)
+            other_positions = db_get_positions(con, tenant_id=OTHER_USER_ID)
         assert len(own_positions) == 1
         assert len(other_positions) == 0
 
@@ -166,15 +176,18 @@ class TestPositionsIDOR:
 class TestNotificationsIDOR:
     def _seed_notif(self, tenant_id: int, event_key: str = "test:1"):
         from notifier._storage import record_delivery
-        return record_delivery(
-            event_type="signal", event_key=event_key, priority="info",
-            payload={"x": 1}, channels_sent=["telegram"], delivery_status="ok",
-            tenant_id=tenant_id,
-        )
+        from db.transaction import transaction
+        with transaction() as con:
+            return record_delivery(
+                con,
+                event_type="signal", event_key=event_key, priority="info",
+                payload={"x": 1}, channels_sent=["telegram"], delivery_status="ok",
+                tenant_id=tenant_id,
+            )
 
     def test_list_excludes_other_user_notifications(self, client):
         self._seed_notif(OTHER_USER_ID, "other:1")
-        self._seed_notif(0, "own:1")
+        self._seed_notif(99, "own:1")
         # GET /notifications uses verify_api_key — pass header
         resp = client.get("/notifications", headers={"X-API-Key": "test-key"})
         assert resp.status_code == 200
@@ -194,7 +207,7 @@ class TestNotificationsIDOR:
         # Seed unread for both
         self._seed_notif(OTHER_USER_ID, "other:1")
         self._seed_notif(OTHER_USER_ID, "other:2")
-        own_id = self._seed_notif(0, "own:1")
+        own_id = self._seed_notif(99, "own:1")
 
         resp = client.post(
             "/notifications/read-all",
@@ -205,7 +218,9 @@ class TestNotificationsIDOR:
 
         # Verify other user's notifications still unread
         from notifier._storage import list_unread
-        other_still_unread = list_unread(tenant_id=OTHER_USER_ID)
+        from db.transaction import transaction
+        with transaction() as con:
+            other_still_unread = list_unread(con, tenant_id=OTHER_USER_ID)
         assert len(other_still_unread) == 2
 
 
@@ -234,7 +249,7 @@ class TestSignalsPerformanceIDOR:
         for i in range(10):
             self._seed_signal_outcome(OTHER_USER_ID, score=5, price_24h_higher=True)
         # Own user has 1 losing outcome
-        self._seed_signal_outcome(0, score=3, price_24h_higher=False)
+        self._seed_signal_outcome(99, score=3, price_24h_higher=False)
 
         resp = client.get("/signals/performance")
         assert resp.status_code == 200
@@ -252,13 +267,17 @@ class TestCapitalIDOR:
     def test_get_other_user_capital_invisible(self, client):
         """GET /capital with other user's data seeded must 404 for current user."""
         from db.capital import db_upsert_capital
-        db_upsert_capital(tenant_id=OTHER_USER_ID, balance=999999.0)
+        from db.transaction import transaction
+        with transaction() as con:
+            db_upsert_capital(con, OTHER_USER_ID, balance=999999.0)
         resp = client.get("/capital")
-        assert resp.status_code == 404  # current user (id=0) has no capital
+        assert resp.status_code == 404  # current user (id=99) has no capital
 
     def test_put_does_not_overwrite_other_user_capital(self, client):
         from db.capital import db_upsert_capital, db_get_capital
-        db_upsert_capital(tenant_id=OTHER_USER_ID, balance=999999.0)
+        from db.transaction import transaction
+        with transaction() as con:
+            db_upsert_capital(con, OTHER_USER_ID, balance=999999.0)
         # Current user PUTs their own
         resp = client.put(
             "/capital",
@@ -267,7 +286,8 @@ class TestCapitalIDOR:
         )
         assert resp.status_code == 200
         # Other user's capital unchanged
-        other = db_get_capital(OTHER_USER_ID)
+        with transaction() as con:
+            other = db_get_capital(con, OTHER_USER_ID)
         assert other["balance"] == 999999.0
 
 
@@ -279,11 +299,14 @@ class TestCapitalIDOR:
 class TestPreferencesIDOR:
     def test_get_other_user_prefs_invisible(self, client):
         """GET /preferences returns DEFAULTS (not other user's prefs)."""
+        from db.transaction import transaction
         from db.user_preferences import db_upsert_user_preferences
-        db_upsert_user_preferences(
-            tenant_id=OTHER_USER_ID, symbol_filter=["XAUTUSDT"], min_score=8,
-            notify_channels={"telegram_chat_id": "OTHER"},
-        )
+        with transaction() as con:
+            db_upsert_user_preferences(
+                con,
+                tenant_id=OTHER_USER_ID, symbol_filter=["XAUTUSDT"], min_score=8,
+                notify_channels={"telegram_chat_id": "OTHER"},
+            )
         resp = client.get("/preferences")
         assert resp.status_code == 200
         body = resp.json()
@@ -293,8 +316,10 @@ class TestPreferencesIDOR:
         assert body["notify_channels"] is None
 
     def test_put_does_not_overwrite_other_user_prefs(self, client):
+        from db.transaction import transaction
         from db.user_preferences import db_upsert_user_preferences, db_get_user_preferences
-        db_upsert_user_preferences(tenant_id=OTHER_USER_ID, min_score=8)
+        with transaction() as con:
+            db_upsert_user_preferences(con, tenant_id=OTHER_USER_ID, min_score=8)
         # Current user PUTs their own
         resp = client.put(
             "/preferences",
@@ -303,7 +328,8 @@ class TestPreferencesIDOR:
         )
         assert resp.status_code == 200
         # Other user's prefs unchanged
-        other = db_get_user_preferences(OTHER_USER_ID)
+        with transaction() as con:
+            other = db_get_user_preferences(con, OTHER_USER_ID)
         assert other["min_score"] == 8
 
 

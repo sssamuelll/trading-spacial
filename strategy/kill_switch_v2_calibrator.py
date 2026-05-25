@@ -443,7 +443,10 @@ def kill_switch_calibrator_loop(cfg_fn, stop_event=None) -> None:
             # when ANY tenant breaches them, not when the (meaningless) cross-
             # tenant aggregate does.
             from db.capital import db_list_active_tenant_ids
-            tenant_ids = db_list_active_tenant_ids()
+            from db.transaction import transaction as _tx_for_tenants
+            # Task 5 (#446): `db_list_active_tenant_ids` now requires `con`.
+            with _tx_for_tenants() as _tenants_con:
+                tenant_ids = db_list_active_tenant_ids(_tenants_con)
             if tenant_ids:
                 per_tenant_dd = [
                     _compute_current_portfolio_dd(cfg, tenant_id=tid)
@@ -577,14 +580,29 @@ def _compute_current_portfolio_dd(
             _load_closed_trades, _load_open_positions, _snapshot_prices,
         )
         from db.capital import db_get_capital
-        cap_row = db_get_capital(tenant_id, con=conn)
+        # Task 5 (#446): `db_get_capital` now requires `con` positional.
+        # When the caller did not pass `conn`, open a short read-only tx.
+        if conn is not None:
+            cap_row = db_get_capital(conn, tenant_id)
+        else:
+            from db.transaction import transaction as _tx_for_cap
+            with _tx_for_cap() as _cap_con:
+                cap_row = db_get_capital(_cap_con, tenant_id)
         if cap_row and cap_row.get("balance") is not None:
             capital_base = float(cap_row["balance"])
         else:
             capital_base = float(cfg.get("capital_usd", 1000.0))
+        if conn is not None:
+            _closed = _load_closed_trades(conn, tenant_id=tenant_id)
+            _opens = _load_open_positions(conn, tenant_id=tenant_id)
+        else:
+            from db.transaction import transaction as _tx_for_loads
+            with _tx_for_loads() as _loads_con:
+                _closed = _load_closed_trades(_loads_con, tenant_id=tenant_id)
+                _opens = _load_open_positions(_loads_con, tenant_id=tenant_id)
         equity_curve = compute_portfolio_equity_curve(
-            closed_trades=_load_closed_trades(tenant_id=tenant_id, conn=conn),
-            open_positions=_load_open_positions(tenant_id=tenant_id, conn=conn),
+            closed_trades=_closed,
+            open_positions=_opens,
             capital_base=capital_base,
             now_price_by_symbol=_snapshot_prices(),
         )

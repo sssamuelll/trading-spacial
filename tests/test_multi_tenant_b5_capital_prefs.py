@@ -51,11 +51,15 @@ def client(tmp_path, monkeypatch):
 class TestCapitalDB:
     def test_get_returns_none_when_missing(self, initialized_db):
         from db.capital import db_get_capital
-        assert db_get_capital(tenant_id=1) is None
+        from db.transaction import transaction
+        with transaction() as con:
+            assert db_get_capital(con, 1) is None
 
     def test_upsert_creates_row(self, initialized_db):
         from db.capital import db_upsert_capital, db_get_capital
-        row = db_upsert_capital(tenant_id=1, balance=10000.0)
+        from db.transaction import transaction
+        with transaction() as con:
+            row = db_upsert_capital(con, 1, balance=10000.0)
         assert row["tenant_id"] == 1
         assert row["balance"] == 10000.0
         # peak_balance defaulted to balance when not provided + row new
@@ -63,35 +67,48 @@ class TestCapitalDB:
         # max_drawdown_pct None for new row
         assert row["max_drawdown_pct"] is None
         # Persists
-        assert db_get_capital(tenant_id=1)["balance"] == 10000.0
+        with transaction() as con:
+            assert db_get_capital(con, 1)["balance"] == 10000.0
 
     def test_upsert_replaces_existing(self, initialized_db):
         from db.capital import db_upsert_capital
-        db_upsert_capital(tenant_id=1, balance=10000.0)
-        updated = db_upsert_capital(tenant_id=1, balance=11000.0, peak_balance=12000.0)
+        from db.transaction import transaction
+        with transaction() as con:
+            db_upsert_capital(con, 1, balance=10000.0)
+        with transaction() as con:
+            updated = db_upsert_capital(con, 1, balance=11000.0, peak_balance=12000.0)
         assert updated["balance"] == 11000.0
         assert updated["peak_balance"] == 12000.0
 
     def test_upsert_preserves_peak_when_omitted(self, initialized_db):
         from db.capital import db_upsert_capital
-        db_upsert_capital(tenant_id=1, balance=10000.0, peak_balance=15000.0)
+        from db.transaction import transaction
+        with transaction() as con:
+            db_upsert_capital(con, 1, balance=10000.0, peak_balance=15000.0)
         # Update balance only, peak should stay
-        updated = db_upsert_capital(tenant_id=1, balance=9500.0)
+        with transaction() as con:
+            updated = db_upsert_capital(con, 1, balance=9500.0)
         assert updated["balance"] == 9500.0
         assert updated["peak_balance"] == 15000.0  # preserved
 
     def test_upsert_preserves_max_drawdown_when_omitted(self, initialized_db):
         from db.capital import db_upsert_capital
-        db_upsert_capital(tenant_id=1, balance=10000.0, max_drawdown_pct=-15.0)
-        updated = db_upsert_capital(tenant_id=1, balance=11000.0)
+        from db.transaction import transaction
+        with transaction() as con:
+            db_upsert_capital(con, 1, balance=10000.0, max_drawdown_pct=-15.0)
+        with transaction() as con:
+            updated = db_upsert_capital(con, 1, balance=11000.0)
         assert updated["max_drawdown_pct"] == -15.0  # preserved
 
     def test_tenant_isolation(self, initialized_db):
         from db.capital import db_upsert_capital, db_get_capital
-        db_upsert_capital(tenant_id=1, balance=10000.0)
-        db_upsert_capital(tenant_id=2, balance=20000.0)
-        assert db_get_capital(tenant_id=1)["balance"] == 10000.0
-        assert db_get_capital(tenant_id=2)["balance"] == 20000.0
+        from db.transaction import transaction
+        with transaction() as con:
+            db_upsert_capital(con, 1, balance=10000.0)
+            db_upsert_capital(con, 2, balance=20000.0)
+        with transaction() as con:
+            assert db_get_capital(con, 1)["balance"] == 10000.0
+            assert db_get_capital(con, 2)["balance"] == 20000.0
 
 
 # ---------------------------------------------------------------------------
@@ -101,12 +118,16 @@ class TestCapitalDB:
 
 class TestUserPreferencesDB:
     def test_get_returns_none_when_missing(self, initialized_db):
+        from db.transaction import transaction
         from db.user_preferences import db_get_user_preferences
-        assert db_get_user_preferences(tenant_id=1) is None
+        with transaction() as con:
+            assert db_get_user_preferences(con, tenant_id=1) is None
 
     def test_upsert_creates_with_defaults(self, initialized_db):
+        from db.transaction import transaction
         from db.user_preferences import db_upsert_user_preferences
-        row = db_upsert_user_preferences(tenant_id=1)
+        with transaction() as con:
+            row = db_upsert_user_preferences(con, tenant_id=1)
         assert row["tenant_id"] == 1
         # min_score defaults to 4 per schema
         assert row["min_score"] == 4
@@ -114,25 +135,31 @@ class TestUserPreferencesDB:
         assert row["notify_channels"] is None
 
     def test_upsert_with_all_fields(self, initialized_db):
+        from db.transaction import transaction
         from db.user_preferences import db_upsert_user_preferences
-        row = db_upsert_user_preferences(
-            tenant_id=1,
-            symbol_filter=["BTCUSDT", "ETHUSDT"],
-            min_score=5,
-            notify_channels={"telegram_chat_id": "12345"},
-        )
+        with transaction() as con:
+            row = db_upsert_user_preferences(
+                con,
+                tenant_id=1,
+                symbol_filter=["BTCUSDT", "ETHUSDT"],
+                min_score=5,
+                notify_channels={"telegram_chat_id": "12345"},
+            )
         assert row["symbol_filter"] == ["BTCUSDT", "ETHUSDT"]
         assert row["min_score"] == 5
         assert row["notify_channels"] == {"telegram_chat_id": "12345"}
 
     def test_upsert_preserves_fields_when_none_passed(self, initialized_db):
+        from db.transaction import transaction
         from db.user_preferences import db_upsert_user_preferences
-        db_upsert_user_preferences(
-            tenant_id=1, symbol_filter=["BTC"], min_score=6,
-            notify_channels={"email": "a@b.c"},
-        )
-        # Update only min_score, others preserved
-        updated = db_upsert_user_preferences(tenant_id=1, min_score=7)
+        with transaction() as con:
+            db_upsert_user_preferences(
+                con,
+                tenant_id=1, symbol_filter=["BTC"], min_score=6,
+                notify_channels={"email": "a@b.c"},
+            )
+            # Update only min_score, others preserved
+            updated = db_upsert_user_preferences(con, tenant_id=1, min_score=7)
         assert updated["min_score"] == 7
         assert updated["symbol_filter"] == ["BTC"]
         assert updated["notify_channels"] == {"email": "a@b.c"}

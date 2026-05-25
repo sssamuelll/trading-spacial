@@ -125,7 +125,9 @@ def run(args: argparse.Namespace) -> int:
     # 2. Pre-snapshot
     pre = _snapshot_counts()
     log.info("Pre-migration row counts:\n%s", _format_snapshot(pre))
-    pre_capital = db_get_capital(args.user_id)
+    # Task 5 (#446): db_get_capital requires `con` positional.
+    with transaction() as con:
+        pre_capital = db_get_capital(con, args.user_id)
     log.info(
         "Pre-migration capital row: %s",
         "EXISTS" if pre_capital else "absent",
@@ -160,19 +162,23 @@ def run(args: argparse.Namespace) -> int:
 
     # 4. Real migration
     log.info("Running backfill_tenant(user_id=%s)…", args.user_id)
-    affected = backfill_tenant(args.user_id)
+    with transaction() as con_bf:
+        affected = backfill_tenant(con_bf, args.user_id)
     log.info(
         "backfill_tenant results: %s",
         ", ".join(f"{t}={n}" for t, n in affected.items()),
     )
 
     log.info("Upserting capital row…")
-    capital_row = db_upsert_capital(
-        args.user_id,
-        balance=args.initial_balance,
-        peak_balance=args.initial_balance,
-        max_drawdown_pct=None,
-    )
+    # Task 5 (#446): db_upsert_capital requires `con` positional.
+    with transaction() as con:
+        capital_row = db_upsert_capital(
+            con,
+            args.user_id,
+            balance=args.initial_balance,
+            peak_balance=args.initial_balance,
+            max_drawdown_pct=None,
+        )
     log.info(
         "Capital row: balance=%s, peak=%s",
         capital_row["balance"], capital_row["peak_balance"],

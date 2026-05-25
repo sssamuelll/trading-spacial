@@ -149,7 +149,9 @@ def _build_e5_cooldown(symbol: str, cfg: dict) -> dict:
 
     try:
         from db.positions import db_last_exit_ts  # noqa: PLC0415
-        last_exit_dt = db_last_exit_ts(symbol)
+        from db.transaction import transaction  # noqa: PLC0415
+        with transaction() as con:
+            last_exit_dt = db_last_exit_ts(con, symbol)
     except Exception as e:  # noqa: BLE001
         # Throttle: one log line per (symbol, exc-type) per process.
         # SQLite Operational/Database errors surface as `error` (real bug
@@ -303,7 +305,11 @@ def scan(symbol: str = None):
         # portfolio MTM + DD are computed against each tenant's own positions.
         # When no tenants are onboarded yet, skip (no portfolios to evaluate).
         from db.capital import db_list_active_tenant_ids
-        for _tid in db_list_active_tenant_ids():
+        from db.transaction import transaction as _tx_for_tenants
+        # Task 5 (#446): `db_list_active_tenant_ids` now requires `con`.
+        with _tx_for_tenants() as _tenants_con:
+            _active_tids = db_list_active_tenant_ids(_tenants_con)
+        for _tid in _active_tids:
             try:
                 emit_shadow_decision(
                     symbol=symbol,

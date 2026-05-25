@@ -330,7 +330,8 @@ def test_11_reset_password_cli_revokes_all_refreshes(tmp_path, monkeypatch):
     from auth.tokens import _hash_refresh, revoke_all_for_user
 
     init_db()
-    init_auth_db()
+    with transaction() as con:
+        init_auth_db(con)
     now = datetime.now(timezone.utc).isoformat()
     with transaction() as con:
         cur = con.execute(
@@ -356,7 +357,8 @@ def test_11_reset_password_cli_revokes_all_refreshes(tmp_path, monkeypatch):
             "WHERE id = ?",
             (new_hash, datetime.now(timezone.utc).isoformat(), uid),
         )
-    revoked = revoke_all_for_user(uid)
+    with transaction() as con:
+        revoked = revoke_all_for_user(con, uid)
     assert revoked == 2
 
     # Verify in DB: hash changed, both refreshes revoked_at IS NOT NULL.

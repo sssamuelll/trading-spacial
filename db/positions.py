@@ -24,8 +24,6 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
 
-from db.transaction import _tx_or_use
-
 log = logging.getLogger("db.positions")
 
 
@@ -40,55 +38,51 @@ def _calc_pnl(direction: str, entry: float, exit_p: float, qty: float):
 
 
 def db_create_position(
+    con: sqlite3.Connection,
     data: dict,
     tenant_id: Optional[int] = None,
-    *,
-    con: Optional[sqlite3.Connection] = None,
 ) -> dict:
     """Create position. If tenant_id provided, persisted on the row.
 
     Per B.5: API callers always pass tenant_id from JWT; internal/legacy
     callers may pass None (row inserted with tenant_id NULL).
 
-    Per Task 8.5: optional `con` lets a caller fold this write into an
-    outer transaction (cross-helper atomicity).
+    Task 8 (#446): `con` is now mandatory positional first arg.
     """
     entry = float(data["entry_price"])
     qty   = float(data.get("qty") or (float(data.get("size_usd", 0) or 0) / entry if entry else 0))
     ts    = data.get("entry_ts") or datetime.now(timezone.utc).isoformat()
-    with _tx_or_use(con) as con:
-        cur = con.execute("""
-            INSERT INTO positions
-                (scan_id, symbol, direction, status, entry_price, entry_ts,
-                 sl_price, tp_price, size_usd, qty, atr_entry, be_mult, notes,
-                 tenant_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            data.get("scan_id"),
-            data["symbol"].upper(),
-            data.get("direction", "LONG").upper(),
-            "open",
-            entry,
-            ts,
-            data.get("sl_price"),
-            data.get("tp_price"),
-            data.get("size_usd"),
-            qty,
-            data.get("atr_entry"),
-            data.get("be_mult"),
-            data.get("notes", ""),
-            tenant_id,  # NULL if not provided — legacy behavior
-        ))
-        pos_id = cur.lastrowid
-        row = con.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
+    cur = con.execute("""
+        INSERT INTO positions
+            (scan_id, symbol, direction, status, entry_price, entry_ts,
+             sl_price, tp_price, size_usd, qty, atr_entry, be_mult, notes,
+             tenant_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        data.get("scan_id"),
+        data["symbol"].upper(),
+        data.get("direction", "LONG").upper(),
+        "open",
+        entry,
+        ts,
+        data.get("sl_price"),
+        data.get("tp_price"),
+        data.get("size_usd"),
+        qty,
+        data.get("atr_entry"),
+        data.get("be_mult"),
+        data.get("notes", ""),
+        tenant_id,  # NULL if not provided — legacy behavior
+    ))
+    pos_id = cur.lastrowid
+    row = con.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
     return dict(row)
 
 
 def db_last_exit_ts(
+    con: sqlite3.Connection,
     symbol: str,
     tenant_id: Optional[int] = None,
-    *,
-    con: Optional[sqlite3.Connection] = None,
 ) -> Optional[datetime]:
     """Return last exit_ts (UTC, tz-aware) for symbol's closed positions, or None.
 
@@ -96,24 +90,23 @@ def db_last_exit_ts(
     across ALL users — correct semantic for scanner cooldown (system-wide).
     When tenant_id is int, filters to that user's exits only.
 
-    Per Task 8.5: optional `con` for caller-controlled transaction composition.
+    Task 8 (#446): `con` is now mandatory positional first arg.
     """
-    with _tx_or_use(con) as con:
-        if tenant_id is None:
-            row = con.execute(
-                "SELECT exit_ts FROM positions "
-                "WHERE symbol=? AND status='closed' AND exit_ts IS NOT NULL "
-                "ORDER BY exit_ts DESC LIMIT 1",
-                (symbol.upper(),),
-            ).fetchone()
-        else:
-            row = con.execute(
-                "SELECT exit_ts FROM positions "
-                "WHERE symbol=? AND status='closed' AND exit_ts IS NOT NULL "
-                "AND tenant_id=? "
-                "ORDER BY exit_ts DESC LIMIT 1",
-                (symbol.upper(), tenant_id),
-            ).fetchone()
+    if tenant_id is None:
+        row = con.execute(
+            "SELECT exit_ts FROM positions "
+            "WHERE symbol=? AND status='closed' AND exit_ts IS NOT NULL "
+            "ORDER BY exit_ts DESC LIMIT 1",
+            (symbol.upper(),),
+        ).fetchone()
+    else:
+        row = con.execute(
+            "SELECT exit_ts FROM positions "
+            "WHERE symbol=? AND status='closed' AND exit_ts IS NOT NULL "
+            "AND tenant_id=? "
+            "ORDER BY exit_ts DESC LIMIT 1",
+            (symbol.upper(), tenant_id),
+        ).fetchone()
     if not row or not row[0]:
         return None
     try:
@@ -126,11 +119,10 @@ def db_last_exit_ts(
 
 
 def db_get_positions(
+    con: sqlite3.Connection,
     status: Optional[str] = None,
     tenant_id: Optional[int] = None,
     since: Optional[str] = None,
-    *,
-    con: Optional[sqlite3.Connection] = None,
 ) -> list:
     """List positions, optionally filtered by status, tenant_id, and since.
 
@@ -142,6 +134,8 @@ def db_get_positions(
     historial) or `entry_ts >= since` otherwise. Pushed into SQL so the
     caller doesn't load the full history into Python just to discard it
     (PR #403 review issue 3).
+
+    Task 8 (#446): `con` is now mandatory positional first arg.
     """
     clauses: list[str] = []
     params: list = []
@@ -159,102 +153,85 @@ def db_get_positions(
         clauses.append(f"{ts_col} >= ?")
         params.append(since)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-    with _tx_or_use(con) as con:
-        rows = con.execute(
-            f"SELECT * FROM positions{where} ORDER BY id DESC", params,
-        ).fetchall()
+    rows = con.execute(
+        f"SELECT * FROM positions{where} ORDER BY id DESC", params,
+    ).fetchall()
     return [dict(r) for r in rows]
 
 
-def db_close_position(
+def db_get_position_by_id(
+    con: sqlite3.Connection, pos_id: int,
+) -> Optional[dict]:
+    """Read a single position by id. Pure SQL — no tenant filter.
+
+    Caller is responsible for tenant ownership check (per Task 8.5 design
+    where helpers are pure SQL operators; ownership lives in the business
+    operator).
+    """
+    row = con.execute(
+        "SELECT * FROM positions WHERE id = ?", (pos_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def db_close_position_sql(
+    con: sqlite3.Connection,
     pos_id: int,
     exit_price: float,
     exit_reason: str,
-    tenant_id: Optional[int] = None,
-    *,
-    con: Optional[sqlite3.Connection] = None,
-) -> Optional[dict]:
-    """Close position by id. Per B.5: ownership-enforced when tenant_id given.
+    exit_ts: str,
+    pnl_usd: float,
+    pnl_pct: float,
+) -> dict:
+    """Pure SQL: UPDATE the position to closed. Returns the updated row.
 
-    If tenant_id is provided and the position does NOT belong to that tenant,
-    returns None (IDOR protection — caller sees same behavior as 'not found').
-
-    Per Task 8.5: optional `con` lets a caller (e.g. `check_position_stops`)
-    fold the close + capital + outcomes mutations into one outer transaction
-    instead of three separate atomic boundaries.
+    No health trigger, no notify, no logging beyond ERROR. Caller (operator)
+    owns lifecycle, transaction, and side-effects.
     """
-    _caller_owned_con = con  # remember whether caller threaded a tx in
-    with _tx_or_use(con) as con:
-        if tenant_id is None:
-            row = con.execute(
-                "SELECT * FROM positions WHERE id=?", (pos_id,),
-            ).fetchone()
-        else:
-            row = con.execute(
-                "SELECT * FROM positions WHERE id=? AND tenant_id=?",
-                (pos_id, tenant_id),
-            ).fetchone()
-        if not row:
-            return None
-        pos = dict(row)
-        qty = pos.get("qty") or 0
-        pnl_usd, pnl_pct = _calc_pnl(pos["direction"], pos["entry_price"], exit_price, qty)
-        exit_ts = datetime.now(timezone.utc).isoformat()
-        con.execute("""
-            UPDATE positions
-            SET status=?, exit_price=?, exit_ts=?, exit_reason=?, pnl_usd=?, pnl_pct=?
-            WHERE id=?
-        """, ("closed", exit_price, exit_ts, exit_reason, pnl_usd, pnl_pct, pos_id))
-        row = con.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
-    closed = dict(row)
-    # Kill switch #138: trigger health evaluation for this symbol.
-    #
-    # Task 8.5: when the caller passes its own `con`, it owns an outer
-    # transaction that hasn't committed yet. `trigger_health_evaluation`
-    # opens a FRESH connection and would BEGIN IMMEDIATE against the
-    # writer lock the outer tx still holds → deadlock. The caller is
-    # responsible for triggering health evaluation post-commit in that
-    # case. When called standalone (con is None), our own tx has already
-    # committed by the time we reach here, so the trigger is safe.
-    if _caller_owned_con is None:
-        try:
-            from health import trigger_health_evaluation  # noqa: PLC0415
-            from api.config import load_config  # noqa: PLC0415
-            trigger_health_evaluation(pos["symbol"], load_config())
-        except Exception as e:
-            log.warning("health trigger skipped for position close: %s", e)
-    return closed
+    con.execute(
+        """UPDATE positions
+           SET status = 'closed',
+               exit_price = ?,
+               exit_ts = ?,
+               exit_reason = ?,
+               pnl_usd = ?,
+               pnl_pct = ?
+           WHERE id = ?""",
+        (exit_price, exit_ts, exit_reason, pnl_usd, pnl_pct, pos_id),
+    )
+    row = con.execute(
+        "SELECT * FROM positions WHERE id = ?", (pos_id,),
+    ).fetchone()
+    return dict(row)
 
 
 def db_update_position(
+    con: sqlite3.Connection,
     pos_id: int,
     data: dict,
     tenant_id: Optional[int] = None,
-    *,
-    con: Optional[sqlite3.Connection] = None,
 ) -> Optional[dict]:
     """Update position fields. Per B.5: ownership-enforced when tenant_id given.
 
     Returns None if position not found OR (when tenant_id provided) the
     position does not belong to that tenant.
 
-    Per Task 8.5: optional `con` for caller-controlled transaction composition.
+    Task 8 (#446): `con` is now mandatory positional first arg.
     """
     allowed = {"sl_price", "tp_price", "size_usd", "qty", "notes", "entry_price", "atr_entry", "be_mult"}
     updates = {k: v for k, v in data.items() if k in allowed}
     if not updates:
         return None
-    with _tx_or_use(con) as con:
-        # Ownership pre-check when tenant_id provided
-        if tenant_id is not None:
-            owner_row = con.execute(
-                "SELECT id FROM positions WHERE id=? AND tenant_id=?",
-                (pos_id, tenant_id),
-            ).fetchone()
-            if not owner_row:
-                return None
-        sets = ", ".join(f"{k}=?" for k in updates)
-        vals = list(updates.values()) + [pos_id]
-        con.execute(f"UPDATE positions SET {sets} WHERE id=?", vals)
-        row = con.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
+    # Ownership pre-check when tenant_id provided
+    if tenant_id is not None:
+        owner_row = con.execute(
+            "SELECT id FROM positions WHERE id=? AND tenant_id=?",
+            (pos_id, tenant_id),
+        ).fetchone()
+        if not owner_row:
+            return None
+    sets = ", ".join(f"{k}=?" for k in updates)
+    vals = list(updates.values()) + [pos_id]
+    con.execute(f"UPDATE positions SET {sets} WHERE id=?", vals)
+    row = con.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
     return dict(row) if row else None
