@@ -17,7 +17,6 @@ from api.config import load_config
 from api.deps import verify_api_key
 from auth.dependencies import get_current_tenant_id, require_role
 from db.capital import apply_pnl_to_capital
-from db.connection import get_db
 from db.positions import (
     _calc_pnl,
     db_close_position,
@@ -25,6 +24,7 @@ from db.positions import (
     db_get_positions,
     db_update_position,
 )
+from db.transaction import transaction
 
 log = logging.getLogger("api.positions")
 
@@ -49,12 +49,17 @@ _EVENT_LOG_LABELS = {
 }
 
 
-def _apply_close_to_capital(closed_pos: dict) -> None:
+def _apply_close_to_capital(closed_pos: dict, *, con=None) -> None:
     """B.2 #255: roll realized P&L from a just-closed position into the
     owner's capital ledger.
 
     Skips positions with tenant_id=NULL (legacy/scanner pre-multi-tenant) or
     pnl_usd=None (no quantified outcome — e.g. qty=0). Locks: pre-reg §2.1, §2.2.
+
+    Per Task 8.5: optional `con` threads the capital update into the caller's
+    open transaction (e.g. `check_position_stops` folding close + capital
+    into one unit of work). Standalone callers (manual /positions/{id}/close)
+    leave `con=None` and let `apply_pnl_to_capital` open its own tx.
     """
     tenant_id = closed_pos.get("tenant_id")
     pnl_usd = closed_pos.get("pnl_usd")
@@ -65,7 +70,7 @@ def _apply_close_to_capital(closed_pos: dict) -> None:
         )
         return
     try:
-        apply_pnl_to_capital(int(tenant_id), float(pnl_usd))
+        apply_pnl_to_capital(int(tenant_id), float(pnl_usd), con=con)
     except Exception as e:
         # Capital update is best-effort: a ledger failure must NOT block the
         # position-close lifecycle. Operator reconciles via separate audit.
@@ -127,139 +132,207 @@ def update_positions_json():
         log.warning(f"update_positions_json error: {e}")
 
 
-def check_position_stops(symbol: str, price: float, now: datetime | None = None):
+def check_position_stops(
+    symbol: str | None = None,
+    price: float | None = None,
+    now: datetime | None = None,
+    *,
+    symbol_price_overrides: dict[str, float] | None = None,
+):
     """Auto-cierra posiciones abiertas si el precio toca TP, SL o time-limit. Sends notifications.
 
+    One transaction per (symbol, price) tick covers BOTH the SELECT of open
+    positions AND the per-position trailing-SL UPDATE. This names the trading
+    invariant (plan 2026-05-24-transaction-unit-of-work, F-05): every mutation
+    derived from one tick of price decision belongs to one serializable
+    transaction. Concurrent operator edits serialize via BEGIN IMMEDIATE.
+
+    Position-close mutations are delegated to `db_close_position` (which owns
+    its own connection today — migration deferred to Tasks 6-9 of the plan).
+    Notifications and event-log writes are side effects kept OUTSIDE the
+    transaction by design (file I/O + network must not extend the DB lock).
+
     `now` is injectable for deterministic testing; defaults to current UTC time.
+
+    `symbol_price_overrides` is a test-injection seam: when provided, the
+    function iterates per (symbol, price) entry and runs the full decision
+    cycle for each. Default `None` preserves the legacy `(symbol, price)`
+    signature for production callers.
     """
+    if symbol_price_overrides is not None:
+        for sym, p in symbol_price_overrides.items():
+            check_position_stops(sym, p, now=now)
+        return
+
+    if symbol is None or price is None:
+        raise TypeError(
+            "check_position_stops requires (symbol, price) or "
+            "symbol_price_overrides={...}"
+        )
+
     if now is None:
         now = datetime.now(timezone.utc)
-    con = get_db()
-    rows = con.execute(
-        "SELECT * FROM positions WHERE symbol=? AND status='open'", (symbol.upper(),)
-    ).fetchall()
-    con.close()
 
     cfg = load_config()
 
-    for pos in [dict(r) for r in rows]:
-        reason = None
-        exit_price = None
+    # Task 8.5: ONE unit of work now covers read + trail-SL + close +
+    # capital ledger update. Previously the close + capital lived in their
+    # own transactions, so a crash between them left a closed position
+    # whose P&L was never folded into the tenant's balance. Now the close
+    # and capital roll-in serialize atomically with the read.
+    #
+    # Side effects (event-log file write + Telegram notify) stay OUTSIDE
+    # the transaction by design — file I/O / network must not extend the
+    # DB lock. We collect them in `post_tx_actions` and run after commit.
+    post_tx_actions: list[dict] = []
 
-        # Trailing ratchet: move SL to breakeven when profit >= be_mult × ATR
-        atr_entry = pos.get("atr_entry")
-        _be_mult = pos.get("be_mult") or 1.5  # per-symbol from config, fallback 1.5
-        if atr_entry and pos["direction"] == "LONG" and pos["sl_price"]:
-            be_threshold = pos["entry_price"] + round(atr_entry * _be_mult, 2)
-            if price >= be_threshold and pos["sl_price"] < pos["entry_price"]:
-                new_sl = pos["entry_price"]
-                con_trail = get_db()
-                con_trail.execute(
-                    "UPDATE positions SET sl_price = ? WHERE id = ?",
-                    (new_sl, pos["id"])
-                )
-                con_trail.commit()
-                con_trail.close()
-                pos["sl_price"] = new_sl
-                log.info(f"Trailing: #{pos['id']} {symbol} SL moved to breakeven ${new_sl:.2f}")
-        elif atr_entry and pos["direction"] == "SHORT" and pos["sl_price"]:
-            be_threshold = pos["entry_price"] - round(atr_entry * _be_mult, 2)
-            if price <= be_threshold and pos["sl_price"] > pos["entry_price"]:
-                new_sl = pos["entry_price"]
-                con_trail = get_db()
-                con_trail.execute(
-                    "UPDATE positions SET sl_price = ? WHERE id = ?",
-                    (new_sl, pos["id"])
-                )
-                con_trail.commit()
-                con_trail.close()
-                pos["sl_price"] = new_sl
-                log.info(f"Trailing: #{pos['id']} {symbol} SL moved to breakeven ${new_sl:.2f}")
+    with transaction() as con:
+        rows = con.execute(
+            "SELECT * FROM positions WHERE symbol=? AND status='open'",
+            (symbol.upper(),),
+        ).fetchall()
+        pos_list = [dict(r) for r in rows]
 
-        if pos["direction"] == "LONG":
-            if pos["tp_price"] and price >= pos["tp_price"]:
-                reason, exit_price = "TP_HIT", pos["tp_price"]
-            elif pos["sl_price"] and price <= pos["sl_price"]:
-                reason, exit_price = "SL_HIT", pos["sl_price"]
-        else:  # SHORT
-            if pos["tp_price"] and price <= pos["tp_price"]:
-                reason, exit_price = "TP_HIT", pos["tp_price"]
-            elif pos["sl_price"] and price >= pos["sl_price"]:
-                reason, exit_price = "SL_HIT", pos["sl_price"]
-
-        if reason is None:
-            overrides = cfg.get("symbol_overrides", {}).get(symbol.upper(), {})
-            _tl_h = _validated_time_limit_hours(overrides.get("time_limit_hours"), symbol)
-            if _tl_h is not None and pos.get("entry_ts"):
-                try:
-                    entry_dt = datetime.fromisoformat(pos["entry_ts"])
-                    if entry_dt.tzinfo is None:
-                        entry_dt = entry_dt.replace(tzinfo=timezone.utc)
-                except (ValueError, TypeError) as e:
-                    log.warning(
-                        f"check_position_stops: malformed entry_ts on position "
-                        f"#{pos['id']} ({symbol}): {pos.get('entry_ts')!r} — "
-                        f"skipping time-limit check (SL/TP unaffected). Error: {e}"
+        for pos in pos_list:
+            # Trailing ratchet: move SL to breakeven when profit >= be_mult × ATR
+            atr_entry = pos.get("atr_entry")
+            _be_mult = pos.get("be_mult") or 1.5  # per-symbol from config, fallback 1.5
+            if atr_entry and pos["direction"] == "LONG" and pos["sl_price"]:
+                be_threshold = pos["entry_price"] + round(atr_entry * _be_mult, 2)
+                if price >= be_threshold and pos["sl_price"] < pos["entry_price"]:
+                    new_sl = pos["entry_price"]
+                    con.execute(
+                        "UPDATE positions SET sl_price = ? WHERE id = ?",
+                        (new_sl, pos["id"]),
                     )
-                    continue
-
-                hours_open = (now - entry_dt).total_seconds() / 3600
-                if hours_open >= _tl_h:
-                    # Stateless config resolution: a lowered time_limit_hours
-                    # edit applies retroactively to long-open positions. The
-                    # buffer (2× scan_interval) absorbs normal scanner lag —
-                    # warn only when we're materially past that.
-                    scan_interval_sec = _validated_scan_interval_sec(
-                        cfg, "check_position_stops", log
+                    pos["sl_price"] = new_sl
+                    log.info(f"Trailing: #{pos['id']} {symbol} SL moved to breakeven ${new_sl:.2f}")
+            elif atr_entry and pos["direction"] == "SHORT" and pos["sl_price"]:
+                be_threshold = pos["entry_price"] - round(atr_entry * _be_mult, 2)
+                if price <= be_threshold and pos["sl_price"] > pos["entry_price"]:
+                    new_sl = pos["entry_price"]
+                    con.execute(
+                        "UPDATE positions SET sl_price = ? WHERE id = ?",
+                        (new_sl, pos["id"]),
                     )
-                    buffer_h = (scan_interval_sec / 3600) * 2
-                    if hours_open > _tl_h + buffer_h:
+                    pos["sl_price"] = new_sl
+                    log.info(f"Trailing: #{pos['id']} {symbol} SL moved to breakeven ${new_sl:.2f}")
+
+        for pos in pos_list:
+            reason = None
+            exit_price = None
+
+            if pos["direction"] == "LONG":
+                if pos["tp_price"] and price >= pos["tp_price"]:
+                    reason, exit_price = "TP_HIT", pos["tp_price"]
+                elif pos["sl_price"] and price <= pos["sl_price"]:
+                    reason, exit_price = "SL_HIT", pos["sl_price"]
+            else:  # SHORT
+                if pos["tp_price"] and price <= pos["tp_price"]:
+                    reason, exit_price = "TP_HIT", pos["tp_price"]
+                elif pos["sl_price"] and price >= pos["sl_price"]:
+                    reason, exit_price = "SL_HIT", pos["sl_price"]
+
+            if reason is None:
+                overrides = cfg.get("symbol_overrides", {}).get(symbol.upper(), {})
+                _tl_h = _validated_time_limit_hours(overrides.get("time_limit_hours"), symbol)
+                if _tl_h is not None and pos.get("entry_ts"):
+                    try:
+                        entry_dt = datetime.fromisoformat(pos["entry_ts"])
+                        if entry_dt.tzinfo is None:
+                            entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                    except (ValueError, TypeError) as e:
                         log.warning(
-                            f"check_position_stops: TIME_LIMIT trigger fired "
-                            f"materially past horizon for #{pos['id']} {symbol} "
-                            f"(hours_open={hours_open:.1f} vs "
-                            f"time_limit_hours={_tl_h}, "
-                            f"buffer={buffer_h:.2f}h) — likely config edit "
-                            f"while position open"
+                            f"check_position_stops: malformed entry_ts on position "
+                            f"#{pos['id']} ({symbol}): {pos.get('entry_ts')!r} — "
+                            f"skipping time-limit check (SL/TP unaffected). Error: {e}"
                         )
-                    reason, exit_price = "TIME_LIMIT_HIT", price
+                        continue
 
-        if reason:
-            closed = db_close_position(pos["id"], exit_price, reason)
-            log.info(f"POSICION #{pos['id']} {symbol} {reason} @ ${exit_price}")
-            _write_position_event_log(pos, reason, exit_price)
-            # B.2 #255: roll realized P&L into owner's capital (no-op if NULL tenant)
-            if closed:
-                _apply_close_to_capital(closed)
+                    hours_open = (now - entry_dt).total_seconds() / 3600
+                    if hours_open >= _tl_h:
+                        # Stateless config resolution: a lowered time_limit_hours
+                        # edit applies retroactively to long-open positions. The
+                        # buffer (2× scan_interval) absorbs normal scanner lag —
+                        # warn only when we're materially past that.
+                        scan_interval_sec = _validated_scan_interval_sec(
+                            cfg, "check_position_stops", log
+                        )
+                        buffer_h = (scan_interval_sec / 3600) * 2
+                        if hours_open > _tl_h + buffer_h:
+                            log.warning(
+                                f"check_position_stops: TIME_LIMIT trigger fired "
+                                f"materially past horizon for #{pos['id']} {symbol} "
+                                f"(hours_open={hours_open:.1f} vs "
+                                f"time_limit_hours={_tl_h}, "
+                                f"buffer={buffer_h:.2f}h) — likely config edit "
+                                f"while position open"
+                            )
+                        reason, exit_price = "TIME_LIMIT_HIT", price
 
-            # Send exit notification via the centralized notifier (#162 PR B).
-            entry = pos.get("entry_price", 0)
-            qty = pos.get("qty", 0)
-            pnl_usd, pnl_pct = _calc_pnl(pos["direction"], entry, exit_price, qty)
+            if reason:
+                # Task 8.5: pass `con=con` so the close write joins this tx.
+                closed = db_close_position(pos["id"], exit_price, reason, con=con)
+                log.info(f"POSICION #{pos['id']} {symbol} {reason} @ ${exit_price}")
+                # B.2 #255: roll realized P&L into owner's capital, in the
+                # same tx (close + capital atomic together).
+                if closed:
+                    _apply_close_to_capital(closed, con=con)
 
-            try:
-                from notifier import notify, PositionExitEvent  # noqa: PLC0415
-                # Map legacy reason strings ("SL_HIT"/"TP_HIT"/"TIME_LIMIT_HIT")
-                # to tier codes used by the notifier templates.
-                exit_reason_code = "SL" if reason == "SL_HIT" else (
-                    "TP" if reason == "TP_HIT" else (
-                        "TIME_LIMIT" if reason == "TIME_LIMIT_HIT" else reason
-                    )
+                # Defer file-log + Telegram notify to AFTER commit. These are
+                # slow I/O (file / HTTP) and must not extend the DB writer lock.
+                post_tx_actions.append({
+                    "pos": pos,
+                    "reason": reason,
+                    "exit_price": exit_price,
+                })
+
+    # Out-of-transaction side effects: event log + health trigger + exit
+    # notification. db_close_position skipped the health trigger because we
+    # passed `con=con` (it would deadlock on the still-open writer lock),
+    # so we fire it here post-commit.
+    for action in post_tx_actions:
+        pos = action["pos"]
+        reason = action["reason"]
+        exit_price = action["exit_price"]
+
+        _write_position_event_log(pos, reason, exit_price)
+
+        # Kill switch #138: deferred health trigger (Task 8.5).
+        try:
+            from health import trigger_health_evaluation  # noqa: PLC0415
+            trigger_health_evaluation(pos["symbol"], cfg)
+        except Exception as e:
+            log.warning("health trigger skipped for position close: %s", e)
+
+        # Send exit notification via the centralized notifier (#162 PR B).
+        entry = pos.get("entry_price", 0)
+        qty = pos.get("qty", 0)
+        pnl_usd, pnl_pct = _calc_pnl(pos["direction"], entry, exit_price, qty)
+
+        try:
+            from notifier import notify, PositionExitEvent  # noqa: PLC0415
+            # Map legacy reason strings ("SL_HIT"/"TP_HIT"/"TIME_LIMIT_HIT")
+            # to tier codes used by the notifier templates.
+            exit_reason_code = "SL" if reason == "SL_HIT" else (
+                "TP" if reason == "TP_HIT" else (
+                    "TIME_LIMIT" if reason == "TIME_LIMIT_HIT" else reason
                 )
-                notify(
-                    PositionExitEvent(
-                        symbol=symbol,
-                        direction=pos.get("direction", "LONG"),
-                        exit_reason=exit_reason_code,
-                        entry_price=float(entry or 0.0),
-                        exit_price=float(exit_price or 0.0),
-                        pnl_usd=float(pnl_usd or 0.0),
-                        pnl_pct=float(pnl_pct or 0.0),
-                    ),
-                    cfg=cfg,
-                )
-            except Exception as e:
-                log.warning(f"Failed to notify {reason} for {symbol}: {e}")
+            )
+            notify(
+                PositionExitEvent(
+                    symbol=symbol,
+                    direction=pos.get("direction", "LONG"),
+                    exit_reason=exit_reason_code,
+                    entry_price=float(entry or 0.0),
+                    exit_price=float(exit_price or 0.0),
+                    pnl_usd=float(pnl_usd or 0.0),
+                    pnl_pct=float(pnl_pct or 0.0),
+                ),
+                cfg=cfg,
+            )
+        except Exception as e:
+            log.warning(f"Failed to notify {reason} for {symbol}: {e}")
 
 
 @router.get("", summary="Listar posiciones")
@@ -351,17 +424,16 @@ def delete_position(
     tenant_id: int = Depends(get_current_tenant_id),
 ):
     # B.5 #258: ownership-enforced via inline SELECT (db helper doesn't have
-    # delete primitive yet; refactor deferred to follow-up)
-    con = get_db()
-    row = con.execute(
-        "SELECT id FROM positions WHERE id=? AND tenant_id=?",
-        (pos_id, tenant_id),
-    ).fetchone()
-    if not row:
-        con.close()
-        raise HTTPException(status_code=404, detail=f"Posicion #{pos_id} no encontrada")
-    con.execute("UPDATE positions SET status='cancelled' WHERE id=?", (pos_id,))
-    con.commit()
-    con.close()
+    # delete primitive yet; refactor deferred to follow-up).
+    # Wrapped in a single transaction so the ownership check + status flip
+    # serialize against any concurrent operator edit of the same row.
+    with transaction() as con:
+        row = con.execute(
+            "SELECT id FROM positions WHERE id=? AND tenant_id=?",
+            (pos_id, tenant_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Posicion #{pos_id} no encontrada")
+        con.execute("UPDATE positions SET status='cancelled' WHERE id=?", (pos_id,))
     update_positions_json()
     return {"ok": True, "message": f"Posicion #{pos_id} cancelada"}

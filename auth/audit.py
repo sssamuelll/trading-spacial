@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from db.connection import get_db
+from db.transaction import _tx_or_use
 
 log = logging.getLogger("auth.audit")
 
@@ -38,6 +39,7 @@ def log_auth_event(
     ip: Optional[str] = None,
     user_agent: Optional[str] = None,
     metadata: Optional[dict[str, Any]] = None,
+    con: Optional[sqlite3.Connection] = None,
 ) -> None:
     """Insert one row into auth_events. Never raises.
 
@@ -53,8 +55,7 @@ def log_auth_event(
     ts = datetime.now(timezone.utc).isoformat()
 
     try:
-        con = get_db()
-        try:
+        with _tx_or_use(con) as con:
             con.execute(
                 """
                 INSERT INTO auth_events
@@ -71,9 +72,6 @@ def log_auth_event(
                     metadata_json,
                 ),
             )
-            con.commit()
-        finally:
-            con.close()
     except Exception as exc:
         # Audit failure must NOT break the calling flow. Log to stderr with
         # enough detail to reconstruct the event later from server logs.

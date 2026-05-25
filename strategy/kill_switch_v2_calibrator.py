@@ -213,7 +213,7 @@ def _persist_recommendation(
     producing malformed result dicts otherwise.
     """
     import json
-    import btc_api
+    from db.transaction import transaction
 
     missing = [k for k in ("status", "report") if k not in result]
     if missing:
@@ -221,8 +221,7 @@ def _persist_recommendation(
             f"_persist_recommendation: result dict missing required keys: {missing}"
         )
 
-    conn = btc_api.get_db()
-    try:
+    with transaction() as conn:
         cursor = conn.execute(
             """INSERT INTO kill_switch_recommendations
                  (ts, triggered_by, slider_value, projected_pnl, projected_dd,
@@ -238,47 +237,35 @@ def _persist_recommendation(
                 json.dumps(result["report"]),
             ),
         )
-        conn.commit()
         return int(cursor.lastrowid)
-    finally:
-        conn.close()
 
 
 def _load_last_recalibration_ts() -> str | None:
     """Return the latest ts from kill_switch_recommendations, or None."""
-    import btc_api
-    conn = btc_api.get_db()
-    try:
+    from db.transaction import transaction
+    with transaction() as conn:
         row = conn.execute(
             "SELECT MAX(ts) FROM kill_switch_recommendations",
         ).fetchone()
-    finally:
-        conn.close()
     return row[0] if row and row[0] else None
 
 
 def _count_recalibrations_today(now) -> int:
     """Count rows in kill_switch_recommendations persisted today (UTC)."""
-    import btc_api
-
+    from db.transaction import transaction
     today_prefix = now.strftime("%Y-%m-%d")
-    conn = btc_api.get_db()
-    try:
+    with transaction() as conn:
         row = conn.execute(
             "SELECT COUNT(*) FROM kill_switch_recommendations WHERE ts LIKE ?",
             (today_prefix + "%",),
         ).fetchone()
-    finally:
-        conn.close()
     return int(row[0]) if row else 0
 
 
 def _load_last_applied_recommendation() -> dict[str, Any] | None:
     """Return the most recent applied recommendation row as a dict, or None."""
-    import btc_api
-
-    conn = btc_api.get_db()
-    try:
+    from db.transaction import transaction
+    with transaction() as conn:
         row = conn.execute(
             """SELECT id, ts, slider_value, projected_pnl, projected_dd,
                       status, applied_ts, applied_by, report_json
@@ -287,8 +274,6 @@ def _load_last_applied_recommendation() -> dict[str, Any] | None:
                ORDER BY applied_ts DESC, id DESC
                LIMIT 1""",
         ).fetchone()
-    finally:
-        conn.close()
     if row is None:
         return None
     return {
@@ -306,16 +291,13 @@ def _load_last_calibration_regime_score() -> float | None:
     field is missing.
     """
     import json
-    import btc_api
+    from db.transaction import transaction
 
-    conn = btc_api.get_db()
-    try:
+    with transaction() as conn:
         row = conn.execute(
             """SELECT report_json FROM kill_switch_recommendations
                ORDER BY ts DESC, id DESC LIMIT 1""",
         ).fetchone()
-    finally:
-        conn.close()
     if not row or not row[0]:
         return None
     try:
@@ -336,12 +318,11 @@ def _count_symbols_with_recent_alerts(window_hours: float) -> int:
     have per_symbol_tier='ALERT' OR portfolio_tier IN ('REDUCED','FROZEN').
     """
     from datetime import datetime, timedelta, timezone
-    import btc_api
+    from db.transaction import transaction
 
     now = datetime.now(tz=timezone.utc)
     cutoff = (now - timedelta(hours=float(window_hours))).isoformat()
-    conn = btc_api.get_db()
-    try:
+    with transaction() as conn:
         row = conn.execute(
             """SELECT COUNT(DISTINCT symbol)
                FROM kill_switch_decisions
@@ -351,26 +332,19 @@ def _count_symbols_with_recent_alerts(window_hours: float) -> int:
                       OR portfolio_tier IN ('REDUCED', 'FROZEN'))""",
             (cutoff,),
         ).fetchone()
-    finally:
-        conn.close()
     return int(row[0]) if row else 0
 
 
 def _mark_prior_pending_as_superseded(new_id: int) -> None:
     """Mark all pending recommendations except `new_id` as superseded."""
-    import btc_api
-
-    conn = btc_api.get_db()
-    try:
+    from db.transaction import transaction
+    with transaction() as conn:
         conn.execute(
             """UPDATE kill_switch_recommendations
                SET status = 'superseded'
                WHERE status = 'pending' AND id != ?""",
             (int(new_id),),
         )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def _send_telegram_recommendation(
@@ -579,7 +553,9 @@ def _load_current_regime_score() -> float | None:
         return None
 
 
-def _compute_current_portfolio_dd(cfg: dict[str, Any], *, tenant_id: int) -> float:
+def _compute_current_portfolio_dd(
+    cfg: dict[str, Any], *, tenant_id: int, conn=None,
+) -> float:
     """Compute live portfolio DD from `tenant_id`'s closed trades + open positions MTM.
 
     Reuses kill_switch_v2.compute_portfolio_dd + compute_portfolio_equity_curve.
@@ -588,6 +564,10 @@ def _compute_current_portfolio_dd(cfg: dict[str, Any], *, tenant_id: int) -> flo
     Per multi-tenant policy: `tenant_id` is required. The capital base is the
     tenant's ledger balance when present, falling back to cfg["capital_usd"]
     for tenants without a capital row (legacy / pre-onboarding case).
+
+    Per Task 8.5: optional `conn` for caller-controlled transaction composition
+    (e.g. get_dashboard_state, which owns an outer tx and would deadlock if
+    inner helpers opened their own).
     """
     try:
         from strategy.kill_switch_v2 import (
@@ -597,14 +577,14 @@ def _compute_current_portfolio_dd(cfg: dict[str, Any], *, tenant_id: int) -> flo
             _load_closed_trades, _load_open_positions, _snapshot_prices,
         )
         from db.capital import db_get_capital
-        cap_row = db_get_capital(tenant_id)
+        cap_row = db_get_capital(tenant_id, con=conn)
         if cap_row and cap_row.get("balance") is not None:
             capital_base = float(cap_row["balance"])
         else:
             capital_base = float(cfg.get("capital_usd", 1000.0))
         equity_curve = compute_portfolio_equity_curve(
-            closed_trades=_load_closed_trades(tenant_id=tenant_id),
-            open_positions=_load_open_positions(tenant_id=tenant_id),
+            closed_trades=_load_closed_trades(tenant_id=tenant_id, conn=conn),
+            open_positions=_load_open_positions(tenant_id=tenant_id, conn=conn),
             capital_base=capital_base,
             now_price_by_symbol=_snapshot_prices(),
         )
