@@ -321,6 +321,58 @@ New business operators emerge from evidence (caller composes >1 helper + side-ef
 
 `F-05` (trading invariant "every mutation derived from one tick of price decision belongs to one serializable transaction") **applies per-close** in Phase 2 of `check_position_stops`, **not per-tick**. The Phase 2 loop wraps each `PositionClosure(SYSTEM)` in `try/except: continue`, so partial-failure observability across N positions in the same tick is currently absent. See #453 for the issue tracking the integrity-observational debt (Voronov reframe of Serrano F-NEW Plano 1, 2026-05-25).
 
+## Capas de enforcement de invariantes (Voronov 2026-05-26)
+
+El dominio del repo afirma invariantes que el almacenamiento no garantiza por defecto. Cada vez que esa asimetría no se nombra, el código paga la diferencia en **membranas silenciosas**: `or 0`, "código de revisor", re-validaciones parciales. Este registro lista las invariantes de dominio que tocan el cluster C2 (#467/#468/#469) y la capa que las enforza.
+
+Cuatro capas posibles, de más fuerte a más débil:
+
+| Capa | Cómo enforza | Quién detecta violación |
+|---|---|---|
+| **Schema** | DDL constraint (CHECK, NOT NULL, FK, UNIQUE) | El motor SQLite, en write |
+| **Tipo** | Anotación + **órgano de rechazo en runtime** (`__post_init__` con `isinstance`, factory privada con sentinel, NewType propagado al consumer). En un lenguaje sin type-checker en CI, la anotación sola es convención disfrazada de sintaxis. La rung 'tipo' sólo es real cuando el constructor o el factory rechaza la entrada equivocada con `TypeError`. | mypy estricto en CI **o** runtime check explícito (`__post_init__` / factory sentinel) |
+| **Test** | Invariant test que falla si la violación ocurre | pytest en CI |
+| **Convención** | Comentario en código / sección de CLAUDE.md / revisión humana | Revisor (si recuerda mirar) |
+
+### Regla de coherencia (Voronov post-Serrano 2026-05-26)
+
+> "La fuerza de una garantía está acotada por encima por el órgano más débil que puede rechazarla en la frontera que la garantía dice proteger."
+
+Tres consecuencias para esta codebase:
+1. Las anotaciones forward-ref en dataclasses no son enforcement. Si una clase declara un field con un tipo específico, debe tener `__post_init__` que rechace lo contrario, o el field debe construirse vía factory privada con sentinel. Sin órgano de rechazo, la anotación pertenece a la rung 'convención', no a 'tipo'.
+2. `NewType` solo cuenta como 'tipo' si el consumer también está anotado y el camino completo es estructuralmente coherente. Una `PrecheckConn` definida y luego pasada a una función con anotación `sqlite3.Connection` regresa a 'convención'.
+3. Cerrar un issue (`#NNN`) contra una eliminación parcial de la patología deja la enfermedad en los sitios no tocados. Closure requiere que el predicado del issue sea verdad en todos los call sites, no sólo los listados en el plan.
+
+### Invariantes C2 — estado tras este PR
+
+| Invariante de dominio | Capa enforced | Mecanismo | Issue cerrado |
+|---|---|---|---|
+| `qty` siempre tiene valor numérico para positions activas (o `status='legacy_unmeasurable'`) | **Schema** | `CHECK (qty IS NOT NULL OR status='legacy_unmeasurable')` en `positions` (vía `_migrate_qty_not_null` en `db/schema.py`) | #467 |
+| `precheck_connection` y `snapshot_connection` son contratos distintos | **Tipo** | `NewType("PrecheckConn", sqlite3.Connection)` y `NewType("SnapshotConn", sqlite3.Connection)` en `db/transaction.py` — mypy detecta mis-uso | #468 |
+| Los campos del snapshot consumidos por el write-tx no cambian entre precheck y BEGIN IMMEDIATE | **Tipo + runtime check** | `OwnershipValidatedSnapshot` (factory privada en `operators/precheck.py`) + field-by-field re-validation en `PositionClosure.execute()` cubre los 6 campos del `PositionSnapshot` | #469 + F6 |
+
+### Patrón nombrado: "invariantes de dominio sin contraparte estructural"
+
+Cada futuro issue de la familia `or X`, "código de revisor", "trust-and-document" debería compararse contra este registro. Si la invariante pertenece a una capa más fuerte que `convención`, moverla es la fix correcta.
+
+### Finding meta — asimetría contractual create vs close (Voronov post-medición 2026-05-26)
+
+Medición de `signals.db` reveló 670 de 2018 positions con `qty IS NULL` (33%), **ZERO backfillables** desde `size_usd/entry_price`. La asunción del plan original era que `qty NULL` era deuda de cierre (size_usd existió, se perdió). La realidad: deuda de nacimiento (size_usd nunca prometido).
+
+> **El sistema tiene un `close()` que asume invariantes que `open()` nunca prometió.** `qty NULL` no es el problema — es el síntoma. La membrana de cierre asume un contrato que la membrana de apertura nunca firmó.
+
+Implicación: hasta que `create_position` exija lo que `close_position` asume, todo CHECK en la salida es teatro defensivo. Issue separado: asimetría contractual create vs close (open issue antes del PR merge — Task 13.5 del plan 2026-05-26-467-468-469).
+
+### Documented status: `legacy_unmeasurable`
+
+Status especial usado por `_migrate_qty_not_null` (#467) para reconocer 670 rows históricas cuya `qty` nunca fue medida y no es derivable. El schema CHECK constraint exempta este status: `CHECK (qty IS NOT NULL OR status='legacy_unmeasurable')`. Convierte 670 mentiras silenciosas en 670 reconocimientos explícitos.
+
+### Known scope gap (Voronov 2026-05-26)
+
+> El sistema enforza invariantes en el momento de cruce (precheck→snapshot, snapshot→write) pero **no enforza invariantes en el momento de origen** (creación de la position). Toda la cadena de defensa de C2 asume que la position fue creada correctamente. Si en `position_open` se crea una row con `tenant_id` mal asignado, los 3 mecanismos de C2 la sostendrán correctamente *con el tenant equivocado*. C2 endurece el ciclo de vida; no endurece el nacimiento.
+
+Esta deuda NO está cubierta por este PR. Tratamiento futuro: auditar `db_create_position` y los endpoints que invocan creación (`POST /positions`, paths del scanner) bajo la misma lente del registro de capas.
+
 ## Known Limitations
 - `watchdog.py` uses Windows-specific commands (`tasklist`, `taskkill`, `wmic`, `netstat`) and won't run on Linux/Mac
 - The webhook process itself is not supervised by the watchdog (only btc_api.py is)
