@@ -11,14 +11,13 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
 
 from api.config import load_config
 from api.deps import verify_api_key
 from auth.dependencies import get_current_tenant_id, require_role
 from db.positions import (
     _calc_pnl,
-    db_create_position,
     db_get_positions,
     db_update_position,
 )
@@ -284,19 +283,58 @@ def list_positions(
 def open_position(
     body: dict = Body(...),
     tenant_id: int = Depends(get_current_tenant_id),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ):
-    required = {"symbol", "entry_price"}
-    missing  = required - body.keys()
-    if missing:
-        raise HTTPException(status_code=422, detail=f"Faltan campos: {missing}")
+    """Open a new position (#473 — Voronov Cluster D dual rung).
+
+    Validation is delegated to api.positions_birth:
+      - _build_open_request runs Pydantic boundary validation (D-Tipo). Any
+        shape / field / cross-field failure raises BodyValidationError → 422.
+      - The schema-level partial UNIQUE index (idx_positions_open_scan_unique)
+        is the last-resort rejection for (tenant_id, scan_id) duplicate-open
+        races: sqlite3.IntegrityError is translated to 409 here (we
+        log.exception because Pydantic was supposed to catch reordering
+        upstream; an integrity error escaping to this layer signals a gap).
+      - Idempotency-Key is read from the request header but its full caching
+        semantics land with BirthRegistrar in Task 15. For now we just
+        accept the header so the route signature is stable.
+      - NO bare `except Exception`. Unknown server faults bubble to
+        FastAPI's default 500 handler with the traceback logged — never
+        leak str(e) to the client (closes Serrano BLOCKER 3 / #473).
+
+    Task 15 wired this to BirthRegistrar.register, which owns:
+      - the write transaction (db_create_position_sql inside `with transaction()`)
+      - same-tx Idempotency-Key cache write (Task 16 lights up the persistence)
+      - post-commit update_positions_json (closes F8)
+      - structured POSICION OPENED log at birth (closes F15)
+      - translation of sqlite3.IntegrityError on the partial UNIQUE index to
+        UniqueViolationError (409)
+
+    The route is now thin: validate → register → return. Errors are typed
+    BirthError subclasses; their status_code is honored. No bare `except
+    Exception` — server faults bubble to FastAPI's default 500 handler with
+    the traceback logged (closes Serrano BLOCKER 3 / #473).
+    """
+    from api.positions_birth import (  # noqa: PLC0415
+        BirthError, BirthRegistrar, _build_open_request,
+    )
     try:
-        # B.5 #258: tenant_id from JWT — body's tenant_id (if any) silently dropped
-        with transaction() as con:
-            pos = db_create_position(con, body, tenant_id=tenant_id)
-        update_positions_json()
+        validated = _build_open_request(body, tenant_id, idempotency_key)
+        pos = BirthRegistrar.register(validated)
         return {"ok": True, "position": pos}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except BirthError as e:
+        log.warning(
+            "open_position rejected: %s detail=%s", e.message, e.detail,
+        )
+        # Pydantic ValidationError.errors() may embed non-JSON-serializable
+        # objects under ctx.* (the original Python exception). Stringify to
+        # a JSON-safe shape before handing to FastAPI.
+        safe_detail = json.loads(json.dumps(e.detail, default=str)) if e.detail else None
+        raise HTTPException(status_code=e.status_code, detail={
+            "error": e.__class__.__name__,
+            "message": e.message,
+            "detail": safe_detail,
+        })
 
 
 @router.put(

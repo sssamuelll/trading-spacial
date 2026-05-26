@@ -72,12 +72,21 @@ def init_db() -> None:
                 payload     TEXT
             )
         """)
-        # Migración: agregar columna symbol si la tabla ya existía sin ella
-        try:
-            con.execute("ALTER TABLE scans ADD COLUMN symbol TEXT NOT NULL DEFAULT 'BTCUSDT'")
+        # Migración: agregar columna symbol si la tabla ya existía sin ella.
+        # PRAGMA-guarded (NOT try/except) so the enclosing BEGIN IMMEDIATE tx
+        # remains in a clean state when the column is already present — a
+        # failed ALTER inside a write-tx marks it as abortable and the
+        # subsequent COMMIT silently rolls back unrelated DDL in the same tx
+        # (Serrano HIGH 1, propagation of the 75b3789 pattern).
+        scans_cols = {
+            row[1]
+            for row in con.execute("PRAGMA table_info(scans)").fetchall()
+        }
+        if "symbol" not in scans_cols:
+            con.execute(
+                "ALTER TABLE scans ADD COLUMN symbol TEXT NOT NULL DEFAULT 'BTCUSDT'"
+            )
             log.info("DB migrada: columna 'symbol' añadida.")
-        except sqlite3.OperationalError:
-            pass  # columna ya existe
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS webhooks_sent (
@@ -324,6 +333,30 @@ def init_db() -> None:
     with transaction() as con_qty:
         _migrate_qty_not_null(con_qty)
 
+    # ── D-cluster migrations: ONE transaction (Serrano HIGH 7). ──
+    # All four sub-migrations participate in the same write-tx. Partial
+    # failure of any step rolls the WHOLE cluster back, so the database
+    # never sits in a half-migrated intermediate state. Each sub-step
+    # remains idempotent on its own; the wrapping tx only changes the
+    # group-failure semantics.
+    #
+    # Ordering constraints inside the cluster:
+    #   1. _migrate_qty_positive — depends on the C2 CHECK from
+    #      _migrate_qty_not_null above (already committed in its own tx).
+    #   2. _migrate_tenant_id_not_null — recreates the positions table,
+    #      must run after _migrate_qty_positive so both CHECKs land on
+    #      the new table together.
+    #   3. _migrate_unique_open_scan — installs the partial UNIQUE index
+    #      against the table _migrate_tenant_id_not_null produced.
+    #   4. _migrate_idempotency_keys — independent table; safe to run
+    #      any time but kept in this cluster so D-cluster invariants
+    #      land or roll back together.
+    with transaction() as con_d:
+        _migrate_qty_positive(con_d)
+        _migrate_tenant_id_not_null(con_d)
+        _migrate_unique_open_scan(con_d)
+        _migrate_idempotency_keys(con_d)
+
 
 # Per-user tables that need a tenant_id column (Epic B B.1).
 # kill_switch_* tables intentionally NOT in this list — kept global for B.1
@@ -346,13 +379,18 @@ def _migrate_multi_tenant_b1(con: sqlite3.Connection) -> None:
 
     Task 8 (#446): `con` is now mandatory positional.
     """
-    # Step 1: Add nullable tenant_id to each per-user table
+    # Step 1: Add nullable tenant_id to each per-user table.
+    # PRAGMA-guarded (NOT try/except) so the enclosing BEGIN IMMEDIATE tx
+    # stays clean when the column already exists — Serrano HIGH 1, same
+    # pathology as 75b3789 on _migrate_idempotency_keys.
     for table in PER_USER_TABLES:
-        try:
+        existing_cols = {
+            row[1]
+            for row in con.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if "tenant_id" not in existing_cols:
             con.execute(f"ALTER TABLE {table} ADD COLUMN tenant_id INTEGER")
             log.info(f"DB migration B.1: added tenant_id column to {table}")
-        except sqlite3.OperationalError:
-            pass  # column already exists
 
     # Step 2: Create capital table (single row per user)
     con.execute(
@@ -502,12 +540,20 @@ def _migrate_agent_audit(con: sqlite3.Connection) -> None:
         # re-deriving the TTL from the signed payload. Idempotent ADD
         # COLUMN (the existing rows have NULL — they predate the column,
         # and a NULL expires_at is treated as "no TTL enforcement" for
-        # rows seeded before this migration).
-        try:
-            con.execute("ALTER TABLE agent_side_effects ADD COLUMN expires_at TEXT")
+        # rows seeded before this migration). PRAGMA-guarded (NOT
+        # try/except) so the enclosing BEGIN IMMEDIATE tx stays clean
+        # when the column is already present — Serrano HIGH 1.
+        side_effects_cols = {
+            row[1]
+            for row in con.execute(
+                "PRAGMA table_info(agent_side_effects)"
+            ).fetchall()
+        }
+        if "expires_at" not in side_effects_cols:
+            con.execute(
+                "ALTER TABLE agent_side_effects ADD COLUMN expires_at TEXT"
+            )
             log.info("DB migration: added expires_at column to agent_side_effects")
-        except sqlite3.OperationalError:
-            pass  # column already exists
 
         # Fase 4 of the multi-provider epic: agent_conversations gains
         # `provider` + `reasoning_tokens` columns so /agent/metrics can
@@ -519,19 +565,31 @@ def _migrate_agent_audit(con: sqlite3.Connection) -> None:
         #   - reasoning_tokens: only DS-reasoner populates this today
         #     (DS's usage.completion_tokens_details.reasoning_tokens
         #     field). NULL or 0 elsewhere; metrics treat NULL as 0.
-        # Both ALTERs are idempotent (try/except on OperationalError).
+        # Both ALTERs are idempotent via a single PRAGMA table_info probe
+        # (NOT try/except — a failed ALTER inside the enclosing BEGIN
+        # IMMEDIATE tx would mark it abortable and silently roll back the
+        # rest of the audit migration on COMMIT; Serrano HIGH 1, same
+        # pathology as 75b3789 on _migrate_idempotency_keys).
         # The backfill is also idempotent because it only touches rows
         # WHERE provider IS NULL — running it twice is a no-op.
-        try:
-            con.execute("ALTER TABLE agent_conversations ADD COLUMN provider TEXT")
+        conv_cols = {
+            row[1]
+            for row in con.execute(
+                "PRAGMA table_info(agent_conversations)"
+            ).fetchall()
+        }
+        if "provider" not in conv_cols:
+            con.execute(
+                "ALTER TABLE agent_conversations ADD COLUMN provider TEXT"
+            )
             log.info("DB migration: added provider column to agent_conversations")
-        except sqlite3.OperationalError:
-            pass  # column already exists
-        try:
-            con.execute("ALTER TABLE agent_conversations ADD COLUMN reasoning_tokens INTEGER")
-            log.info("DB migration: added reasoning_tokens column to agent_conversations")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        if "reasoning_tokens" not in conv_cols:
+            con.execute(
+                "ALTER TABLE agent_conversations ADD COLUMN reasoning_tokens INTEGER"
+            )
+            log.info(
+                "DB migration: added reasoning_tokens column to agent_conversations"
+            )
 
         # Backfill provider from model. Only touches rows where provider
         # IS NULL (i.e. pre-Fase-4 rows) — safe to re-run. The mapping
@@ -829,4 +887,351 @@ def _migrate_qty_not_null(con: sqlite3.Connection) -> None:
     log.info(
         "_migrate_qty_not_null: migration complete. "
         "positions enforces qty IS NOT NULL OR status='legacy_unmeasurable'."
+    )
+
+
+def _migrate_qty_positive(con: sqlite3.Connection) -> None:
+    """Extend the qty CHECK from 'NOT NULL' to '> 0' (#471 closure of qty=0 bypass).
+
+    Production measurement (2026-05-26): 72 rows with qty=0.0 exactly (68
+    closed, 2 open, 2 cancelled). These bypassed the C2 NULL check.
+
+    Policy (Voronov dual-rung): re-status the 72 zero-qty rows as
+    'legacy_unmeasurable' (admit the absence; don't invent a value), then
+    extend the CHECK to require qty > 0 on non-quarantine rows.
+
+    Idempotent: detects the qty>0 fragment in the live schema and skips.
+    """
+    schema_row = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='positions'"
+    ).fetchone()
+    if not schema_row or not schema_row[0]:
+        log.warning(
+            "_migrate_qty_positive: positions table not found; skipping."
+        )
+        return
+    # Normalize whitespace for the idempotency probe. Look for "qty > 0" or
+    # "qty>0" anywhere in the CHECK fragment.
+    normalized = "".join(schema_row[0].split()).lower()
+    if "qty>0" in normalized:
+        log.info(
+            "_migrate_qty_positive: positions already enforces qty > 0; skipping."
+        )
+        return
+
+    # 1. Quarantine zero-qty rows (any status). The C2 CHECK allowed them; the
+    #    new CHECK will reject them on non-quarantine status. Re-status to
+    #    legacy_unmeasurable (same quarantine bucket used by C2).
+    con.execute(
+        """UPDATE positions
+              SET status = 'legacy_unmeasurable'
+            WHERE qty = 0
+              AND status != 'legacy_unmeasurable'"""
+    )
+    quarantined = con.execute("SELECT changes()").fetchone()[0]
+    log.info(
+        "_migrate_qty_positive: quarantined %d zero-qty rows as 'legacy_unmeasurable'.",
+        quarantined,
+    )
+
+    # 2. Defensive sanity: any qty < 0 in legacy data also goes to quarantine.
+    con.execute(
+        """UPDATE positions
+              SET status = 'legacy_unmeasurable'
+            WHERE qty < 0
+              AND status != 'legacy_unmeasurable'"""
+    )
+    neg_quarantined = con.execute("SELECT changes()").fetchone()[0]
+    if neg_quarantined:
+        log.warning(
+            "_migrate_qty_positive: quarantined %d NEGATIVE-qty rows (unexpected).",
+            neg_quarantined,
+        )
+
+    # 3. Recreate the table with the strengthened CHECK.
+    log.info(
+        "_migrate_qty_positive: recreating positions table with "
+        "CHECK ((qty IS NOT NULL AND qty > 0) OR status='legacy_unmeasurable')."
+    )
+    existing_cols = {
+        row[1] for row in con.execute("PRAGMA table_info(positions)").fetchall()
+    }
+    con.execute(
+        """
+        CREATE TABLE positions_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_id     INTEGER REFERENCES scans(id),
+            symbol      TEXT    NOT NULL,
+            direction   TEXT    NOT NULL DEFAULT 'LONG',
+            status      TEXT    NOT NULL DEFAULT 'open',
+            entry_price REAL    NOT NULL,
+            entry_ts    TEXT    NOT NULL,
+            sl_price    REAL,
+            tp_price    REAL,
+            size_usd    REAL,
+            qty         REAL,
+            exit_price  REAL,
+            exit_ts     TEXT,
+            exit_reason TEXT,
+            pnl_usd     REAL,
+            pnl_pct     REAL,
+            notes       TEXT,
+            atr_entry   REAL,
+            be_mult     REAL,
+            tenant_id   INTEGER,
+            CHECK ((qty IS NOT NULL AND qty > 0) OR status = 'legacy_unmeasurable')
+        )
+        """
+    )
+    TARGET_COLS = [
+        "id", "scan_id", "symbol", "direction", "status", "entry_price",
+        "entry_ts", "sl_price", "tp_price", "size_usd", "qty",
+        "exit_price", "exit_ts", "exit_reason", "pnl_usd", "pnl_pct",
+        "notes", "atr_entry", "be_mult", "tenant_id",
+    ]
+    select_expressions = [
+        col if col in existing_cols else "NULL"
+        for col in TARGET_COLS
+    ]
+    insert_sql = (
+        f"INSERT INTO positions_new ({', '.join(TARGET_COLS)}) "
+        f"SELECT {', '.join(select_expressions)} FROM positions"
+    )
+    con.execute(insert_sql)
+    con.execute("DROP TABLE positions")
+    con.execute("ALTER TABLE positions_new RENAME TO positions")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_positions_tenant ON positions(tenant_id)")
+    log.info(
+        "_migrate_qty_positive: migration complete. positions enforces qty > 0."
+    )
+
+
+def _migrate_tenant_id_not_null(con: sqlite3.Connection) -> None:
+    """Schema CHECK: tenant_id IS NOT NULL OR status IN ('legacy_unmeasurable',
+    'legacy_no_tenant') — #471 (Voronov D-schema rung, tenant invariant).
+
+    Production measurement (2026-05-26): 2018/2018 positions had
+    tenant_id IS NULL. Of those, 670 are already in legacy_unmeasurable from
+    C2 — the new CHECK exempts them via the OR (no double-quarantine).
+    The remaining ~1348 get re-statused to 'legacy_no_tenant'.
+
+    Idempotent: detects the 'legacy_no_tenant' literal in the live CHECK
+    fragment and skips.
+    """
+    schema_row = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='positions'"
+    ).fetchone()
+    if not schema_row or not schema_row[0]:
+        log.warning(
+            "_migrate_tenant_id_not_null: positions table not found; skipping."
+        )
+        return
+    if "legacy_no_tenant" in schema_row[0]:
+        log.info(
+            "_migrate_tenant_id_not_null: positions already exempts "
+            "'legacy_no_tenant'; skipping."
+        )
+        return
+
+    # Column-aware: if tenant_id column missing (pre-B.1 stub schema), skip
+    # the backfill UPDATE — there is nothing to re-status — but still recreate
+    # the table with the CHECK so the invariant is anchored at the schema.
+    existing_cols = {
+        row[1] for row in con.execute("PRAGMA table_info(positions)").fetchall()
+    }
+    if "tenant_id" in existing_cols:
+        # 1. Quarantine NULL-tenant rows that are NOT already in legacy_unmeasurable.
+        #    Rows already in legacy_unmeasurable keep that status — the OR in the new
+        #    CHECK will exempt them directly.
+        con.execute(
+            """UPDATE positions
+                  SET status = 'legacy_no_tenant'
+                WHERE tenant_id IS NULL
+                  AND status != 'legacy_unmeasurable'"""
+        )
+        quarantined = con.execute("SELECT changes()").fetchone()[0]
+        log.info(
+            "_migrate_tenant_id_not_null: re-statused %d NULL-tenant rows as "
+            "'legacy_no_tenant'.",
+            quarantined,
+        )
+    else:
+        log.info(
+            "_migrate_tenant_id_not_null: skipping backfill — tenant_id column "
+            "not yet present (pre-B.1 stub schema)."
+        )
+
+    # 2. Recreate the table with the strengthened CHECK. Both CHECKs (qty>0
+    #    from Task 4 + tenant_id from this migration) must coexist on the
+    #    new table — they compose.
+    log.info(
+        "_migrate_tenant_id_not_null: recreating positions with CHECK "
+        "(tenant_id IS NOT NULL OR status IN ('legacy_unmeasurable','legacy_no_tenant'))."
+    )
+    con.execute(
+        """
+        CREATE TABLE positions_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_id     INTEGER REFERENCES scans(id),
+            symbol      TEXT    NOT NULL,
+            direction   TEXT    NOT NULL DEFAULT 'LONG',
+            status      TEXT    NOT NULL DEFAULT 'open',
+            entry_price REAL    NOT NULL,
+            entry_ts    TEXT    NOT NULL,
+            sl_price    REAL,
+            tp_price    REAL,
+            size_usd    REAL,
+            qty         REAL,
+            exit_price  REAL,
+            exit_ts     TEXT,
+            exit_reason TEXT,
+            pnl_usd     REAL,
+            pnl_pct     REAL,
+            notes       TEXT,
+            atr_entry   REAL,
+            be_mult     REAL,
+            tenant_id   INTEGER,
+            CHECK ((qty IS NOT NULL AND qty > 0) OR status = 'legacy_unmeasurable'),
+            CHECK (tenant_id IS NOT NULL OR status IN ('legacy_unmeasurable', 'legacy_no_tenant'))
+        )
+        """
+    )
+    TARGET_COLS = [
+        "id", "scan_id", "symbol", "direction", "status", "entry_price",
+        "entry_ts", "sl_price", "tp_price", "size_usd", "qty",
+        "exit_price", "exit_ts", "exit_reason", "pnl_usd", "pnl_pct",
+        "notes", "atr_entry", "be_mult", "tenant_id",
+    ]
+    select_expressions = [
+        col if col in existing_cols else "NULL"
+        for col in TARGET_COLS
+    ]
+    insert_sql = (
+        f"INSERT INTO positions_new ({', '.join(TARGET_COLS)}) "
+        f"SELECT {', '.join(select_expressions)} FROM positions"
+    )
+    con.execute(insert_sql)
+    con.execute("DROP TABLE positions")
+    con.execute("ALTER TABLE positions_new RENAME TO positions")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_positions_tenant ON positions(tenant_id)")
+    log.info(
+        "_migrate_tenant_id_not_null: migration complete. positions enforces "
+        "tenant_id IS NOT NULL or quarantine."
+    )
+
+
+def _migrate_unique_open_scan(con: sqlite3.Connection) -> None:
+    """Partial unique index on (tenant_id, scan_id) WHERE status='open' AND
+    scan_id IS NOT NULL — #470 idempotency race closure.
+
+    Closes the race window of two concurrent POST /positions with the same
+    scan_id: the second INSERT fires sqlite3.IntegrityError, which
+    BirthRegistrar maps to a 409 UniqueViolationError. Combined with the
+    Idempotency-Key cache (Task 17), a retried client request is replayed
+    safely; a duplicate client request hits the schema fence.
+
+    Production measurement (2026-05-26): only 2 rows share scan_id=42, both
+    closed. No open rows currently violate this index — migration is safe
+    at-rest.
+
+    Column-aware: if `positions` is missing OR either `tenant_id` / `scan_id`
+    column is absent (pre-B.1 stub schema), skip — there is nothing to index
+    against.
+
+    Idempotent: CREATE INDEX IF NOT EXISTS.
+    """
+    schema_row = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='positions'"
+    ).fetchone()
+    if not schema_row:
+        log.warning(
+            "_migrate_unique_open_scan: positions table not found; skipping."
+        )
+        return
+    existing_cols = {
+        row[1] for row in con.execute("PRAGMA table_info(positions)").fetchall()
+    }
+    if "tenant_id" not in existing_cols or "scan_id" not in existing_cols:
+        log.info(
+            "_migrate_unique_open_scan: tenant_id and/or scan_id column "
+            "missing; skipping (pre-B.1 stub schema)."
+        )
+        return
+    con.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_open_scan_unique
+              ON positions (tenant_id, scan_id)
+              WHERE status = 'open' AND scan_id IS NOT NULL"""
+    )
+    log.info(
+        "_migrate_unique_open_scan: partial UNIQUE index ensured "
+        "(tenant_id, scan_id) WHERE status='open' AND scan_id IS NOT NULL."
+    )
+
+
+def _migrate_idempotency_keys(con: sqlite3.Connection) -> None:
+    """Idempotency-Key cache table — #470 (Voronov D-Tipo HTTP rung).
+
+    Backs `api.positions_birth.IdempotencyCache`: per-(tenant, key) cache of
+    serialized POST /positions results. 24h TTL enforced at read time
+    (`expires_at > now`), with lazy cleanup deleting expired rows for the
+    same (tenant, key) on each `get`. No background sweeper, no scheduler.
+
+    Per Voronov: "performance + UX, no invariante existencial" — this is the
+    operational cousin of the structural #470 partial UNIQUE index. The
+    schema fence catches duplicate scan_id at the DB; this cache lets a
+    well-behaved client retry safely without paying for a 409 round-trip.
+
+    PRIMARY KEY (tenant_id, key) makes `INSERT OR REPLACE` the natural
+    overwrite primitive. Secondary index on `expires_at` is reserved for a
+    future eager sweeper if lazy cleanup proves insufficient (NOT used by
+    the current `get` path; included for forward compatibility).
+
+    `body_sha256` carries the SHA-256 of the canonical-JSON request body
+    that produced `result_json`. BirthRegistrar compares fingerprints on
+    cache hit; a mismatch raises DuplicateIdempotencyKeyError (409) per
+    RFC 9457 idempotency semantics. The column is added via idempotent
+    ALTER TABLE so installations created before the fingerprint guard
+    pick it up on next boot (Serrano BLOCKER 1).
+
+    Idempotent: CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS +
+    PRAGMA-guarded ALTER for the body_sha256 column (a try/except on the
+    ALTER would mark the enclosing BEGIN IMMEDIATE tx as abortable when
+    the column already exists, which silently rolls back the entire
+    D-cluster on subsequent COMMIT; PRAGMA check avoids contaminating
+    the tx).
+    """
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS idempotency_keys (
+               tenant_id      INTEGER NOT NULL,
+               key            TEXT    NOT NULL,
+               result_json    TEXT    NOT NULL,
+               body_sha256    TEXT,
+               created_at     TEXT    NOT NULL,
+               expires_at     TEXT    NOT NULL,
+               PRIMARY KEY (tenant_id, key)
+           )"""
+    )
+    # ALTER TABLE for installations that created the table BEFORE the
+    # body_sha256 column existed. PRAGMA-guarded (NOT try/except) so the
+    # enclosing tx remains in a clean state when the column is already
+    # present.
+    existing_cols = {
+        row[1]
+        for row in con.execute("PRAGMA table_info(idempotency_keys)").fetchall()
+    }
+    if "body_sha256" not in existing_cols:
+        con.execute(
+            "ALTER TABLE idempotency_keys ADD COLUMN body_sha256 TEXT"
+        )
+        log.info(
+            "_migrate_idempotency_keys: added body_sha256 column to "
+            "idempotency_keys."
+        )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_idempotency_expires "
+        "ON idempotency_keys(expires_at)"
+    )
+    log.info(
+        "_migrate_idempotency_keys: idempotency_keys table + expires index "
+        "ensured."
     )

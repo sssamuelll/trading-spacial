@@ -343,13 +343,36 @@ Tres consecuencias para esta codebase:
 2. `NewType` solo cuenta como 'tipo' si el consumer también está anotado y el camino completo es estructuralmente coherente. Una `PrecheckConn` definida y luego pasada a una función con anotación `sqlite3.Connection` regresa a 'convención'.
 3. Cerrar un issue (`#NNN`) contra una eliminación parcial de la patología deja la enfermedad en los sitios no tocados. Closure requiere que el predicado del issue sea verdad en todos los call sites, no sólo los listados en el plan.
 
-### Invariantes C2 — estado tras este PR
+### Invariantes registradas — estado tras Cluster D (post-#471 #470 #473, post-convergencia Serrano/Aurelius)
+
+> Esta tabla **reemplaza** la antigua tabla C2 (que listaba sólo #467/#468/#469). Las tres filas C2 están retenidas aquí; añade las siete filas de Cluster D. Una sola tabla de verdad — la duplicación adjacente previa era deuda doc nombrada por Serrano MEDIUM 10.
 
 | Invariante de dominio | Capa enforced | Mecanismo | Issue cerrado |
 |---|---|---|---|
-| `qty` siempre tiene valor numérico para positions activas (o `status='legacy_unmeasurable'`) | **Schema** | `CHECK (qty IS NOT NULL OR status='legacy_unmeasurable')` en `positions` (vía `_migrate_qty_not_null` en `db/schema.py`) | #467 |
+| `qty` siempre tiene valor numérico para positions activas (o `status='legacy_unmeasurable'`) | **Schema** | `CHECK (qty IS NOT NULL OR status='legacy_unmeasurable')` en `positions` (vía `_migrate_qty_not_null`) | #467 |
 | `precheck_connection` y `snapshot_connection` son contratos distintos | **Tipo** | `NewType("PrecheckConn", sqlite3.Connection)` y `NewType("SnapshotConn", sqlite3.Connection)` en `db/transaction.py` — mypy detecta mis-uso | #468 |
 | Los campos del snapshot consumidos por el write-tx no cambian entre precheck y BEGIN IMMEDIATE | **Tipo + runtime check** | `OwnershipValidatedSnapshot` (factory privada en `operators/precheck.py`) + field-by-field re-validation en `PositionClosure.execute()` cubre los 6 campos del `PositionSnapshot` | #469 + F6 |
+| `qty > 0` para positions activas (cierra el 0.0-bypass) | **Schema** | `CHECK ((qty IS NOT NULL AND qty > 0) OR status='legacy_unmeasurable')` (via `_migrate_qty_positive`) | #471 |
+| `tenant_id IS NOT NULL` para positions activas | **Schema** | `CHECK (tenant_id IS NOT NULL OR status IN ('legacy_unmeasurable','legacy_no_tenant'))` (via `_migrate_tenant_id_not_null`) | #471 |
+| `tenant_id: int > 0` en la frontera de entrada (anotación + rechazo runtime) | **Tipo + runtime órgano de rechazo** | `_build_open_request` rechaza `tenant_id` no-int, ≤ 0, bool, o None con `BodyValidationError` (regla de coherencia post-Serrano) | #471 F6 |
+| Idempotencia estructural: no dos open rows con el mismo `(tenant_id, scan_id)` | **Schema** | `CREATE UNIQUE INDEX idx_positions_open_scan_unique ... WHERE status='open' AND scan_id IS NOT NULL` (via `_migrate_unique_open_scan`) | #470 |
+| Probe + INSERT + cache write atómicos por request (no TOCTOU race entre Idempotency-Key probe y row INSERT) | **Operador-ligero** | `BirthRegistrar.register` corre todo bajo UNA `with transaction()` (BEGIN IMMEDIATE) — colapsa los rungs por el reframe de Aurelius | #470 (race), #473 |
+| Idempotencia HTTP con body-fingerprint (misma key + diferente body → 409, no replay) | **Tipo (HTTP) + Schema** | tabla `idempotency_keys` con columna `body_sha256` (SHA-256 del canonical-JSON post-Pydantic); `BirthRegistrar` levanta `DuplicateIdempotencyKeyError` si el fingerprint no matchea | #473 |
+| Input externo → `Position` legítima (allowlist symbol, direction enum, qty>0, SL/TP relacional, entry_ts window) | **Tipo + runtime órgano de rechazo** | Pydantic `OpenPositionRequest` (extra='forbid') + factory privada `_build_open_request` con `_OPEN_REQUEST_SENTINEL` en `api/positions_birth.py` | #471 F5/F6/F7/F9, #473 |
+| Error taxonomy 422/409/503 vs 500 — traducción al layer originante, no por substring de prosa | **Tipo** | `BirthError` hierarchy (`BodyValidationError`, `AmbiguousQtyError`, `StaleEntryTsError`, `TenantViolationError`, `DuplicateIdempotencyKeyError`, `IdempotencyCacheUnavailableError`, `UniqueViolationError`, `SchemaIntegrityError`); `BirthRegistrar._translate_integrity_error` mapea por `sqlite_errorcode` + fragmento del CHECK (no por substring de prosa inglesa). `IdempotencyCacheUnavailableError` (503) cierra el silent-duplicate window cuando el cliente pidió `Idempotency-Key` y el cache está unreachable (Serrano HIGH 2 post-convergencia) | #473 |
+| Post-commit atomicidad + observabilidad de `update_positions_json` | **Operador-ligero + log estructurado** | `BirthRegistrar.register` posee la tx; si el snapshot post-commit falla, emite `log.error("POSITION_SNAPSHOT_STALE pos_id=... tenant=... snapshot_error=...")` (no swallows silencioso — Serrano HIGH 5) | #473 F8 |
+| Observabilidad + fail-closed del cache de idempotencia | **Log estructurado + Tipo** | `IdempotencyCache.get/.set` emiten `log.error("IDEMPOTENCY_CACHE_UNREACHABLE ...")` cuando la tabla falla, y levantan `_CacheUnavailable`. `BirthRegistrar` lo traduce a `IdempotencyCacheUnavailableError` (503) **sólo cuando** el request portaba `Idempotency-Key` — un request sin key bypassa el cache y nunca ve la excepción. Cierra el silent-duplicate window (cache no-op + INSERT commit + retry → dos rows bajo la misma key) | Serrano MEDIUM 11 + HIGH 2 |
+| Cluster D migrations atómicas como grupo | **Schema** | Las cuatro sub-migraciones (`_migrate_qty_positive`, `_migrate_tenant_id_not_null`, `_migrate_unique_open_scan`, `_migrate_idempotency_keys`) corren bajo UNA `with transaction()` en `init_db` — partial failure roll-back-ea el cluster entero | Serrano HIGH 7 |
+
+### Principio dual de la frontera Cluster D (Voronov 2026-05-26)
+
+> Una `Position` existe si y solo si su acto de nominación satisfizo simultáneamente: (a) el contrato existencial del schema (qué la convierte ontológicamente en Position), y (b) el contrato de nominación de la frontera de entrada (qué valida que el input externo intentaba declararla legítimamente). Schema es la frontera que ningún caller evade; nominación es donde el error toma forma semántica.
+
+> `close()` valida una transición entre dos estados conocidos del mismo objeto. `open()` no valida transición — valida un acto de nominación. Son primos, no hermanos. Cluster D NO introduce un `PositionOpen` operador simétrico a `PositionClosure` — eso sería "falsa simetría — imitación visual; no comparte contrato". `BirthRegistrar` es un op-ligero: validación ocurrió arriba (Pydantic + `_build_open_request`); el registrar solo posee la atomicidad transacción + post-commit.
+
+### Documented status: `legacy_no_tenant`
+
+Status especial usado por `_migrate_tenant_id_not_null` (#471) para reconocer rows históricas pre-multi-tenant cuya `tenant_id` no es recuperable. El schema CHECK exempta `legacy_unmeasurable` Y `legacy_no_tenant`. Rows ya marcadas `legacy_unmeasurable` (de la migración C2) NO se re-clasifican — el OR del CHECK las exempta directamente. Convierte 2018 mentiras silenciosas (tenant_id=NULL implícito) en reconocimientos explícitos.
 
 ### Patrón nombrado: "invariantes de dominio sin contraparte estructural"
 
@@ -367,11 +390,16 @@ Implicación: hasta que `create_position` exija lo que `close_position` asume, t
 
 Status especial usado por `_migrate_qty_not_null` (#467) para reconocer 670 rows históricas cuya `qty` nunca fue medida y no es derivable. El schema CHECK constraint exempta este status: `CHECK (qty IS NOT NULL OR status='legacy_unmeasurable')`. Convierte 670 mentiras silenciosas en 670 reconocimientos explícitos.
 
-### Known scope gap (Voronov 2026-05-26)
+### Known scope gap (post-D, post-convergencia)
 
-> El sistema enforza invariantes en el momento de cruce (precheck→snapshot, snapshot→write) pero **no enforza invariantes en el momento de origen** (creación de la position). Toda la cadena de defensa de C2 asume que la position fue creada correctamente. Si en `position_open` se crea una row con `tenant_id` mal asignado, los 3 mecanismos de C2 la sostendrán correctamente *con el tenant equivocado*. C2 endurece el ciclo de vida; no endurece el nacimiento.
+Las siguientes patologías están reconocidas y deferidas — no son parte del cierre estructural de #471/#470/#473 y no bloquean su merge. Cada una tiene/necesita issue separado.
 
-Esta deuda NO está cubierta por este PR. Tratamiento futuro: auditar `db_create_position` y los endpoints que invocan creación (`POST /positions`, paths del scanner) bajo la misma lente del registro de capas.
+- **Rate limiting (#473 F10) — `Advances #473`, no `closes`.** El endpoint `POST /positions` no tiene throttle. Un cliente legítimo con la `Idempotency-Key` correcta puede inundar el endpoint creando rows distintas (cada body único pasa). El sistema confía en autenticación + JWT para acotar abuso. F10 vive en issue follow-up separado (#483). El PR body del Cluster D dice `Advances #473 (F10 deferred to #483)` para evitar overstatement (Serrano LOW 15).
+- **Direction enum sólo en boundary (#482)** — el schema acepta cualquier TEXT en `positions.direction`; el `Literal["LONG","SHORT"]` vive sólo en la frontera Pydantic. Una migración manual o cliente legacy podría escribir `"long"` en lowercase. Mover a `CHECK (direction IN ('LONG','SHORT'))` es follow-up trivial.
+- **`scan_id` FK (#484)** — `scan_id` es nullable y referencia una tabla que no existe (no hay `scans` con esa semántica de signal_id). El UNIQUE parcial cierra la race condition (#470) pero NO la integridad referencial.
+- **Idempotency cache eager sweeper (Serrano MEDIUM 4)** — lazy cleanup es per-key only; one-shot keys que nadie re-pregunta nunca leakean en la tabla. El índice `idx_idempotency_expires` ya está creado para soportar un sweeper futuro. Follow-up pendiente (sin issue formal aún — bajo impacto).
+- **`entry_ts` window relajada (Serrano MEDIUM 9)** — `[now-7d, now+60s]` rechaza backfills legítimos y clientes con skew >60s. Requiere decisión UX antes de relajar. Sin issue formal aún.
+- **`legacy_no_tenant` consumer filters (Serrano MEDIUM 12)** — el status nuevo está en el schema; ningún consumer del UI / agente filtra rows con ese status explícitamente. Hoy es teórico (rows con `legacy_no_tenant` no son `open`, y las queries más activas filtran por status). Audit de cada consumer pendiente.
 
 ## Known Limitations
 - `watchdog.py` uses Windows-specific commands (`tasklist`, `taskkill`, `wmic`, `netstat`) and won't run on Linux/Mac
