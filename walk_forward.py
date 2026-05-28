@@ -32,7 +32,7 @@ import argparse
 import logging
 import sys
 from dataclasses import dataclass, asdict
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Iterable
 
 from dateutil.relativedelta import relativedelta
@@ -260,6 +260,109 @@ def compute_windows(
         fold += 1
 
     return windows
+
+
+# --------------------------------------------------------------------------- #
+# Per-window tuning (commit 3 of #276)
+# --------------------------------------------------------------------------- #
+#
+# `tune_window` drives `auto_tune.optimize_symbol` over the active portfolio
+# for a single fold, using `window.train_end` as both the "today" reference
+# (anchors `calculate_periods`) and the `cutoff` (no-leakage upper bound on
+# every backtest call inside the optimizer).
+#
+# Contract:
+#   - `auto_tune.optimize_symbol(symbol, config, today=cutoff, cutoff=cutoff)`
+#     is the canonical invocation pattern. The pre-holdout retune wrapper
+#     (`tools/retune_pre_holdout.py:74`) uses the same shape; do not diverge.
+#   - `window.train_end` is a `datetime.date`. `optimize_symbol` reaches into
+#     `calculate_periods` which does `relativedelta` arithmetic on a UTC
+#     `datetime`, so we lift `train_end` to midnight UTC before passing.
+#   - The portfolio comes from `auto_tune.get_portfolio_symbols(config)` —
+#     filters out symbols whose override is exactly `False`.
+#   - One call per active symbol. No process pool here: that orchestration
+#     belongs to a downstream commit (whoever wires the harness end-to-end
+#     decides whether to parallelise; this layer stays single-threaded so
+#     callers can monkeypatch in tests without ProcessPoolExecutor friction).
+#
+# Holdout safety (Non-Negotiable #3):
+#   - `window.train_end <= holdout_start` is guaranteed by `compute_windows`
+#     (commit 1 contract). This function consumes that contract; it does not
+#     re-verify it.
+#   - `cutoff` is propagated into `optimize_symbol` so every internal
+#     `run_backtest_with_params` strips bars `>= cutoff`. The assertion in
+#     `_slice_below_cutoff` is the load-bearing guard.
+
+
+def _train_end_to_cutoff(train_end: date) -> datetime:
+    """Lift a fold's `train_end` (date) to a tz-aware UTC datetime at midnight.
+
+    `auto_tune.calculate_periods` does month arithmetic with `relativedelta`
+    against `today`, and downstream `_slice_below_cutoff` compares against
+    OHLCV index timestamps. Both need a `datetime`. Midnight UTC is the
+    canonical lift used by `tools/retune_pre_holdout.py`.
+    """
+    if isinstance(train_end, datetime):
+        # Already a datetime; ensure tz-aware UTC.
+        return train_end if train_end.tzinfo is not None else train_end.replace(tzinfo=timezone.utc)
+    return datetime(train_end.year, train_end.month, train_end.day, tzinfo=timezone.utc)
+
+
+def tune_window(window: Window, config: dict) -> dict:
+    """Run `auto_tune.optimize_symbol` for every active portfolio symbol
+    against a single walk-forward fold.
+
+    The cutoff is pinned to `window.train_end` (lifted to midnight UTC) and
+    passed as both `today` and `cutoff` — matching the contract that
+    `tools/retune_pre_holdout.py:74` exercises in production.
+
+    Args:
+        window: Fold descriptor produced by `compute_windows`. Only
+            `train_end` is consumed here; `test_*` boundaries are not
+            referenced because optimization is anchored to the train edge.
+        config: Application config dict (the same shape `auto_tune` loads
+            via `load_app_config`). Must contain `symbol_overrides` for
+            `get_portfolio_symbols` to filter, and `auto_tune.seed` if a
+            non-default RNG seed is desired.
+
+    Returns:
+        A dict shaped::
+
+            {
+                "window_index": int,
+                "train_end": "YYYY-MM-DD",
+                "cutoff": "<iso datetime>",
+                "results": {symbol: <optimize_symbol return dict>, ...},
+            }
+
+        Symbol order in `results` matches the order returned by
+        `get_portfolio_symbols`. An empty portfolio yields `results == {}`.
+
+    Raises:
+        Whatever `auto_tune.optimize_symbol` raises is propagated. The
+        pre-holdout wrapper swallows per-symbol exceptions in its process
+        pool; this layer leaves that policy to callers.
+    """
+    # Local import to avoid pulling `auto_tune` (and its heavy transitive
+    # deps — pandas, the strategy module, etc.) at walk_forward import
+    # time. The CLI scaffold and the window math do not need them.
+    import auto_tune  # noqa: PLC0415
+
+    symbols = auto_tune.get_portfolio_symbols(config)
+    cutoff = _train_end_to_cutoff(window.train_end)
+
+    results: dict[str, dict] = {}
+    for sym in symbols:
+        results[sym] = auto_tune.optimize_symbol(
+            sym, config, today=cutoff, cutoff=cutoff
+        )
+
+    return {
+        "window_index": window.index,
+        "train_end": window.train_end.isoformat(),
+        "cutoff": cutoff.isoformat(),
+        "results": results,
+    }
 
 
 # --------------------------------------------------------------------------- #
