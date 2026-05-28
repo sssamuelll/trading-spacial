@@ -35,8 +35,7 @@ import { formatPrice } from '../utils';
 import { getOhlcv } from '../api';
 import { useAgentStream } from '../agent/useAgentStream';
 import { SURFACE_SYMBOL_DETAIL } from '../agent/surfaces';
-import type { ProposalChip, ToolChip } from '../agent/types';
-import { SCORE_FACTORS } from '../constants/score-factors';
+import type { AgentContextHints, ProposalChip, ToolChip } from '../agent/types';
 
 // ── Public types ─────────────────────────────────────────────
 
@@ -74,26 +73,6 @@ function cssVar(name: string, fallback: string): string {
   if (typeof window === 'undefined') return fallback;
   const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   return v || fallback;
-}
-
-// TODO: replace when backend exposes symbol.score_components: boolean[].
-// See: frontend/src/constants/score-factors.ts for the 9-factor catalog.
-function buildFactors(symbol: SymbolStatus) {
-  const score   = symbol.score ?? 0;
-  const lrc     = symbol.lrc_pct ?? 50;
-  const trigger = symbol.señal === true;
-  const seed = symbol.symbol.split('').reduce((a, c) => a + c.charCodeAt(0), 0);
-
-  const passes = new Set<number>();
-  if (lrc < 25) passes.add(0);   // LRC
-  if (trigger)  passes.add(8);   // TRIG
-  let i = 0;
-  while (passes.size < score && i < 100) {
-    const idx = (seed + i * 7) % 9;
-    passes.add(idx);
-    i++;
-  }
-  return SCORE_FACTORS.map((f, idx) => ({ ...f, pass: passes.has(idx) }));
 }
 
 // Note: the `<<<TOOL:name>>>` marker protocol the Copilot used to parse
@@ -395,31 +374,119 @@ const Copilot: React.FC<CopilotProps> = ({ symbol, agentEnabled }) => {
   // system prompt with the streaming hook. The server owns the prompt
   // (api/agent/prompts/system.py + surfaces.py), the tool schema, and
   // the audit. The model never sees a frontend-built system prompt.
-  const { msgs, loading, sendTurn, confirmProposal } = useAgentStream({
+  const { msgs, loading, sendTurn, confirmProposal, streamGreeting } = useAgentStream({
     surface: SURFACE_SYMBOL_DETAIL,
   });
 
-  // Proactive synthetic greeting computed locally — never goes on the
-  // wire, never enters the rolling transcript. Re-derives whenever
-  // the symbol or its score-relevant fields change.
-  const greeting = useMemo<{ text: string; verdict: Verdict } | null>(() => {
+  // Template greeting computed locally from backend fields — instant, 0ms,
+  // cites symbol.señal / symbol.gatillo / symbol.estado / symbol.score /
+  // symbol.direction directly. No thresholds invented, no factors fabricated
+  // (#528). This is the fallback the LLM-enriched bubble replaces below.
+  const templateGreeting = useMemo<{ text: string; verdict: Verdict } | null>(() => {
     if (!symbol) return null;
-    const factors = buildFactors(symbol);
-    const passing = factors.filter((f) => f.pass);
-    const failing = factors.filter((f) => !f.pass);
-    const verdict: Verdict =
-      passing.length >= 6 ? 'bull' :
-      passing.length >= 4 ? 'warn' :
-      'bear';
-    const base = symbol.symbol.replace('USDT', '');
-    const text =
-      verdict === 'bull'
-        ? `Detecté **setup firme** en ${base}. Score ${passing.length}/9, gatillo activo. ¿Quieres que te explique los factores o prefieres simular una posición?`
-        : verdict === 'warn'
-        ? `${base} muestra **setup parcial** (${passing.length}/9). Faltan ${failing.length} confirmaciones. ¿Te explico cuáles?`
-        : `${base} **no recomienda entrar ahora** — sólo ${passing.length} de 9 filtros se cumplen. ¿Te muestro qué falta?`;
+    const base   = symbol.symbol.replace('USDT', '');
+    const score  = symbol.score ?? 0;
+    const dir    = symbol.direction ?? 'LONG';
+    const isSig  = symbol.señal === true;
+    const isStp  = symbol.setup === true;
+    const isTrig = symbol.gatillo === true;
+    const verdict: Verdict = isSig ? 'bull' : isStp ? 'warn' : 'bear';
+    const text = isSig
+      ? `Señal ${dir} confirmada en ${base}. Score ${score}/9${isTrig ? ', gatillo activo' : ''}. ¿Quieres simular una posición o ver historial del par?`
+      : isStp
+      ? `${base} en setup ${dir.toLowerCase()}, ${isTrig ? 'gatillo activo' : 'esperando gatillo 5M'}. Score ${score}/9. ¿Te explico qué falta para señal?`
+      : `${base} sin setup ahora — score ${score}/9. ¿Te explico el estado actual?`;
     return { text, verdict };
   }, [symbol]);
+
+  // Hybrid greeting #528: the template above shows instantly (0ms). In
+  // parallel, fire a one-shot LLM call to the copilot with the symbol's
+  // live state as context. When the model responds, replace the bubble
+  // with its richer prose. Cache by `symbol + ts` so re-opening the same
+  // drawer for the same scan doesn't re-burn tokens; a new scan (ts
+  // changes) invalidates the cache and re-enriches.
+  //
+  // Race resolution: if the operator switches symbols mid-stream, the
+  // useEffect cleanup discards the in-flight result via a "live" flag —
+  // the dropped response stays out of `enrichedText`, the new drawer's
+  // own effect fires fresh. No explicit AbortController needed because
+  // the response is ignored, not the network call (greeting calls are
+  // short and the cost of letting them finish is bounded).
+  const greetingCacheRef = useRef<Map<string, string>>(new Map());
+  const [enrichedText, setEnrichedText] = useState<string | null>(null);
+  const [enrichedKey, setEnrichedKey]   = useState<string | null>(null);
+
+  // Key for cache + race detection. Null when symbol/ts not available yet —
+  // skip enrichment until the scan has actually run.
+  const greetingKey = useMemo(() => {
+    if (!symbol || !symbol.ts) return null;
+    return `${symbol.symbol}:${symbol.ts}`;
+  }, [symbol]);
+
+  useEffect(() => {
+    if (!greetingKey || !symbol) {
+      setEnrichedText(null);
+      setEnrichedKey(null);
+      return;
+    }
+    // Cache hit — paint instantly, no LLM call.
+    const cached = greetingCacheRef.current.get(greetingKey);
+    if (cached) {
+      setEnrichedText(cached);
+      setEnrichedKey(greetingKey);
+      return;
+    }
+    // Cache miss — clear stale enrichment from the previous symbol's drawer,
+    // then fire the LLM call. Mark this effect-instance "live" so a switch
+    // mid-stream discards its result.
+    setEnrichedText(null);
+    setEnrichedKey(null);
+    let live = true;
+    // The prompt carries the live state of the symbol so the model
+    // doesn't need a tool round-trip to know what to comment on. The
+    // hint also passes `symbol` so the backend's per-surface prompt
+    // can scope tool calls if it needs them.
+    const dirLbl = symbol.direction ?? 'LONG';
+    const sigLbl = symbol.señal ? 'señal activa' : symbol.setup ? 'setup' : 'sin setup';
+    const trgLbl = symbol.gatillo ? 'gatillo 5M activo' : 'sin gatillo';
+    const prompt =
+      `Saluda al operador con un brief breve (1-2 oraciones, máximo 3) sobre ` +
+      `el estado actual de ${symbol.symbol}. Estado real del scanner: ` +
+      `${sigLbl}, ${trgLbl}, score ${symbol.score ?? 0}/9, dirección ${dirLbl}, ` +
+      `LRC ${(symbol.lrc_pct ?? 0).toFixed(1)}%, estado="${symbol.estado ?? '—'}". ` +
+      `Sé directo, sin marketing. No prometas señales que el estado no indica. ` +
+      `Termina con una pregunta corta que invite a explorar (qué falta, simular, historial).`;
+    const hints: AgentContextHints = { symbol: symbol.symbol };
+    streamGreeting(prompt, hints, (partial) => {
+      if (!live) return;
+      setEnrichedText(partial);
+      setEnrichedKey(greetingKey);
+    }).then((result) => {
+      if (!live) return;
+      if (result.ok && result.text.trim().length > 0) {
+        greetingCacheRef.current.set(greetingKey, result.text);
+        setEnrichedText(result.text);
+        setEnrichedKey(greetingKey);
+      } else {
+        // Failure — keep enrichedText null so render falls back to template.
+        setEnrichedText(null);
+        setEnrichedKey(null);
+      }
+    });
+    return () => {
+      live = false;
+    };
+  }, [greetingKey, symbol, streamGreeting]);
+
+  // The bubble the JSX renders. Enriched if the LLM responded for the
+  // current key; template otherwise (instant + always honest).
+  const greeting = useMemo<{ text: string; verdict: Verdict } | null>(() => {
+    if (!templateGreeting) return null;
+    if (enrichedText && enrichedKey === greetingKey) {
+      return { text: enrichedText, verdict: templateGreeting.verdict };
+    }
+    return templateGreeting;
+  }, [templateGreeting, enrichedText, enrichedKey, greetingKey]);
 
   // Autoscroll on new messages
   useEffect(() => {
