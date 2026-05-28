@@ -18,7 +18,7 @@ from datetime import date
 
 import pytest
 
-from walk_forward import Window, compute_windows
+from walk_forward import Window, compute_windows, compute_warmup_bars
 
 
 # --------------------------------------------------------------------------- #
@@ -182,3 +182,73 @@ def test_invalid_arguments_raise(base_config, kwargs):
 def test_rolling_mode_not_implemented(base_config):
     with pytest.raises(NotImplementedError):
         compute_windows(**base_config, anchored=False)
+
+
+# --------------------------------------------------------------------------- #
+# Warmup bars (commit 2 of #276)
+# --------------------------------------------------------------------------- #
+#
+# Indicator lookbacks are sourced from strategy/constants.py and the active
+# call sites in strategy/core.py / strategy/regime.py / strategy/patterns.py.
+# The expected values below are the maximum lookback per TF that the harness
+# must respect when slicing fold history.
+
+
+def test_warmup_bars_4h_dominated_by_sma100():
+    """4h path runs SMA100 (strategy/core.py:576). Nothing on 4h goes deeper."""
+    assert compute_warmup_bars("4h") == 100
+
+
+def test_warmup_bars_1h_dominated_by_sma200():
+    """1h path runs LRC100 + SMA200 (computed unconditionally, core.py:556-559).
+
+    SMA200 1h is computed on every bar (the value is exposed in
+    `decision.indicators` regardless of the `trend_pullback_enabled` flag,
+    which only feature-gates its downstream *use*). Compute-warmup must
+    therefore cover it. If SMA200 1h is removed from the compute path,
+    drop this back to 100.
+    """
+    assert compute_warmup_bars("1h") == 200
+
+
+def test_warmup_bars_5m_dominated_by_bb20():
+    """5m path runs RSI14 + BB20 + VOL20 (patterns.py / core.py)."""
+    assert compute_warmup_bars("5m") == 20
+
+
+@pytest.mark.parametrize("tf", ["4h", "1h", "5m"])
+def test_warmup_bars_returns_positive_int(tf):
+    bars = compute_warmup_bars(tf)
+    assert isinstance(bars, int)
+    assert bars > 0
+
+
+@pytest.mark.parametrize(
+    "tf,floor",
+    [
+        ("4h", 100),   # SMA100
+        ("1h", 200),   # SMA200 1h computed unconditionally (use is feature-gated)
+        ("5m", 20),    # BB20 / VOL20
+    ],
+)
+def test_warmup_bars_at_least_declared_max(tf, floor):
+    """Sanity: the return value is never below the declared max for the TF."""
+    assert compute_warmup_bars(tf) >= floor
+
+
+@pytest.mark.parametrize("tf", ["4H", "1H", "5M", " 1h "])
+def test_warmup_bars_case_and_whitespace_insensitive(tf):
+    """Operators type these by hand. Be lenient with case + surrounding space."""
+    assert compute_warmup_bars(tf) > 0
+
+
+@pytest.mark.parametrize("bad_tf", ["", "1d", "15m", "2h", "1w", "foo"])
+def test_warmup_bars_rejects_unknown_timeframe(bad_tf):
+    with pytest.raises(ValueError):
+        compute_warmup_bars(bad_tf)
+
+
+@pytest.mark.parametrize("bad", [None, 60, 1.0, ("1h",)])
+def test_warmup_bars_rejects_non_string(bad):
+    with pytest.raises(ValueError):
+        compute_warmup_bars(bad)  # type: ignore[arg-type]
