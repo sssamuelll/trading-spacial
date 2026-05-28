@@ -70,6 +70,11 @@ HOLDOUT_LEGITIMATE_MODULES: set[str] = {
     "tools/r2_gates_rederivation.py",
     # A.2 walk-forward harness modules and A.4 evaluation modules will be
     # added here when those tickets land.
+    # A.2 walk-forward harness property tests (#276). Validates structural
+    # invariants on window boundaries against `holdout_start` (a date cutoff,
+    # not a data path). No `data/holdout/` access; assertion messages
+    # legitimately name the boundary parameter for fold debugging.
+    "tests/test_walk_forward_windows.py",
 }
 
 # Directories that don't contain trading code; scanning them would be noise
